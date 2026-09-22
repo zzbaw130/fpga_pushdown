@@ -1,0 +1,17 @@
+services:
+  cemu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cemu_vm
+    container_name: cemu_dengyao
+    ports:
+      - "2222:2222"
+    working_dir: /workspace/code/CEMU/build
+    environment:
+      - CSD_COUNT=1
+    volumes:
+      - ./code/test-cemu:/workspace/code/CEMU/tests/cemu
+      - ./data:/workspace/data
+      - ./results:/workspace/results
+      - ./scripts:/workspace/scripts
