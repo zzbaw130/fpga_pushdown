@@ -98,6 +98,16 @@ PostgreSQL 主机端使用 CSD 的本地块设备，避免将 9p 的额外开销
 CSD 计划 ABI、FPGA 风格算子、spill-to-flash、AER 缓存回填和 PostgreSQL
 `csd.exe_path` 放置策略的实现边界见 [CSD 设计文档](docs/csd_design.md)。
 
+PostgreSQL 规划器扩展位于 `code/postgres-csd`。它目前支持
+`csd.exe_path = host|csd|auto`、TPC-H 所需表达式白名单、CSD
+scan/join/aggregate/sort 路径和递归算子成本元数据；执行器仍会明确拒绝尚未
+接通的 NVMe 传输。可用 SF1 已启动实例验证全部 22 条计划：
+
+```bash
+./tests/test_csd_planner.sh --sf 1 --mode csd
+./tests/test_csd_planner.sh --sf 1 --mode host --skip-build
+```
+
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD
 开发目录；修改主机端源码会直接反映到来宾。目录只保留 CSD 计划 ABI、独立

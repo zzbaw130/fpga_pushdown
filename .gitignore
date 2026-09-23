@@ -4,4 +4,5 @@ code/test-cemu/build/
 .pgsock_*/
 results/**/*.log
 results/**/*.pid
+results/csd_planner_sf*/
 data

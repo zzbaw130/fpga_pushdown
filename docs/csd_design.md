@@ -169,12 +169,28 @@ command spelling: `SET csd.exe_path = 'auto'`).  `host` suppresses CSD paths;
 returns an explicit planning error; `auto` adds both paths to normal PostgreSQL
 dynamic-programming path selection.
 
-This PostgreSQL planner/executor integration is not implemented yet.  When it
-is added, a planner hook creates a `CustomPath`
-whose cost includes CSD scan, pipeline, materialization, Flash spill, command,
-and result-return costs.  Host scan cost uses the observed CSD-prefetched page
-fraction, capped by relation size.  Join alternatives are added at the same
-join search level as regular paths, allowing mixed host/CSD pipelines rather
-than a query-wide binary choice.  The CustomScan executor serializes the
-selected subtree using this ABI and falls back only for explicitly unsupported
-types or expressions; a fallback is visible in `EXPLAIN` rather than silent.
+The out-of-tree PostgreSQL 12 extension in `code/postgres-csd` now installs
+planner hooks for base relations, joins, and upper relations.  It creates
+`CustomPath` alternatives whose modeled cost includes Flash pages, streamed
+tuples, hash build/probe, aggregate state, sort comparisons, command setup,
+and result bytes.  `host` suppresses these paths; `csd` prunes host compute
+alternatives and rejects unsupported expressions; `auto` leaves both choices
+to PostgreSQL's dynamic-programming search.  A configurable
+`csd.host_cache_fraction` is already a cost-model input, but is still a manual
+value until the AER feedback control plane supplies per-relation observations.
+
+The chosen CSD subtree is represented as one `CustomScan` plus a recursive,
+copy-safe operator metadata tree.  Projection and unflattened subquery paths
+are retained as metadata rather than executable PostgreSQL child plans, so
+internal join/group keys do not cross back into host tuple pipelines.  The 22
+supplied TPC-H `EXPLAIN` files pass forced-CSD planning; scalar InitPlans are
+separate CSD commands and a top-level PostgreSQL `Limit` may remain as control
+orchestration, while host scan/join/aggregate/sort nodes are rejected by the
+planner test.
+
+This is a planner milestone, not completed query execution.  The `CustomScan`
+executor deliberately errors instead of silently falling back.  The next
+stage must serialize PostgreSQL relations, target expressions, quals, join
+keys, group keys, sort keys, subplan dependencies, and limits into ABI v4,
+then submit the staged plan through CEMU Program Execute and decode result
+tuples.  Per-relation AER cache feedback follows that transport work.
