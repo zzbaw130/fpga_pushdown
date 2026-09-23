@@ -1,0 +1,39 @@
+Timing is on.
+                                                                        QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=213403.73..213403.74 rows=1 width=34)
+   ->  Sort  (cost=213403.73..213403.74 rows=1 width=34)
+         Sort Key: (count(*)) DESC, supplier.s_name
+         ->  GroupAggregate  (cost=213403.70..213403.72 rows=1 width=34)
+               Group Key: supplier.s_name
+               ->  Sort  (cost=213403.70..213403.71 rows=1 width=26)
+                     Sort Key: supplier.s_name
+                     ->  Nested Loop  (cost=1254.87..213403.69 rows=1 width=26)
+                           ->  Nested Loop Semi Join  (cost=1254.44..213403.19 rows=1 width=34)
+                                 ->  Gather  (cost=1254.01..213401.97 rows=1 width=34)
+                                       Workers Planned: 2
+                                       ->  Nested Loop Anti Join  (cost=254.01..212401.87 rows=1 width=34)
+                                             ->  Hash Join  (cost=253.58..190638.87 rows=33174 width=34)
+                                                   Hash Cond: (l1.l_suppkey = supplier.s_suppkey)
+                                                   ->  Parallel Seq Scan on lineitem l1  (cost=0.00..186943.50 rows=829347 width=8)
+                                                         Filter: (l_receiptdate > l_commitdate)
+                                                   ->  Hash  (cost=248.58..248.58 rows=400 width=30)
+                                                         ->  Nested Loop  (cost=11.38..248.58 rows=400 width=30)
+                                                               ->  Seq Scan on nation  (cost=0.00..1.31 rows=1 width=4)
+                                                                     Filter: (n_name = 'MOROCCO'::bpchar)
+                                                               ->  Bitmap Heap Scan on supplier  (cost=11.38..243.27 rows=400 width=34)
+                                                                     Recheck Cond: (s_nationkey = nation.n_nationkey)
+                                                                     ->  Bitmap Index Scan on idx_supplier_nation_key  (cost=0.00..11.29 rows=400 width=0)
+                                                                           Index Cond: (s_nationkey = nation.n_nationkey)
+                                             ->  Index Scan using lineitem_pkey on lineitem l3  (cost=0.43..1.25 rows=7 width=8)
+                                                   Index Cond: (l_orderkey = l1.l_orderkey)
+                                                   Filter: ((l_receiptdate > l_commitdate) AND (l_suppkey <> l1.l_suppkey))
+                                 ->  Index Scan using lineitem_pkey on lineitem l2  (cost=0.43..1.20 rows=21 width=8)
+                                       Index Cond: (l_orderkey = l1.l_orderkey)
+                                       Filter: (l_suppkey <> l1.l_suppkey)
+                           ->  Index Scan using orders_pkey on orders  (cost=0.43..0.51 rows=1 width=4)
+                                 Index Cond: (o_orderkey = l1.l_orderkey)
+                                 Filter: (o_orderstatus = 'F'::bpchar)
+(33 rows)
+
+Time: 7.021 ms

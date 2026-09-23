@@ -1,0 +1,32 @@
+Timing is on.
+                                                                                  QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=535255.41..535255.66 rows=100 width=71)
+   ->  Sort  (cost=535255.41..536205.01 rows=379838 width=71)
+         Sort Key: orders.o_totalprice DESC, orders.o_orderdate
+         ->  Finalize GroupAggregate  (cost=472728.35..520738.28 rows=379838 width=71)
+               Group Key: customer.c_custkey, orders.o_orderkey
+               ->  Gather Merge  (cost=472728.35..512824.98 rows=316532 width=71)
+                     Workers Planned: 2
+                     ->  Partial GroupAggregate  (cost=471728.33..475289.31 rows=158266 width=71)
+                           Group Key: customer.c_custkey, orders.o_orderkey
+                           ->  Sort  (cost=471728.33..472123.99 rows=158266 width=44)
+                                 Sort Key: customer.c_custkey, orders.o_orderkey
+                                 ->  Nested Loop  (cost=352978.34..453188.48 rows=158266 width=44)
+                                       ->  Parallel Hash Join  (cost=352977.91..394766.89 rows=39757 width=43)
+                                             Hash Cond: (orders.o_custkey = customer.c_custkey)
+                                             ->  Hash Join  (cost=347986.66..389671.28 rows=39757 width=24)
+                                                   Hash Cond: (orders.o_orderkey = lineitem_1.l_orderkey)
+                                                   ->  Parallel Seq Scan on orders  (cost=0.00..32345.00 rows=625000 width=20)
+                                                   ->  Hash  (cost=346420.96..346420.96 rows=95416 width=4)
+                                                         ->  GroupAggregate  (cost=0.43..345466.80 rows=95416 width=4)
+                                                               Group Key: lineitem_1.l_orderkey
+                                                               Filter: (sum(lineitem_1.l_quantity) > '314'::numeric)
+                                                               ->  Index Scan using idx_lineitem_orderkey on lineitem lineitem_1  (cost=0.43..311316.60 rows=5971296 width=9)
+                                             ->  Parallel Hash  (cost=4210.00..4210.00 rows=62500 width=23)
+                                                   ->  Parallel Seq Scan on customer  (cost=0.00..4210.00 rows=62500 width=23)
+                                       ->  Index Scan using lineitem_pkey on lineitem  (cost=0.43..1.26 rows=21 width=9)
+                                             Index Cond: (l_orderkey = orders.o_orderkey)
+(26 rows)
+
+Time: 6.064 ms

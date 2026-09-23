@@ -1,0 +1,28 @@
+Timing is on.
+                                                                     QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=15805.55..15805.69 rows=1 width=72)
+   InitPlan 1 (returns $1)
+     ->  Finalize Aggregate  (cost=6230.81..6230.82 rows=1 width=32)
+           ->  Gather  (cost=6230.59..6230.80 rows=2 width=32)
+                 Workers Planned: 2
+                 ->  Partial Aggregate  (cost=5230.59..5230.60 rows=1 width=32)
+                       ->  Parallel Seq Scan on customer customer_1  (cost=0.00..5225.62 rows=1984 width=6)
+                             Filter: ((c_acctbal > 0.00) AND ("substring"((c_phone)::text, 1, 2) = ANY ('{23,21,25,32,13,29,11}'::text[])))
+   ->  Finalize GroupAggregate  (cost=9574.73..9675.33 rows=754 width=72)
+         Group Key: ("substring"((customer.c_phone)::text, 1, 2))
+         ->  Gather Merge  (cost=9574.73..9655.86 rows=628 width=72)
+               Workers Planned: 2
+               Params Evaluated: $1
+               ->  Partial GroupAggregate  (cost=8574.71..8583.35 rows=314 width=72)
+                     Group Key: ("substring"((customer.c_phone)::text, 1, 2))
+                     ->  Sort  (cost=8574.71..8575.50 rows=314 width=38)
+                           Sort Key: ("substring"((customer.c_phone)::text, 1, 2))
+                           ->  Nested Loop Anti Join  (cost=0.43..8561.69 rows=314 width=38)
+                                 ->  Parallel Seq Scan on customer  (cost=0.00..5225.62 rows=729 width=26)
+                                       Filter: ((c_acctbal > $1) AND ("substring"((c_phone)::text, 1, 2) = ANY ('{23,21,25,32,13,29,11}'::text[])))
+                                 ->  Index Only Scan using idx_orders_custkey on orders  (cost=0.43..48.94 rows=18 width=4)
+                                       Index Cond: (o_custkey = customer.c_custkey)
+(22 rows)
+
+Time: 4.012 ms

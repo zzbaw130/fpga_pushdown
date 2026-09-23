@@ -19,9 +19,10 @@ Dockerfile中包括两阶段, 编译阶段和运行阶段, 后者删除了编译
 ## 使用说明
 使用docker compose build编译cemu_vm镜像, 之后使用docker compose up -d后台启动容器即可
 
-docker-compose.yml中的CSD_COUNT指定了CSD的个数, 考虑到内存限制, 默认为1（运行测试脚本时需要注释掉Three CSDs Tests）, 虚拟机为默认配置, 即8核CPU+8G内存+1块48GB CSD
+docker-compose.yml中的CSD_COUNT指定了CSD的个数, 考虑到内存限制, 默认为1（运行测试脚本时需要注释掉Three CSDs Tests）, 虚拟机为默认配置, 即8核CPU+16G内存+1块48GB CSD
 
-虚拟机启动后使用ssh -p 2222 root@localhost, 连接虚拟机(密码root)
+虚拟机启动后使用ssh -p 2223 root@localhost, 连接虚拟机(密码root)。本项目
+使用 2223 以免与主机上已有的 CEMU 实验冲突。
 
 进入虚拟机后，需要运行cemu-mount.sh挂载CSD，现在运行该脚本需要指定一个整型参数，用于指定初始化的数据文件大小(GB)，防止占用过多主机内存
 
@@ -33,7 +34,7 @@ Host:~/cemu_docker& docker compose build
 Host:~/cemu_docker& docker compose up -d
 
 # 虚拟机启动后(约1分钟), ssh连接进入容器(跳过了容器层, 直接连接到容器内部的虚拟机)
-Host:~/cemu_docker& ssh root@localhost -p 2222
+Host:~/cemu_docker& ssh root@localhost -p 2223
 
 # 运行cemu-mount.sh挂载CSD之后开始后续实验, 参数表示每个CSD的数据文件大小(此处以4GB为例)
 # CEMU对主机内存的需求 = 8G虚拟机主存 + 32*32M的CSD内存  CSD_COUNT*数据文件大小 = 13GB
@@ -42,7 +43,79 @@ inside_VM:~# ./cemu-mount.sh 4
 .....
 ```
 
-## 测试说明
-目录结构中有一个test-cemu目录，它是code/CEMU/tests/cemu复制目录，我单独将他拉出来并且挂载到了虚拟机内部，因此只需要在主机端修改其中的测试文件，虚拟机内部就会自动同步，方便二次开发
+## PostgreSQL 与 TPC-H 数据准备
 
-整个实验阶段，我们只需要在该目录下，参考其内部的实现方法进行二次开发即可，比如将diskann源码clone到该目录下，将其改造成kernel目录下形式的函数，并按照vadd_example或cemu_benchmark的方式调用即可
+先初始化并编译 `code/postgres`（REL_12_STABLE submodule），再用 DuckDB 的
+`tpch` 与 `postgres` 扩展生成数据。一个 scale factor 对应一个独立的
+PostgreSQL cluster，数据目录为 `data/tpch_s<SF>`、数据库名为
+`tpch_s<SF>`；脚本会创建表、装载数据、创建主键/外键/索引并执行
+`ANALYZE`。
+
+```bash
+git submodule update --init code/postgres
+./scripts/build_postgres.sh
+./scripts/gen_data/create_tpch_db.sh --sf 1
+./scripts/gen_data/create_tpch_db.sh --sf 32 --keep-running
+```
+
+`--keep-running` 保留本地实例（默认端口为 `55432 + SF`），便于检查；
+不带该选项时脚本在完成后干净停止集群。SF32 装载时间较长，若主机或
+终端会话中断，可执行 `./scripts/gen_data/create_tpch_db.sh --sf 32
+--resume --keep-running`。续传会保留已完整导入的表，并继续空表；如需
+明确重建某个 cluster，才使用 `--force`。
+
+CEMU 必须运行在 TCG 下以支持 VM-Freeze；本项目不启用 KVM。PostgreSQL
+在 CEMU 来宾内编译一次并安装到持久化 qcow2 覆盖层的 `/opt/pgsql12`；
+之后每次启动均直接复用。虚拟机启动后，首次以 root 登录一次，创建
+UID/GID 与共享数据一致的 `csdpg` 用户并编译 PostgreSQL：
+
+```bash
+docker compose up -d
+
+# Guest: only needed once for a fresh named volume
+ssh -p 2223 root@localhost
+/root/CEMU/scripts/guest/bootstrap_csdpg.sh
+/root/CEMU/scripts/guest/build_postgres.sh
+# 之后使用密码 csdpg 登录；首次登录后应执行 passwd 修改密码
+ssh -p 2223 csdpg@localhost
+```
+
+Docker named volume 会保存来宾 qcow2 覆盖层，因此 `csdpg` 用户与来宾
+内编译的 PostgreSQL 会跨 `docker compose up --force-recreate` 保留。登录
+`csdpg` 后，直接在 9p 挂载的 `data/tpch_s<SF>` 上运行只读冒烟测试，
+不复制数据库：
+
+```bash
+/mnt/cemu/scripts/guest/run_shared_tpch.sh 1
+```
+
+运行直接挂载测试前必须停止对应的主机 PostgreSQL 实例。PostgreSQL 即使
+只读查询也会创建 PID 文件和少量状态文件，因此同一 PGDATA 不能同时被
+主机和来宾使用。9p 直接运行仅用于功能验证；正式 CSD 性能实验应让
+PostgreSQL 主机端使用 CSD 的本地块设备，避免将 9p 的额外开销当作 CSD
+性能。
+
+CSD 计划 ABI、FPGA 风格算子、spill-to-flash、AER 缓存回填和 PostgreSQL
+`csd.exe_path` 放置策略的实现边界见 [CSD 设计文档](docs/csd_design.md)。
+
+## 测试说明
+`code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD
+开发目录；修改主机端源码会直接反映到来宾。目录只保留 CSD 计划 ABI、独立
+算子文件、CEMU Program Execute runner，以及它们必需的 ioctl/helper 代码；原始
+CEMU 的 vadd、grep、knn、BPF、io_uring、benchmark 和测试样例已移除。
+
+```bash
+make -C code/test-cemu test                 # 主机侧算子与并行调度单元测试
+make -C code/test-cemu all                  # 构建 csd_sql.so 与 CEMU runner
+
+# 在 TCG CEMU 来宾中
+cd /root/CEMU/code/CEMU/tests/cemu
+make -C kernel all && make all
+./build/csd_sql_example
+```
+
+算子实现位于 `kernel/csd_{scan,expression,filter,project,aggregate,join,sort,control}.cc`；
+`kernel/csd_sql.cc` 仅负责 ABI 校验、任务 DAG 调度、并行 worker 预算、状态和
+结果序列化。ABI v4 的无跳转表达式指令流覆盖 TPC-H 所需的定点算术、布尔
+逻辑、`LIKE`、`CASE`、`substring` 和日期年份提取；单元测试同时覆盖多键
+group/join/sort、join residual、`DISTINCT`、top-N、spill 及规范化节点计数。

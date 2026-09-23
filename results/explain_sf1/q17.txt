@@ -1,0 +1,28 @@
+Timing is on.
+                                                              QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=614909.82..614909.83 rows=1 width=32)
+   ->  Aggregate  (cost=614909.82..614909.83 rows=1 width=32)
+         ->  Nested Loop  (cost=532078.98..614905.17 rows=1857 width=8)
+               Join Filter: (part.p_partkey = lineitem.l_partkey)
+               ->  Merge Join  (cost=532078.55..614011.33 rows=187 width=40)
+                     Merge Cond: (part.p_partkey = lineitem_1.l_partkey)
+                     ->  Gather Merge  (cost=1000.44..9576.95 rows=195 width=4)
+                           Workers Planned: 2
+                           ->  Parallel Index Scan using part_pkey on part  (cost=0.42..8554.42 rows=81 width=4)
+                                 Filter: ((p_brand = 'Brand#54'::bpchar) AND (p_container = 'JUMBO BAG'::bpchar))
+                     ->  Finalize GroupAggregate  (cost=531078.11..602040.30 rows=191337 width=36)
+                           Group Key: lineitem_1.l_partkey
+                           ->  Gather Merge  (cost=531078.11..596300.19 rows=382674 width=36)
+                                 Workers Planned: 2
+                                 ->  Partial GroupAggregate  (cost=530078.08..551130.10 rows=191337 width=36)
+                                       Group Key: lineitem_1.l_partkey
+                                       ->  Sort  (cost=530078.08..536298.18 rows=2488040 width=9)
+                                             Sort Key: lineitem_1.l_partkey
+                                             ->  Parallel Seq Scan on lineitem lineitem_1  (cost=0.00..180723.40 rows=2488040 width=9)
+               ->  Index Scan using idx_lineitem_part_supp on lineitem  (cost=0.43..4.65 rows=10 width=17)
+                     Index Cond: (l_partkey = lineitem_1.l_partkey)
+                     Filter: (l_quantity < ((0.2 * avg(lineitem_1.l_quantity))))
+(22 rows)
+
+Time: 3.567 ms

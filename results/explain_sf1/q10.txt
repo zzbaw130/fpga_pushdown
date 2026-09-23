@@ -1,0 +1,33 @@
+Timing is on.
+                                                                                          QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=175304.93..175304.98 rows=20 width=202)
+   ->  Sort  (cost=175304.93..175445.05 rows=56046 width=202)
+         Sort Key: (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))) DESC
+         ->  Finalize GroupAggregate  (cost=166612.97..173813.57 rows=56046 width=202)
+               Group Key: customer.c_custkey, nation.n_name
+               ->  Gather Merge  (cost=166612.97..172645.95 rows=46704 width=202)
+                     Workers Planned: 2
+                     ->  Partial GroupAggregate  (cost=165612.95..166255.13 rows=23352 width=202)
+                           Group Key: customer.c_custkey, nation.n_name
+                           ->  Sort  (cost=165612.95..165671.33 rows=23352 width=182)
+                                 Sort Key: customer.c_custkey, nation.n_name
+                                 ->  Hash Join  (cost=156761.00..161843.12 rows=23352 width=182)
+                                       Hash Cond: (customer.c_nationkey = nation.n_nationkey)
+                                       ->  Parallel Hash Join  (cost=156759.44..161769.86 rows=23352 width=160)
+                                             Hash Cond: (customer.c_custkey = orders.o_custkey)
+                                             ->  Parallel Seq Scan on customer  (cost=0.00..4210.00 rows=62500 width=148)
+                                             ->  Parallel Hash  (cost=156467.54..156467.54 rows=23352 width=16)
+                                                   ->  Nested Loop  (cost=1206.52..156467.54 rows=23352 width=16)
+                                                         ->  Parallel Bitmap Heap Scan on orders  (cost=1206.08..27655.75 rows=23645 width=8)
+                                                               Recheck Cond: ((o_orderdate >= '1993-03-01'::date) AND (o_orderdate < '1993-06-01 00:00:00'::timestamp without time zone))
+                                                               ->  Bitmap Index Scan on idx_orders_orderdate  (cost=0.00..1191.90 rows=56747 width=0)
+                                                                     Index Cond: ((o_orderdate >= '1993-03-01'::date) AND (o_orderdate < '1993-06-01 00:00:00'::timestamp without time zone))
+                                                         ->  Index Scan using idx_lineitem_orderkey on lineitem  (cost=0.43..5.40 rows=5 width=16)
+                                                               Index Cond: (l_orderkey = orders.o_orderkey)
+                                                               Filter: (l_returnflag = 'R'::bpchar)
+                                       ->  Hash  (cost=1.25..1.25 rows=25 width=30)
+                                             ->  Seq Scan on nation  (cost=0.00..1.25 rows=25 width=30)
+(27 rows)
+
+Time: 9.232 ms

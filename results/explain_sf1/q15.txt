@@ -1,0 +1,37 @@
+Timing is on.
+CREATE VIEW
+Time: 6.218 ms
+                                                                         QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=394507.45..394568.69 rows=1 width=103)
+   InitPlan 1 (returns $1)
+     ->  Aggregate  (cost=198618.41..198618.42 rows=1 width=32)
+           ->  Finalize GroupAggregate  (cost=195888.74..198493.59 rows=9986 width=36)
+                 Group Key: lineitem_1.l_suppkey
+                 ->  Gather Merge  (cost=195888.74..198218.97 rows=19972 width=36)
+                       Workers Planned: 2
+                       ->  Sort  (cost=194888.72..194913.68 rows=9986 width=36)
+                             Sort Key: lineitem_1.l_suppkey
+                             ->  Partial HashAggregate  (cost=194100.54..194225.36 rows=9986 width=36)
+                                   Group Key: lineitem_1.l_suppkey
+                                   ->  Parallel Seq Scan on lineitem lineitem_1  (cost=0.00..193163.60 rows=93694 width=16)
+                                         Filter: ((l_shipdate >= '1993-04-01'::date) AND (l_shipdate < '1993-07-01 00:00:00'::timestamp without time zone))
+   ->  Nested Loop  (cost=195889.03..198951.00 rows=50 width=103)
+         ->  Finalize GroupAggregate  (cost=195888.74..198643.38 rows=50 width=36)
+               Group Key: lineitem.l_suppkey
+               Filter: (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount))) = $1)
+               ->  Gather Merge  (cost=195888.74..198218.97 rows=19972 width=36)
+                     Workers Planned: 2
+                     ->  Sort  (cost=194888.72..194913.68 rows=9986 width=36)
+                           Sort Key: lineitem.l_suppkey
+                           ->  Partial HashAggregate  (cost=194100.54..194225.36 rows=9986 width=36)
+                                 Group Key: lineitem.l_suppkey
+                                 ->  Parallel Seq Scan on lineitem  (cost=0.00..193163.60 rows=93694 width=16)
+                                       Filter: ((l_shipdate >= '1993-04-01'::date) AND (l_shipdate < '1993-07-01 00:00:00'::timestamp without time zone))
+         ->  Index Scan using supplier_pkey on supplier  (cost=0.29..6.14 rows=1 width=71)
+               Index Cond: (s_suppkey = lineitem.l_suppkey)
+(27 rows)
+
+Time: 2.637 ms
+DROP VIEW
+Time: 1.095 ms

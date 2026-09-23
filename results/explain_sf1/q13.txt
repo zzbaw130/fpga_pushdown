@@ -1,0 +1,22 @@
+Timing is on.
+                                                                 QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=162297.08..162297.08 rows=1 width=16)
+   ->  Sort  (cost=162297.08..162297.58 rows=200 width=16)
+         Sort Key: (count(*)) DESC, (count(orders.o_orderkey)) DESC
+         ->  HashAggregate  (cost=162294.08..162296.08 rows=200 width=16)
+               Group Key: count(orders.o_orderkey)
+               ->  Finalize GroupAggregate  (cost=1000.87..160044.08 rows=150000 width=12)
+                     Group Key: customer.c_custkey
+                     ->  Gather Merge  (cost=1000.87..157044.08 rows=300000 width=12)
+                           Workers Planned: 2
+                           ->  Partial GroupAggregate  (cost=0.85..121416.61 rows=150000 width=12)
+                                 Group Key: customer.c_custkey
+                                 ->  Nested Loop Left Join  (cost=0.85..116823.18 rows=618687 width=8)
+                                       ->  Parallel Index Only Scan using customer_pkey on customer  (cost=0.42..6619.43 rows=62500 width=4)
+                                       ->  Index Scan using idx_orders_custkey on orders  (cost=0.43..1.59 rows=17 width=8)
+                                             Index Cond: (o_custkey = customer.c_custkey)
+                                             Filter: ((o_comment)::text !~~ '%pending%accounts%'::text)
+(16 rows)
+
+Time: 4.183 ms

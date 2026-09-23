@@ -1,0 +1,324 @@
+#ifndef CSD_SQL_PLAN_H
+#define CSD_SQL_PLAN_H
+
+#include <stdint.h>
+
+/*
+ * Stable little-endian wire ABI between PostgreSQL and the CEMU program.
+ * PostgreSQL executor nodes are deliberately not sent across this boundary.
+ * Version 4 adds the TPC-H expression bytecode, multi-column blocking
+ * operators, fixed-point scale metadata, and explicit canonicalization
+ * counters. PostgreSQL executor structs never cross this boundary.
+ */
+#define CSD_SQL_PLAN_MAGIC       UINT32_C(0x43534450) /* "CSDP" */
+#define CSD_SQL_PLAN_VERSION     4
+#define CSD_SQL_RESULT_MAGIC     UINT32_C(0x43534452) /* "CSDR" */
+#define CSD_SQL_INVALID_NODE     UINT32_C(0xffffffff)
+#define CSD_SQL_INVALID_RANGE    UINT32_C(0xffffffff)
+#define CSD_SQL_NO_COLUMN        UINT16_C(0xffff)
+#define CSD_SQL_PAGE_BYTES       8192U
+
+enum CsdSqlOpcode {
+    CSD_SQL_OP_SCAN = 1,
+    CSD_SQL_OP_INDEX_SCAN,
+    CSD_SQL_OP_FILTER,
+    CSD_SQL_OP_PROJECT,
+    CSD_SQL_OP_HASH_JOIN,
+    CSD_SQL_OP_MERGE_JOIN,
+    CSD_SQL_OP_NL_JOIN,
+    CSD_SQL_OP_HASH_AGG,
+    CSD_SQL_OP_GROUP_AGG,
+    CSD_SQL_OP_SORT,
+    CSD_SQL_OP_MATERIALIZE,
+    CSD_SQL_OP_LIMIT,
+    CSD_SQL_OP_SUBPLAN,
+};
+
+enum CsdSqlJoinKind {
+    CSD_SQL_JOIN_INNER = 1,
+    CSD_SQL_JOIN_LEFT,
+    CSD_SQL_JOIN_SEMI,
+    CSD_SQL_JOIN_ANTI,
+};
+
+enum CsdSqlPlanFlags {
+    /* The final CEMU memory range is a CsdSqlExecutionStatus. */
+    CSD_SQL_PLAN_STATUS_LAST_RANGE = UINT32_C(1) << 0,
+    /* The scanner may inspect tuple visibility only under this contract. */
+    CSD_SQL_PLAN_FROZEN_SNAPSHOT = UINT32_C(1) << 1,
+    /*
+     * The plan bytes reside in an MRS entry.  Program Execute cparam1 is the
+     * exact byte count and cparam2 is the zero-based MRS entry index.  This
+     * avoids the Linux passthrough overlay, where CEMU's dlen shares bytes
+     * with the standard NVMe metadata fields.
+     */
+    CSD_SQL_PLAN_STAGED_RANGE = UINT32_C(1) << 2,
+};
+
+enum CsdSqlNodeFlags {
+    CSD_SQL_NODE_BLOCKING = UINT16_C(1) << 0,
+    CSD_SQL_NODE_SPILLABLE = UINT16_C(1) << 1,
+    CSD_SQL_NODE_REQUIRES_ORDER = UINT16_C(1) << 2,
+};
+
+enum CsdSqlScanFlags {
+    /* The PostgreSQL planner proved the scanned pages safe for CSD visibility. */
+    CSD_SQL_SCAN_FROZEN_PAGES = UINT32_C(1) << 0,
+    /* Fail rather than producing a partial answer when a non-normal tuple appears. */
+    CSD_SQL_SCAN_STRICT_PAGE_FORMAT = UINT32_C(1) << 1,
+};
+
+enum CsdSqlColumnFlags {
+    /* Value is emitted by SCAN.  Other physical attributes are decoded only to skip them. */
+    CSD_SQL_COLUMN_OUTPUT = UINT16_C(1) << 0,
+    /* Data in a varlena datum must not be external/TOASTed. */
+    CSD_SQL_COLUMN_NO_EXTERNAL = UINT16_C(1) << 1,
+};
+
+enum CsdSqlDatumType {
+    CSD_SQL_TYPE_INVALID = 0,
+    CSD_SQL_TYPE_INT16,
+    CSD_SQL_TYPE_INT32,
+    CSD_SQL_TYPE_INT64,
+    CSD_SQL_TYPE_DATE,
+    CSD_SQL_TYPE_BOOL,
+    CSD_SQL_TYPE_NUMERIC,
+    CSD_SQL_TYPE_BYTES,
+};
+
+/* Bounded postfix bytecode shared by FILTER, PROJECT and join residuals. */
+enum CsdSqlExpressionOpcode {
+    CSD_SQL_EXPR_PUSH_COLUMN = 1,
+    CSD_SQL_EXPR_PUSH_AUX_COLUMN,
+    CSD_SQL_EXPR_PUSH_CONSTANT,
+    CSD_SQL_EXPR_ADD,
+    CSD_SQL_EXPR_SUBTRACT,
+    CSD_SQL_EXPR_MULTIPLY,
+    CSD_SQL_EXPR_DIVIDE,
+    CSD_SQL_EXPR_NEGATE,
+    CSD_SQL_EXPR_EQUAL,
+    CSD_SQL_EXPR_NOT_EQUAL,
+    CSD_SQL_EXPR_LESS,
+    CSD_SQL_EXPR_LESS_EQUAL,
+    CSD_SQL_EXPR_GREATER,
+    CSD_SQL_EXPR_GREATER_EQUAL,
+    CSD_SQL_EXPR_AND,
+    CSD_SQL_EXPR_OR,
+    CSD_SQL_EXPR_NOT,
+    CSD_SQL_EXPR_IS_NULL,
+    CSD_SQL_EXPR_IS_NOT_NULL,
+    CSD_SQL_EXPR_LIKE,
+    CSD_SQL_EXPR_SELECT,
+    CSD_SQL_EXPR_EXTRACT_YEAR,
+    CSD_SQL_EXPR_SUBSTRING,
+    CSD_SQL_EXPR_EMIT,
+};
+
+enum CsdSqlExpressionFlags {
+    CSD_SQL_EXPR_CASE_INSENSITIVE = UINT16_C(1) << 0,
+};
+
+enum CsdSqlAggregateOp {
+    CSD_SQL_AGG_COUNT = 1,
+    CSD_SQL_AGG_SUM,
+    CSD_SQL_AGG_MIN,
+    CSD_SQL_AGG_MAX,
+    CSD_SQL_AGG_AVG,
+};
+
+enum CsdSqlAggregateFlags {
+    CSD_SQL_AGG_DISTINCT = UINT16_C(1) << 0,
+};
+
+enum CsdSqlSortFlags {
+    CSD_SQL_SORT_DESC = UINT16_C(1) << 0,
+    CSD_SQL_SORT_NULLS_FIRST = UINT16_C(1) << 1,
+};
+
+enum CsdSqlStatusCode {
+    CSD_SQL_STATUS_OK = 0,
+    CSD_SQL_STATUS_BAD_ABI = 1,
+    CSD_SQL_STATUS_BAD_NODE = 2,
+    CSD_SQL_STATUS_BAD_EXPRESSION = 3,
+    CSD_SQL_STATUS_NO_STATUS_RANGE = 4,
+    CSD_SQL_STATUS_UNSUPPORTED = 5,
+    CSD_SQL_STATUS_BAD_PAGE = 6,
+    CSD_SQL_STATUS_OUTPUT_TOO_SMALL = 7,
+    CSD_SQL_STATUS_SPILL_TOO_SMALL = 8,
+    CSD_SQL_STATUS_NO_INPUT_RANGE = 9,
+};
+
+/*
+ * The plan payload consists of this header, fixed-size nodes and descriptors.
+ * It can be delivered as legacy command data, or placed in a CSD MRS entry
+ * when CSD_SQL_PLAN_STAGED_RANGE is set.  In the latter (production) mode,
+ * Program Execute cparam1 is plan_bytes and cparam2 selects the MRS entry;
+ * only that descriptor travels in the NVMe command.
+ */
+struct CsdSqlPlanHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_bytes;
+    uint32_t node_count;
+    uint32_t node_bytes;
+    uint32_t plan_bytes;
+    uint32_t root_node;
+    uint32_t flags;
+    uint32_t output_range;
+    uint32_t spill_range;
+    /* Zero is deterministic single-worker mode; otherwise capped by CSD. */
+    uint32_t parallel_workers;
+    uint64_t plan_id;
+    uint64_t work_mem_bytes;
+} __attribute__((packed));
+
+/* Inputs must refer to an earlier node ID, or CSD_SQL_INVALID_NODE. */
+struct CsdSqlPlanNode {
+    uint32_t node_id;
+    uint16_t opcode;
+    uint16_t flags;
+    uint32_t left_input;
+    uint32_t right_input;
+    uint32_t aux_input;
+    uint32_t expression_offset;
+    uint32_t expression_length;
+    uint32_t output_schema_id;
+    uint64_t estimated_rows;
+    uint64_t estimated_bytes;
+    uint64_t arg0;
+    uint64_t arg1;
+    uint32_t reserved;
+} __attribute__((packed));
+
+/* SCAN expression: CsdSqlScanSpec immediately followed by attr_count columns. */
+struct CsdSqlScanSpec {
+    uint32_t input_range;
+    uint32_t first_page;
+    uint32_t page_count;
+    uint16_t attr_count;
+    uint16_t output_count;
+    uint32_t flags;
+} __attribute__((packed));
+
+/*
+ * Physical attributes must appear in PostgreSQL attnum order.  attlen is the
+ * PostgreSQL typlen (-1 for varlena); alignment is one of 1, 2, 4 or 8.
+ * Numeric is normalized to a scaled int64 using numeric_scale.
+ */
+struct CsdSqlColumnSpec {
+    uint16_t attnum;
+    uint16_t output_column;
+    int16_t attlen;
+    uint8_t alignment;
+    uint8_t datum_type;
+    int32_t numeric_scale;
+    uint16_t flags;
+    uint16_t reserved;
+} __attribute__((packed));
+
+/* Followed by instruction_count CsdSqlExpressionInstruction records. */
+struct CsdSqlExpressionSpec {
+    uint16_t output_count;
+    uint16_t instruction_count;
+    uint16_t max_stack;
+    uint16_t flags;
+} __attribute__((packed));
+
+struct CsdSqlExpressionInstruction {
+    uint8_t opcode;
+    uint8_t datum_type;
+    uint16_t operand;
+    int16_t numeric_scale;
+    uint16_t flags;
+    uint32_t bytes_offset; /* relative to the complete plan blob */
+    uint32_t bytes_length;
+    int64_t immediate;
+} __attribute__((packed));
+
+/* Followed by group_count uint16 columns, then aggregate_count descriptors. */
+struct CsdSqlAggregateSpec {
+    uint16_t group_count;
+    uint16_t aggregate_count;
+    uint16_t flags;
+    uint16_t reserved;
+} __attribute__((packed));
+
+struct CsdSqlAggregateColumn {
+    uint16_t input_column;
+    uint8_t operation;
+    uint8_t datum_type;
+    int16_t output_scale;
+    uint16_t flags;
+} __attribute__((packed));
+
+/* Followed by key_count CsdSqlJoinKey descriptors. */
+struct CsdSqlJoinSpec {
+    uint16_t key_count;
+    uint16_t join_kind;
+    uint32_t residual_offset; /* optional expression over the joined row */
+    uint32_t residual_length;
+    uint32_t flags;
+} __attribute__((packed));
+
+struct CsdSqlJoinKey {
+    uint16_t left_key;
+    uint16_t right_key;
+} __attribute__((packed));
+
+/* Followed by key_count CsdSqlSortKey descriptors. */
+struct CsdSqlSortSpec {
+    uint16_t key_count;
+    uint16_t reserved;
+    uint64_t top_n; /* zero means all rows */
+} __attribute__((packed));
+
+struct CsdSqlSortKey {
+    uint16_t key_column;
+    uint16_t flags;
+} __attribute__((packed));
+
+/* Wire result in output_range: header, cell_count fixed cells, byte payload. */
+struct CsdSqlResultHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t status_code;
+    uint32_t root_node;
+    uint32_t row_count;
+    uint16_t column_count;
+    uint16_t reserved16;
+    uint64_t cell_count;
+    uint64_t cells_offset;
+    uint64_t bytes_offset;
+    uint64_t bytes_length;
+} __attribute__((packed));
+
+struct CsdSqlResultCell {
+    int64_t integer;
+    uint32_t bytes_offset; /* relative to CsdSqlResultHeader::bytes_offset */
+    uint16_t bytes_length;
+    uint8_t datum_type;
+    uint8_t flags; /* bit 0: NULL */
+    int16_t numeric_scale;
+    uint16_t reserved16;
+} __attribute__((packed));
+
+struct CsdSqlExecutionStatus {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t status_code;
+    uint32_t validated_nodes;
+    uint32_t executed_nodes;
+    uint32_t failed_node;
+    uint32_t reserved32;
+    uint64_t plan_id;
+    uint64_t estimated_bytes;
+    uint64_t input_rows;
+    uint64_t output_rows;
+    uint64_t spill_write_bytes;
+    uint64_t spill_read_bytes;
+    uint64_t modeled_cycles;
+    uint32_t canonicalized_nodes;
+    uint32_t software_fallback_nodes;
+} __attribute__((packed));
+
+#endif /* CSD_SQL_PLAN_H */
