@@ -4,14 +4,28 @@ services:
       context: .
       dockerfile: Dockerfile
     image: cemu_vm
-    container_name: cemu_dengyao
+    container_name: cemu_fpga_pushdown
     ports:
-      - "2222:2222"
+      # 2222 is already used by an unrelated CEMU experiment on this host.
+      - "2223:2222"
     working_dir: /workspace/code/CEMU/build
     environment:
       - CSD_COUNT=1
     volumes:
       - ./code/test-cemu:/workspace/code/CEMU/tests/cemu
+      # run-csd.sh is copied into build/ during image construction; mount it
+      # here so launch configuration changes do not require a full CEMU rebuild.
+      - ./code/CEMU/femu-scripts/run-csd.sh:/workspace/code/CEMU/build/run-csd.sh:ro
+      - ./code/CEMU/femu-scripts/cemu-mount.sh:/workspace/code/CEMU/femu-scripts/cemu-mount.sh:ro
+      # PostgreSQL is compiled once inside the persistent CEMU guest from this
+      # source tree, then installed in its qcow2 overlay.
+      - ./code/postgres:/workspace/code/postgres
       - ./data:/workspace/data
       - ./results:/workspace/results
       - ./scripts:/workspace/scripts
+      # Preserve the guest qcow2 overlay across compose recreations, including
+      # the provisioned non-root csdpg account.
+      - cemu_guest_disk:/workspace/code/dqib_amd64-pc
+
+volumes:
+  cemu_guest_disk:

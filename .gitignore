@@ -1,1 +1,7 @@
 code/dqib_amd64-pc
+build/
+code/test-cemu/build/
+.pgsock_*/
+results/**/*.log
+results/**/*.pid
+data

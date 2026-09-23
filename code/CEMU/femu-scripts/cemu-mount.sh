@@ -4,8 +4,9 @@ if [[ $# -ne 1 ]] || ! [[ $1 =~ ^[0-9]+$ ]]; then
 	echo "Usage: $0 <data size in GB (number)>"
 	exit 1
 fi
-echo "export CSD_TEST_DATA_SIZE=$1" >> ~/.bashrc
-source ~/.bashrc
+export CSD_TEST_DATA_SIZE="$1"
+grep -qxF "export CSD_TEST_DATA_SIZE=$1" ~/.bashrc || \
+	echo "export CSD_TEST_DATA_SIZE=$1" >> ~/.bashrc
 datasize=$1
 
 nr_dev=$(ls /sys/class/nvme | wc -l)
@@ -51,4 +52,4 @@ for ((i=0; i<$nr_dev; i++)); do
 	fi
 done
 
-cd ./CEMU/tests/cemu
+cd "$(dirname "$0")/../tests/cemu"
