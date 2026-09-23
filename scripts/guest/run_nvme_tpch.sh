@@ -33,6 +33,13 @@ cleanup() {
 trap cleanup EXIT
 
 "${PG_BIN}/pg_ctl" -D "${PGDATA}" -o "${OPTIONS}" -w start
+POSTMASTER_PID="$(head -n 1 "${PGDATA}/postmaster.pid")"
+CAP_EFFECTIVE="$(awk '$1 == "CapEff:" { print $2 }' "/proc/${POSTMASTER_PID}/status")"
+if (( (16#${CAP_EFFECTIVE} & (1 << 21)) == 0 )); then
+    echo "PostgreSQL postmaster is missing effective CAP_SYS_ADMIN." >&2
+    exit 1
+fi
+echo "PostgreSQL CAP_SYS_ADMIN active: pid=${POSTMASTER_PID}, CapEff=${CAP_EFFECTIVE}"
 "${PG_BIN}/psql" -v ON_ERROR_STOP=1 -U "${DB_USER}" -h "${SOCKET_DIR}" -p "${PORT}" -d "${DB_NAME}" <<'SQL'
 SELECT count(*) AS lineitem_rows FROM lineitem;
 SELECT count(*) AS orders_in_1995

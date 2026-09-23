@@ -44,9 +44,8 @@ echo "Shared files are available to ${PG_OS_USER} at ${USER_SHARE_ROOT}."
 echo "Change its password after first login: passwd ${PG_OS_USER}"
 
 # Grant csdpg permission to open the CEMU control and execute nodes after udev
-# creates them on every boot. Linux still requires CAP_SYS_ADMIN for unknown
-# NVMe passthrough opcodes; the PostgreSQL executor must use the forthcoming
-# constrained Program Execute allowlist rather than a broad process capability.
+# creates them on every boot. build_postgres.sh separately grants the postgres
+# executable CAP_SYS_ADMIN for the generic NVME_IOCTL_IO_CMD permission check.
 install -d -m 0755 /usr/local/sbin /etc/systemd/system
 cat >/usr/local/sbin/csd-grant-device-access <<EOF
 #!/usr/bin/env bash

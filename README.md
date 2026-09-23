@@ -80,6 +80,17 @@ ssh -p 2223 root@localhost
 ssh -p 2223 csdpg@localhost
 ```
 
+`build_postgres.sh` 会为 guest 内的 `/opt/pgsql12/bin/postgres` 设置
+`cap_sys_admin=ep`，使普通 `csdpg` backend 可以继续通过
+`NVME_IOCTL_IO_CMD` 提交 CEMU Program Execute，并保持原有 NVMe queue 与
+VM-Freeze 路径。已有安装无需重编，可由 root 重新授权：
+
+```bash
+/root/CEMU/scripts/guest/grant_csd_capability.sh
+```
+
+该能力仅用于科研仿真环境，不适用于生产部署。
+
 Docker named volume 会保存来宾 qcow2 覆盖层，因此 `csdpg` 用户与来宾
 内编译的 PostgreSQL 会跨 `docker compose up --force-recreate` 保留。为保证
 PostgreSQL 数据访问和 CSD 页读取都经过同一个 CEMU NVMe namespace，先停止
