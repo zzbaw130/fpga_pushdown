@@ -60,6 +60,7 @@ mkdir -p "${OUTPUT_DIR}"
 failures=0
 pending_expressions=0
 parameter_relocations=0
+subplan_rewrites=0
 
 for query in $(seq 1 22); do
     sql="${ROOT}/scripts/gen_data/queries/${query}.explain.sql"
@@ -103,6 +104,9 @@ for query in $(seq 1 22); do
         while IFS= read -r relocations; do
             parameter_relocations=$((parameter_relocations + relocations))
         done < <(sed -n 's/.*CSD Parameter Relocations: \([0-9][0-9]*\).*/\1/p' "${output}")
+        while IFS= read -r rewrites; do
+            subplan_rewrites=$((subplan_rewrites + rewrites))
+        done < <(sed -n 's/.*CSD SubPlan Rewrites: \([0-9][0-9]*\).*/\1/p' "${output}")
     elif [[ "${MODE}" == host ]] && grep -q 'Custom Scan (CsdScan)' "${output}"; then
         printf 'Q%02d FAIL (CsdScan present in host mode)\n' "${query}"
         failures=$((failures + 1))
@@ -117,8 +121,18 @@ if [[ "${failures}" -ne 0 ]]; then
     exit 1
 fi
 
+if [[ "${MODE}" == csd && "${pending_expressions}" -ne 0 ]]; then
+    echo "CSD plans retain ${pending_expressions} non-scalar expression(s)" >&2
+    exit 1
+fi
+if [[ "${MODE}" == csd && "${subplan_rewrites}" -ne 2 ]]; then
+    echo "Expected 2 TPC-H SubPlan rewrites, observed ${subplan_rewrites}" >&2
+    exit 1
+fi
+
 echo "All 22 TPC-H planner tests passed in ${MODE} mode."
 if [[ "${MODE}" == csd ]]; then
     echo "Pending non-scalar expressions: ${pending_expressions}"
     echo "Executor parameter relocations: ${parameter_relocations}"
+    echo "Relational SubPlan rewrites: ${subplan_rewrites}"
 fi

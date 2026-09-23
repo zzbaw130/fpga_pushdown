@@ -34,11 +34,12 @@ descriptor arrays; complex aggregate arguments use a streaming pre-projection
 and subquery outputs use positional projection. `PARAM_EXEC` inputs are marked
 as relocations and CEMU rejects them until the host executor patches the value.
 
-Result decoding and NVMe submission remain integration stages. Q2's correlated
-scalar `MIN` SubPlan and Q16's hashed `NOT IN SubPlan` are explicitly counted
-as pending relational rewrites; neither is emitted as an incorrect scalar
-predicate. There is no silent host fallback when a selected `CustomScan`
-reaches the executor.
+Q2's correlated scalar `MIN` is decorrelated into a grouped aggregate branch
+and two-key join. Q16's hashed `NOT IN` becomes a hash anti-join only after both
+columns are proven `NOT NULL`; both branches are merged into the outer CSD DAG.
+All 22 TPC-H plans therefore lower with zero pending expressions. Result
+decoding and NVMe submission remain integration stages, and there is no silent
+host fallback when a selected `CustomScan` reaches the executor.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

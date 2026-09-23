@@ -210,12 +210,17 @@ aggregate core; HAVING and final expressions form later streaming stages.
 PostgreSQL columns removed from a physical Group Key through functional
 dependency are added to the CSD key so the standalone result retains them.
 
-PostgreSQL `PARAM_EXEC` values become flagged constant relocations: an
-unpatched relocation is rejected by CEMU as a bad expression, never interpreted
-as SQL NULL. Two relational rewrites remain explicit rather than being emitted
-incorrectly as scalar bytecode: Q2's correlated scalar `MIN` SubPlan and Q16's
-hashed null-aware `NOT IN` SubPlan. The `CustomScan` executor therefore still
+Q2's correlated scalar `MIN` SubPlan is decorrelated into a grouped aggregate
+branch and a two-key join. Q16's hashed `NOT IN` SubPlan is converted to an
+anti-join only after both comparison columns are proven `NOT NULL`; otherwise
+the rewrite is refused so SQL's UNKNOWN result cannot be lost. Both subplans
+are merged into the same postorder CSD DAG with newly allocated input ranges.
+The forced-CSD TPC-H suite therefore has zero pending non-scalar expressions.
+
+PostgreSQL `PARAM_EXEC` values used by independent scalar InitPlans become
+flagged constant relocations: an unpatched relocation is rejected by CEMU as a
+bad expression, never interpreted as SQL NULL. The `CustomScan` executor still
 errors instead of submitting an incomplete plan or silently falling back. The
-next stage must attach/merge SubPlan DAGs, patch executor Params, submit the
-staged plan through CEMU Program Execute, and decode result tuples. Per-relation
-AER cache feedback follows that transport work.
+next stage must patch those executor Params, submit the staged plan through
+CEMU Program Execute, and decode result tuples. Per-relation AER cache feedback
+follows that transport work.

@@ -39,6 +39,8 @@ extern void csd_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 extern bool csd_expression_supported(Node *node, const char **reason);
 extern bool csd_expression_list_supported(List *expressions, const char **reason);
 extern const char *csd_upper_stage_name(UpperRelationKind stage);
+extern List *csd_rewrite_subplans(PlannerInfo *root, List *metadata,
+								  uint32 *rewrite_count);
 extern bytea *csd_lower_wire_plan(List *metadata, uint32 *node_count,
 								  uint32 *expression_count,
 								  uint32 *parameter_count,
