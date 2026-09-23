@@ -82,7 +82,7 @@ for query in $(seq 1 22); do
             continue
         fi
         csd_scans="$(grep -c 'Custom Scan (CsdScan)' "${output}")"
-        wire_plans="$(grep -c 'CSD Wire Status: ABI v4 scan/filter lowering' "${output}" || true)"
+        wire_plans="$(grep -c 'CSD Wire Status: ABI v4 scan/expression/join/aggregate/sort descriptors' "${output}" || true)"
         if [[ "${wire_plans}" -ne "${csd_scans}" ]]; then
             printf 'Q%02d FAIL (missing ABI v4 wire plan: scans=%s wire=%s)\n' \
                 "${query}" "${csd_scans}" "${wire_plans}"

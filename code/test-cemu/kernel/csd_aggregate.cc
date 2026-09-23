@@ -14,7 +14,8 @@
     bool execute_aggregate(uint32_t index, const CsdSqlPlanNode &node, const Batch &input, Batch *output)
     {
         const CsdSqlAggregateSpec *spec = NULL;
-        if (!expression_as(node, sizeof(CsdSqlAggregateSpec), &spec) || spec->aggregate_count == 0)
+        if (!expression_as(node, sizeof(CsdSqlAggregateSpec), &spec) ||
+            (spec->group_count == 0 && spec->aggregate_count == 0))
             return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
         uint64_t group_bytes = 0, aggregate_bytes = 0, descriptor_bytes = 0;
         if (!checked_mul(spec->group_count, sizeof(uint16_t), &group_bytes) ||

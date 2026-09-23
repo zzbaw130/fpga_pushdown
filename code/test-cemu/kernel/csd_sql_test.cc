@@ -676,6 +676,79 @@ void test_visibility_contract_is_required()
     assert(static_cast<uint32_t>(static_cast<uint64_t>(result) >> 32) == CSD_SQL_STATUS_UNSUPPORTED);
 }
 
+void test_group_only_distinct_aggregate()
+{
+    std::vector<unsigned char> page(CSD_SQL_PAGE_BYTES, 0);
+    put_u16(page.data() + 12, 24 + 3 * 4);
+    add_right_tuple(page.data(), 0, 128, 1, 10);
+    add_right_tuple(page.data(), 1, 192, 1, 20);
+    add_right_tuple(page.data(), 2, 256, 2, 30);
+
+    std::vector<unsigned char> plan(sizeof(CsdSqlPlanHeader) +
+                                    2 * sizeof(CsdSqlPlanNode), 0);
+    CsdSqlPlanNode scan_node = make_node(0, CSD_SQL_OP_SCAN);
+    CsdSqlScanSpec scan = {};
+    scan.input_range = 0;
+    scan.page_count = 1;
+    scan.attr_count = 2;
+    scan.output_count = 2;
+    scan.flags = CSD_SQL_SCAN_FROZEN_PAGES;
+    scan_node.expression_offset = append(&plan, scan);
+    for (uint16_t attribute = 0; attribute < 2; ++attribute) {
+        CsdSqlColumnSpec column = {};
+        column.attnum = attribute + 1;
+        column.output_column = attribute;
+        column.attlen = 4;
+        column.alignment = 4;
+        column.datum_type = CSD_SQL_TYPE_INT32;
+        column.flags = CSD_SQL_COLUMN_OUTPUT;
+        append(&plan, column);
+    }
+    scan_node.expression_length = sizeof(scan) + 2 * sizeof(CsdSqlColumnSpec);
+
+    CsdSqlPlanNode aggregate_node = make_node(1, CSD_SQL_OP_HASH_AGG);
+    aggregate_node.left_input = 0;
+    aggregate_node.flags = CSD_SQL_NODE_BLOCKING | CSD_SQL_NODE_SPILLABLE;
+    CsdSqlAggregateSpec aggregate = {};
+    aggregate.group_count = 1;
+    aggregate_node.expression_offset = append(&plan, aggregate);
+    const uint16_t group_column = 0;
+    append(&plan, group_column);
+    aggregate_node.expression_length = sizeof(aggregate) + sizeof(group_column);
+
+    CsdSqlPlanHeader header = {};
+    header.magic = CSD_SQL_PLAN_MAGIC;
+    header.version = CSD_SQL_PLAN_VERSION;
+    header.header_bytes = sizeof(header);
+    header.node_count = 2;
+    header.node_bytes = sizeof(CsdSqlPlanNode);
+    header.plan_bytes = plan.size();
+    header.root_node = 1;
+    header.flags = CSD_SQL_PLAN_FROZEN_SNAPSHOT;
+    header.output_range = 1;
+    header.spill_range = 2;
+    header.work_mem_bytes = 4096;
+    overwrite(&plan, 0, header);
+    overwrite(&plan, sizeof(header), scan_node);
+    overwrite(&plan, sizeof(header) + sizeof(scan_node), aggregate_node);
+
+    std::vector<unsigned char> output(1024, 0), spill(1024, 0);
+    void *ranges[] = {page.data(), output.data(), spill.data()};
+    long long lengths[] = {static_cast<long long>(page.size()),
+                           static_cast<long long>(output.size()),
+                           static_cast<long long>(spill.size())};
+    cemu_args args = {};
+    args.numr = 3;
+    args.mr_addr = ranges;
+    args.mr_len = lengths;
+    args.data_buffer = plan.data();
+    args.buffer_len = plan.size();
+    assert(csd_sql(&args) == 2);
+    const CsdSqlResultHeader *result =
+        reinterpret_cast<const CsdSqlResultHeader *>(output.data());
+    assert(result->row_count == 2 && result->column_count == 1);
+}
+
 void test_unpatched_parameter_is_rejected()
 {
     std::vector<unsigned char> page(CSD_SQL_PAGE_BYTES, 0);
@@ -756,6 +829,7 @@ int main()
     test_heap_pipeline_with_spill();
     test_tpch_expression_and_multikey_pipeline();
     test_join_canonicalization_and_residual();
+    test_group_only_distinct_aggregate();
     test_visibility_contract_is_required();
     test_unpatched_parameter_is_rejected();
     return 0;

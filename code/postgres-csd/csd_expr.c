@@ -4,6 +4,7 @@
 
 #include "catalog/pg_type.h"
 #include "datatype/timestamp.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
 #include "optimizer/clauses.h"
@@ -25,12 +26,25 @@ typedef struct CsdExpressionBuilder
 	uint32 instruction_capacity;
 	int stack_depth;
 	int max_stack;
-	Index scan_rti;
-	TupleDesc descriptor;
+	const CsdExprSchema *input_schema;
 	uint32 parameter_count;
 } CsdExpressionBuilder;
 
 static void csd_compile_expression(CsdExpressionBuilder *builder, Node *node);
+
+static Oid
+csd_expression_output_type(Node *expression)
+{
+	if (IsA(expression, FuncExpr))
+	{
+		const char *name = get_func_name(((FuncExpr *) expression)->funcid);
+
+		if (name != NULL && (strcmp(name, "date_part") == 0 ||
+			strcmp(name, "extract") == 0))
+			return INT4OID;
+	}
+	return exprType(expression);
+}
 
 static uint8
 csd_expression_type(Oid type_oid)
@@ -184,6 +198,64 @@ invalid:
 	pg_unreachable();
 }
 
+int16
+csd_expression_numeric_scale(Node *expression)
+{
+	int32 typmod;
+
+	if (expression == NULL)
+		return 0;
+	if (IsA(expression, TargetEntry))
+		expression = (Node *) ((TargetEntry *) expression)->expr;
+	if (exprType(expression) != NUMERICOID)
+		return 0;
+	typmod = exprTypmod(expression);
+	if (typmod >= VARHDRSZ)
+		return csd_numeric_typmod_scale(typmod);
+	if (IsA(expression, Const))
+	{
+		Const *constant = (Const *) expression;
+		int16 scale = 0;
+
+		if (!constant->constisnull)
+			(void) csd_numeric_constant(constant->constvalue, &scale);
+		return scale;
+	}
+	if (IsA(expression, OpExpr))
+	{
+		OpExpr *operation = (OpExpr *) expression;
+		const char *name = get_opname(operation->opno);
+		int16 left = csd_expression_numeric_scale(linitial(operation->args));
+		int16 right = list_length(operation->args) > 1 ?
+			csd_expression_numeric_scale(lsecond(operation->args)) : 0;
+
+		if (name != NULL && strcmp(name, "*") == 0)
+			return Min(18, left + right);
+		if (name != NULL && strcmp(name, "/") == 0)
+			return Min(18, Max(6, left));
+		return Max(left, right);
+	}
+	if (IsA(expression, Aggref))
+	{
+		Aggref *aggregate = (Aggref *) expression;
+		int16 scale = aggregate->args == NIL ? 0 :
+			csd_expression_numeric_scale(linitial(aggregate->args));
+		const char *name = get_func_name(aggregate->aggfnoid);
+
+		return name != NULL && strcmp(name, "avg") == 0 ?
+			Min(18, Max(6, scale)) : scale;
+	}
+	if (IsA(expression, RelabelType))
+		return csd_expression_numeric_scale((Node *) ((RelabelType *) expression)->arg);
+	if (IsA(expression, CoerceViaIO))
+		return csd_expression_numeric_scale((Node *) ((CoerceViaIO *) expression)->arg);
+	if (IsA(expression, CoerceToDomain))
+		return csd_expression_numeric_scale((Node *) ((CoerceToDomain *) expression)->arg);
+	if (IsA(expression, FuncExpr) && ((FuncExpr *) expression)->args != NIL)
+		return csd_expression_numeric_scale(linitial(((FuncExpr *) expression)->args));
+	return 0;
+}
+
 static void
 csd_compile_constant(CsdExpressionBuilder *builder, Oid type_oid, int32 typmod,
 					 Datum value, bool is_null)
@@ -243,25 +315,17 @@ csd_compile_constant(CsdExpressionBuilder *builder, Oid type_oid, int32 typmod,
 	csd_expression_stack(builder, 1);
 }
 
-static uint16
-csd_scan_column(CsdExpressionBuilder *builder, Var *variable)
+int
+csd_expr_schema_lookup(const CsdExprSchema *schema, Node *expression)
 {
-	uint16 output_column = 0;
-	int attribute;
+	uint16 column;
 
-	if (variable->varno != builder->scan_rti || variable->varattno <= 0 ||
-		variable->varattno > builder->descriptor->natts)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("CSD scan expression references a non-local variable")));
-	for (attribute = 0; attribute < variable->varattno - 1; ++attribute)
-		if (!TupleDescAttr(builder->descriptor, attribute)->attisdropped)
-			++output_column;
-	if (TupleDescAttr(builder->descriptor, variable->varattno - 1)->attisdropped)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("CSD scan expression references a dropped column")));
-	return output_column;
+	if (schema == NULL)
+		return -1;
+	for (column = 0; column < schema->count; ++column)
+		if (equal(schema->columns[column].expression, expression))
+			return column;
+	return -1;
 }
 
 static uint8
@@ -313,7 +377,7 @@ csd_compile_operator(CsdExpressionBuilder *builder, OpExpr *expression)
 	datum_type = expression->opresulttype == BOOLOID ? CSD_SQL_TYPE_BOOL :
 		csd_expression_type(expression->opresulttype);
 	scale = expression->opresulttype == NUMERICOID ?
-		csd_numeric_typmod_scale(exprTypmod((Node *) expression)) : 0;
+		csd_expression_numeric_scale((Node *) expression) : 0;
 	csd_expression_binary(builder, opcode, datum_type, scale);
 	if (strcmp(name, "!~~") == 0)
 		csd_expression_unary(builder, CSD_SQL_EXPR_NOT, CSD_SQL_TYPE_BOOL, 0);
@@ -458,21 +522,38 @@ unsupported:
 static void
 csd_compile_expression(CsdExpressionBuilder *builder, Node *node)
 {
+	int bound_column;
+
 	if (node == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("CSD expression cannot lower a NULL node")));
-	if (IsA(node, Var))
+	bound_column = csd_expr_schema_lookup(builder->input_schema, node);
+	if (bound_column >= 0)
 	{
-		Var *variable = (Var *) node;
+		CsdExprColumn *column = &builder->input_schema->columns[bound_column];
 		struct CsdSqlExpressionInstruction *instruction =
 			csd_expression_instruction(builder, CSD_SQL_EXPR_PUSH_COLUMN);
 
-		instruction->operand = csd_scan_column(builder, variable);
-		instruction->datum_type = csd_expression_type(variable->vartype);
-		instruction->numeric_scale = variable->vartype == NUMERICOID ?
-			csd_numeric_typmod_scale(variable->vartypmod) : 0;
+		instruction->operand = bound_column;
+		instruction->datum_type = csd_expression_type(column->type_oid);
+		instruction->numeric_scale = column->type_oid == NUMERICOID ?
+			csd_numeric_typmod_scale(column->typmod) : 0;
 		csd_expression_stack(builder, 1);
+	}
+	else if (IsA(node, Var))
+	{
+		List *schema_expressions = NIL;
+		uint16 column;
+
+		for (column = 0; column < builder->input_schema->count; ++column)
+			schema_expressions = lappend(schema_expressions,
+				builder->input_schema->columns[column].expression);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CSD expression references a column absent from its input schema"),
+				 errdetail("Unbound expression: %s; input schema: %s",
+					nodeToString(node), nodeToString(schema_expressions))));
 	}
 	else if (IsA(node, Const))
 	{
@@ -556,7 +637,8 @@ csd_compile_expression(CsdExpressionBuilder *builder, Node *node)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("expression node tag %d has no CSD bytecode lowering",
-						(int) nodeTag(node))));
+						(int) nodeTag(node)),
+				 errdetail("Unbound expression: %s", nodeToString(node))));
 }
 
 void
@@ -571,11 +653,12 @@ csd_append_scan_expression(StringInfo target, List *clauses, Index scan_rti,
 	uint32 instruction_offset;
 	uint32 constants_offset;
 	uint32 index;
+	CsdExprSchema scan_schema;
 
 	MemSet(&builder, 0, sizeof(builder));
 	builder.target = target;
-	builder.scan_rti = scan_rti;
-	builder.descriptor = descriptor;
+	csd_expr_schema_from_scan(&scan_schema, scan_rti, descriptor);
+	builder.input_schema = &scan_schema;
 	initStringInfo(&builder.constants);
 	foreach(cell, clauses)
 	{
@@ -616,6 +699,132 @@ csd_append_scan_expression(StringInfo target, List *clauses, Index scan_rti,
 		*parameter_count += builder.parameter_count;
 	pfree(builder.instructions);
 	pfree(builder.constants.data);
+	csd_expr_schema_release(&scan_schema);
+}
+
+void
+csd_append_expression_program(StringInfo target, List *expressions,
+							  const CsdExprSchema *input_schema,
+							  uint32 *offset, uint32 *length,
+							  uint32 *parameter_count)
+{
+	CsdExpressionBuilder builder;
+	struct CsdSqlExpressionSpec spec = {0};
+	ListCell *cell;
+	uint32 instruction_offset;
+	uint32 constants_offset;
+	uint32 index;
+
+	if (expressions == NIL || list_length(expressions) > PG_UINT16_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("CSD expression program has an invalid output count")));
+	MemSet(&builder, 0, sizeof(builder));
+	builder.target = target;
+	builder.input_schema = input_schema;
+	initStringInfo(&builder.constants);
+	foreach(cell, expressions)
+	{
+		Node *expression = (Node *) lfirst(cell);
+
+		if (IsA(expression, TargetEntry))
+			expression = (Node *) ((TargetEntry *) expression)->expr;
+		csd_compile_expression(&builder, expression);
+		csd_expression_instruction(&builder, CSD_SQL_EXPR_EMIT)->datum_type =
+			csd_expression_type(csd_expression_output_type(expression));
+		csd_expression_stack(&builder, -1);
+	}
+	if (builder.stack_depth != 0 || builder.max_stack == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("CSD expression compiler left an invalid stack depth")));
+	*offset = target->len;
+	spec.output_count = list_length(expressions);
+	spec.instruction_count = builder.instruction_count;
+	spec.max_stack = builder.max_stack;
+	appendBinaryStringInfo(target, (const char *) &spec, sizeof(spec));
+	instruction_offset = target->len;
+	constants_offset = instruction_offset + builder.instruction_count *
+		sizeof(*builder.instructions);
+	for (index = 0; index < builder.instruction_count; ++index)
+		if (builder.instructions[index].bytes_length != 0 &&
+			builder.instructions[index].opcode == CSD_SQL_EXPR_PUSH_CONSTANT)
+			builder.instructions[index].bytes_offset += constants_offset;
+	appendBinaryStringInfo(target, (const char *) builder.instructions,
+		builder.instruction_count * sizeof(*builder.instructions));
+	appendBinaryStringInfo(target, builder.constants.data, builder.constants.len);
+	*length = target->len - *offset;
+	if (parameter_count != NULL)
+		*parameter_count += builder.parameter_count;
+	pfree(builder.instructions);
+	pfree(builder.constants.data);
+}
+
+void
+csd_expr_schema_from_scan(CsdExprSchema *schema, Index scan_rti,
+						  TupleDesc descriptor)
+{
+	uint16 count = 0;
+	int attribute;
+
+	MemSet(schema, 0, sizeof(*schema));
+	for (attribute = 0; attribute < descriptor->natts; ++attribute)
+		if (!TupleDescAttr(descriptor, attribute)->attisdropped)
+			++count;
+	schema->count = count;
+	schema->columns = palloc0(count * sizeof(*schema->columns));
+	count = 0;
+	for (attribute = 0; attribute < descriptor->natts; ++attribute)
+	{
+		Form_pg_attribute pg_attribute = TupleDescAttr(descriptor, attribute);
+
+		if (pg_attribute->attisdropped)
+			continue;
+		schema->columns[count].expression = (Node *) makeVar(scan_rti,
+			attribute + 1, pg_attribute->atttypid, pg_attribute->atttypmod,
+			pg_attribute->attcollation, 0);
+		schema->columns[count].type_oid = pg_attribute->atttypid;
+		schema->columns[count].typmod = pg_attribute->atttypmod;
+		++count;
+	}
+}
+
+void
+csd_expr_schema_from_expressions(CsdExprSchema *schema, List *expressions)
+{
+	ListCell *cell;
+	uint16 count = 0;
+
+	if (list_length(expressions) > PG_UINT16_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("CSD schema exceeds 65535 columns")));
+	MemSet(schema, 0, sizeof(*schema));
+	schema->count = list_length(expressions);
+	schema->columns = palloc0(schema->count * sizeof(*schema->columns));
+	foreach(cell, expressions)
+	{
+		Node *expression = (Node *) lfirst(cell);
+
+		if (IsA(expression, TargetEntry))
+			expression = (Node *) ((TargetEntry *) expression)->expr;
+		schema->columns[count].expression = expression;
+		schema->columns[count].type_oid = csd_expression_output_type(expression);
+		schema->columns[count].typmod = exprTypmod(expression);
+		if (schema->columns[count].type_oid == NUMERICOID &&
+			schema->columns[count].typmod < VARHDRSZ)
+			schema->columns[count].typmod = VARHDRSZ +
+				csd_expression_numeric_scale(expression);
+		++count;
+	}
+}
+
+void
+csd_expr_schema_release(CsdExprSchema *schema)
+{
+	if (schema->columns != NULL)
+		pfree(schema->columns);
+	MemSet(schema, 0, sizeof(*schema));
 }
 
 List *

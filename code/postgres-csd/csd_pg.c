@@ -269,7 +269,8 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 						   intVal(list_nth(scan->custom_private, 11)), es);
 	ExplainPropertyInteger("CSD Pending Expressions", NULL,
 						   intVal(list_nth(scan->custom_private, 12)), es);
-	ExplainPropertyText("CSD Wire Status", "ABI v4 scan/filter lowering; blocking keys pending", es);
+	ExplainPropertyText("CSD Wire Status",
+		"ABI v4 scan/expression/join/aggregate/sort descriptors", es);
 	ExplainPropertyText("CSD Transport", "execution disabled", es);
 }
 
@@ -292,6 +293,6 @@ csd_engine_capabilities(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text(
 		"abi=4; scan; expression-vm; multikey-join; multikey-aggregate; "
-		"multikey-sort; spill-layout; planner-paths; wire-lowering=scan-filter; "
+		"multikey-sort; spill-layout; planner-paths; wire-lowering=operators; "
 		"transport=disabled"));
 }

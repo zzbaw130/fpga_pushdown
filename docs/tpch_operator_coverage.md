@@ -24,9 +24,11 @@ only filter/project/aggregate/inner hash join/sort is not sufficient.
 ## ABI v4 engine status
 
 The CSD engine now has a semantic representation for every operator and
-expression family used by the 22 queries. This means a lowering pass can emit
-an all-CSD DAG; it does **not** mean the unimplemented PostgreSQL lowering can
-already run the SQL files end to end.
+expression family used by the 22 queries. PostgreSQL emits real scan,
+projection, join, aggregate, sort, limit, and expression descriptors for all
+22 forced-CSD EXPLAIN cases. This does **not** yet mean that every SQL file can
+execute end to end: Q2 and Q16 still require SubPlan-to-DAG relational rewrites,
+and the transport/result path is intentionally disabled.
 
 | TPC-H requirement | ABI v4 lowering |
 | --- | --- |

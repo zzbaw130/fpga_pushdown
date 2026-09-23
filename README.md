@@ -100,8 +100,10 @@ CSD 计划 ABI、FPGA 风格算子、spill-to-flash、AER 缓存回填和 Postgr
 
 PostgreSQL 规划器扩展位于 `code/postgres-csd`。它目前支持
 `csd.exe_path = host|csd|auto`、TPC-H 所需表达式白名单、CSD
-scan/join/aggregate/sort 路径和递归算子成本元数据；执行器仍会明确拒绝尚未
-接通的 NVMe 传输。可用 SF1 已启动实例验证全部 22 条计划：
+scan/project/join/aggregate/sort/limit 的真实 ABI v4 lowering 和递归算子成本
+元数据；执行器仍会明确拒绝尚未接通的 NVMe 传输。Q2 的相关标量 SubPlan
+和 Q16 的空值安全 `NOT IN` 仍标为待转关系 DAG。可用 SF1 已启动实例验证
+全部 22 条计划：
 
 ```bash
 ./tests/test_csd_planner.sh --sf 1 --mode csd

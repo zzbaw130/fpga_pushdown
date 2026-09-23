@@ -195,18 +195,27 @@ page counts, and one physical column descriptor per PostgreSQL attribute.
 The scan descriptor intentionally does not assert the frozen-page flag: that
 must come from a real visibility/all-visible proof, not from forced mode.
 
-Base-relation restrictions are now lowered to the same bounded postfix VM used
-by CEMU.  This covers fixed-point/date constants, timestamp-at-midnight folding,
+Base-relation restrictions, projections, join residuals, HAVING clauses, and
+post-aggregate arithmetic are lowered to the same bounded postfix VM used by
+CEMU. This covers fixed-point/date constants, timestamp-at-midnight folding,
 arithmetic comparisons, SQL boolean/null logic, `LIKE`, constant-array `IN`,
-and substring.  PostgreSQL `PARAM_EXEC` values become flagged constant
-relocations: an unpatched relocation is rejected by CEMU as a bad expression,
-never interpreted as SQL NULL.  The TPC-H set currently exposes one deliberate
-pending expression, Q16's hashed `NOT IN SubPlan`; it requires a null-safe
-anti-join normalization and is not representable as scalar bytecode.
+`CASE`, and substring. Numeric expressions with unknown typmods get an
+explicit fixed-point scale inferred from their columns, constants, and
+arithmetic operators rather than silently collapsing to integer scale.
 
-Project bytecode and join/group/sort keys are still marked pending, and the
-`CustomScan` executor deliberately errors instead of submitting a semantically
-incomplete plan or silently falling back.  The next stage must finish those
-descriptors, normalize Q16, patch executor Params, submit the staged plan
-through CEMU Program Execute, and decode result tuples.  Per-relation AER cache
-feedback follows that transport work.
+Join keys, aggregate group/argument descriptors, aggregate `DISTINCT`, sort
+keys/direction/null ordering, and limits are now serialized as real ABI-v4
+payloads. Complex aggregate inputs are projected before the FPGA-style
+aggregate core; HAVING and final expressions form later streaming stages.
+PostgreSQL columns removed from a physical Group Key through functional
+dependency are added to the CSD key so the standalone result retains them.
+
+PostgreSQL `PARAM_EXEC` values become flagged constant relocations: an
+unpatched relocation is rejected by CEMU as a bad expression, never interpreted
+as SQL NULL. Two relational rewrites remain explicit rather than being emitted
+incorrectly as scalar bytecode: Q2's correlated scalar `MIN` SubPlan and Q16's
+hashed null-aware `NOT IN` SubPlan. The `CustomScan` executor therefore still
+errors instead of submitting an incomplete plan or silently falling back. The
+next stage must attach/merge SubPlan DAGs, patch executor Params, submit the
+staged plan through CEMU Program Execute, and decode result tuples. Per-relation
+AER cache feedback follows that transport work.

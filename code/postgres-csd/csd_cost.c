@@ -88,7 +88,8 @@ csd_path_metadata(const Path *path)
 		metadata = lappend(metadata, makeFloat(psprintf("%.17g", Max(1.0, path->rows))));
 		metadata = lappend(metadata, makeFloat(psprintf("%.17g",
 			Max(1.0, path->rows) * Max(1, path->pathtarget->width))));
-		return lappend(metadata, copyObject(path->pathtarget->exprs));
+		return lappend(metadata, list_make2(makeInteger(path->parent->relid),
+			copyObject(path->pathtarget->exprs)));
 	}
 	pg_unreachable();
 }
@@ -366,13 +367,15 @@ csd_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		copyObject(root->parse->groupClause),
 		copyObject(root->parse->sortClause));
 	payload = lappend(payload, copyObject(root->parse->havingQual));
-	if (stage == UPPERREL_FINAL && final_extra != NULL)
-	{
-		payload = lappend(payload,
-			makeString(psprintf(INT64_FORMAT, final_extra->count_est)));
-		payload = lappend(payload,
-			makeString(psprintf(INT64_FORMAT, final_extra->offset_est)));
-	}
+	/* Sort/group clauses identify entries in the parse target list. */
+	payload = lappend(payload, copyObject(root->parse->targetList));
+	payload = lappend(payload, copyObject(root->parse->distinctClause));
+	payload = lappend(payload, copyObject(root->parse->limitCount));
+	payload = lappend(payload, copyObject(root->parse->limitOffset));
+	payload = lappend(payload, makeInteger(final_extra != NULL ?
+		final_extra->count_est : -1));
+	payload = lappend(payload, makeInteger(final_extra != NULL ?
+		final_extra->offset_est : 0));
 	path = csd_make_path(output_rel, name, (int) stage, list_make1(input),
 						input->startup_cost, modeled, modeled,
 						stage == UPPERREL_ORDERED ? root->query_pathkeys : input->pathkeys,
