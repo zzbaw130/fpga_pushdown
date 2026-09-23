@@ -6,6 +6,7 @@
 #include "nodes/value.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/restrictinfo.h"
 
 #include "csd_pg.h"
 
@@ -68,7 +69,11 @@ csd_path_metadata(const Path *path)
 		metadata = list_make4(makeString(pstrdup("Project")), makeInteger(0),
 							  makeFloat(psprintf("%.17g", csd_path_modeled_cost(path))),
 							  makeFloat(psprintf("%.17g", csd_host_cache_fraction)));
-		return lappend(metadata, children);
+		metadata = lappend(metadata, children);
+		metadata = lappend(metadata, makeFloat(psprintf("%.17g", Max(1.0, path->rows))));
+		metadata = lappend(metadata, makeFloat(psprintf("%.17g",
+			Max(1.0, path->rows) * Max(1, path->pathtarget->width))));
+		return lappend(metadata, copyObject(path->pathtarget->exprs));
 	}
 	if (path != NULL && IsA(path, SubqueryScanPath))
 	{
@@ -79,7 +84,11 @@ csd_path_metadata(const Path *path)
 		metadata = list_make4(makeString(pstrdup("Subquery")), makeInteger(0),
 							  makeFloat(psprintf("%.17g", csd_path_modeled_cost(path))),
 							  makeFloat(psprintf("%.17g", csd_host_cache_fraction)));
-		return lappend(metadata, children);
+		metadata = lappend(metadata, children);
+		metadata = lappend(metadata, makeFloat(psprintf("%.17g", Max(1.0, path->rows))));
+		metadata = lappend(metadata, makeFloat(psprintf("%.17g",
+			Max(1.0, path->rows) * Max(1, path->pathtarget->width))));
+		return lappend(metadata, copyObject(path->pathtarget->exprs));
 	}
 	pg_unreachable();
 }
@@ -125,7 +134,7 @@ csd_keep_only_paths(RelOptInfo *rel)
 static CustomPath *
 csd_make_path(RelOptInfo *rel, const char *name, int detail, List *children,
 			  Cost startup_cost, Cost total_cost, double modeled_cost,
-			  List *pathkeys)
+			  List *pathkeys, Node *payload)
 {
 	CustomPath *path = makeNode(CustomPath);
 	Cost planner_startup = startup_cost;
@@ -169,6 +178,12 @@ csd_make_path(RelOptInfo *rel, const char *name, int detail, List *children,
 										makeFloat(psprintf("%.17g", modeled_cost)),
 										makeFloat(psprintf("%.17g", csd_host_cache_fraction)));
 	path->custom_private = lappend(path->custom_private, child_metadata);
+	path->custom_private = lappend(path->custom_private,
+		makeFloat(psprintf("%.17g", Max(1.0, rel->rows))));
+	path->custom_private = lappend(path->custom_private,
+		makeFloat(psprintf("%.17g", Max(1.0, rel->rows) *
+			Max(1, rel->reltarget->width))));
+	path->custom_private = lappend(path->custom_private, payload);
 	path->methods = &csd_path_methods;
 	return path;
 }
@@ -193,6 +208,7 @@ csd_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	double bytes;
 	double modeled;
 	CustomPath *path;
+	List *payload;
 
 	(void) root;
 	if (csd_exe_path == CSD_EXE_HOST || rte->rtekind != RTE_RELATION || rte->inh)
@@ -209,8 +225,11 @@ csd_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	modeled = csd_setup_cost + rel->pages * csd_flash_page_cost +
 		rows * csd_tuple_cost + bytes * csd_result_byte_cost +
 		rel->pages * csd_host_cache_fraction * seq_page_cost;
+	payload = list_make3(makeString(psprintf("%u", rte->relid)),
+		copyObject(rel->reltarget->exprs),
+		extract_actual_clauses(rel->baserestrictinfo, false));
 	path = csd_make_path(rel, "Scan", (int) rti, NIL,
-					 csd_setup_cost, modeled, modeled, NIL);
+					 csd_setup_cost, modeled, modeled, NIL, (Node *) payload);
 	add_path(rel, &path->path);
 	if (csd_exe_path == CSD_EXE_CSD)
 		csd_keep_only_paths(rel);
@@ -229,6 +248,7 @@ csd_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	double bytes;
 	double modeled;
 	CustomPath *path;
+	List *payload;
 
 	(void) root;
 	if (csd_exe_path == CSD_EXE_HOST)
@@ -264,9 +284,12 @@ csd_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	modeled = csd_path_modeled_cost(outer) + csd_path_modeled_cost(inner) +
 		(outer->rows + inner->rows) * csd_join_tuple_cost +
 		bytes * csd_result_byte_cost;
+	payload = list_make3(makeInteger((int) jointype),
+		extract_actual_clauses(extra->restrictlist, false),
+		copyObject(joinrel->reltarget->exprs));
 	path = csd_make_path(joinrel, name, (int) jointype,
 					 list_make2(outer, inner), csd_setup_cost, modeled,
-					 modeled, NIL);
+					 modeled, NIL, (Node *) payload);
 	add_path(joinrel, &path->path);
 	if (csd_exe_path == CSD_EXE_CSD)
 		csd_keep_only_paths(joinrel);
@@ -285,6 +308,7 @@ csd_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	double stage_cost = 0;
 	double modeled;
 	CustomPath *path;
+	List *payload;
 
 	if (csd_exe_path == CSD_EXE_HOST || input_rel == NULL || output_rel == NULL)
 		return;
@@ -336,9 +360,23 @@ csd_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	}
 	modeled = csd_path_modeled_cost(input) + stage_cost +
 		bytes * csd_result_byte_cost;
+	payload = list_make4(makeInteger((int) stage),
+		copyObject(root->upper_targets[stage] != NULL ?
+			root->upper_targets[stage]->exprs : output_rel->reltarget->exprs),
+		copyObject(root->parse->groupClause),
+		copyObject(root->parse->sortClause));
+	payload = lappend(payload, copyObject(root->parse->havingQual));
+	if (stage == UPPERREL_FINAL && final_extra != NULL)
+	{
+		payload = lappend(payload,
+			makeString(psprintf(INT64_FORMAT, final_extra->count_est)));
+		payload = lappend(payload,
+			makeString(psprintf(INT64_FORMAT, final_extra->offset_est)));
+	}
 	path = csd_make_path(output_rel, name, (int) stage, list_make1(input),
 						input->startup_cost, modeled, modeled,
-						stage == UPPERREL_ORDERED ? root->query_pathkeys : input->pathkeys);
+						stage == UPPERREL_ORDERED ? root->query_pathkeys : input->pathkeys,
+						(Node *) payload);
 	if (root->upper_targets[stage] != NULL)
 		path->path.pathtarget = root->upper_targets[stage];
 	path->path.rows = Max(1.0, rows);

@@ -23,10 +23,12 @@ EXPLAIN SELECT ...;
 ```
 
 The current executor intentionally rejects execution.  Planner selection,
-operator-tree metadata, and cost comparison are active; PostgreSQL-expression
-to ABI-v4 serialization and NVMe submission are the next integration stage.
-There is no silent host fallback when a selected `CustomScan` reaches the
-executor.
+operator-tree metadata, and cost comparison are active.  A selected path is
+already serialized into a structurally validated ABI-v4 header/node table;
+every scan contains the real heap page count and physical PostgreSQL column
+layout.  Expression bytecode, join/group/sort descriptors, result decoding,
+and NVMe submission remain the next integration stages.  There is no silent
+host fallback when a selected `CustomScan` reaches the executor.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

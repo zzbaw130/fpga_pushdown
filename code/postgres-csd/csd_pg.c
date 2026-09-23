@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+#include "catalog/pg_type.h"
 #include "commands/explain.h"
 #include "executor/nodeCustom.h"
 #include "nodes/makefuncs.h"
@@ -151,6 +152,9 @@ csd_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					 List *tlist, List *clauses, List *custom_plans)
 {
 	CustomScan *scan = makeNode(CustomScan);
+	Const *wire_plan;
+	bytea *wire_bytes;
+	uint32 wire_nodes = 0;
 
 	(void) root;
 	(void) clauses;
@@ -164,6 +168,12 @@ csd_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	/* Expressions will be encoded into the ABI wire plan before execution. */
 	scan->custom_exprs = NIL;
 	scan->custom_private = copyObject(best_path->custom_private);
+	wire_bytes = csd_lower_wire_plan(best_path->custom_private, &wire_nodes);
+	wire_plan = makeConst(BYTEAOID, -1, InvalidOid, -1,
+					  PointerGetDatum(wire_bytes), false, false);
+	scan->custom_private = lappend(scan->custom_private, wire_plan);
+	scan->custom_private = lappend(scan->custom_private,
+		makeInteger((int) wire_nodes));
 	/*
 	 * A base-relation CustomScan reads the relation's physical row type, so
 	 * setrefs must process its quals as ordinary scan expressions.  Supplying
@@ -231,6 +241,8 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	const char *name = strVal(list_nth(scan->custom_private, 0));
 	double modeled = floatVal(list_nth(scan->custom_private, 2));
 	double cache_fraction = floatVal(list_nth(scan->custom_private, 3));
+	Const *wire_plan = castNode(Const, list_nth(scan->custom_private, 8));
+	bytea *wire_bytes = DatumGetByteaPP(wire_plan->constvalue);
 
 	(void) ancestors;
 	ExplainPropertyText("CSD Operator", name, es);
@@ -238,7 +250,11 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 						   csd_metadata_operator_count(scan->custom_private), es);
 	ExplainPropertyFloat("CSD Modeled Cost", NULL, modeled, 3, es);
 	ExplainPropertyFloat("Host Cache Fraction", NULL, cache_fraction, 3, es);
-	ExplainPropertyText("CSD Transport", "lowering-only (execution disabled)", es);
+	ExplainPropertyInteger("CSD Wire Nodes", NULL,
+						   intVal(list_nth(scan->custom_private, 9)), es);
+	ExplainPropertyInteger("CSD Wire Bytes", NULL, VARSIZE_ANY_EXHDR(wire_bytes), es);
+	ExplainPropertyText("CSD Wire Status", "ABI v4 scan descriptors; expressions pending", es);
+	ExplainPropertyText("CSD Transport", "execution disabled", es);
 }
 
 static int
@@ -260,5 +276,6 @@ csd_engine_capabilities(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text(
 		"abi=4; scan; expression-vm; multikey-join; multikey-aggregate; "
-		"multikey-sort; spill-layout; planner-paths; transport=disabled"));
+		"multikey-sort; spill-layout; planner-paths; wire-lowering=scan-schema; "
+		"transport=disabled"));
 }

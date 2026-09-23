@@ -188,9 +188,16 @@ separate CSD commands and a top-level PostgreSQL `Limit` may remain as control
 orchestration, while host scan/join/aggregate/sort nodes are rejected by the
 planner test.
 
-This is a planner milestone, not completed query execution.  The `CustomScan`
-executor deliberately errors instead of silently falling back.  The next
-stage must serialize PostgreSQL relations, target expressions, quals, join
-keys, group keys, sort keys, subplan dependencies, and limits into ABI v4,
-then submit the staged plan through CEMU Program Execute and decode result
-tuples.  Per-relation AER cache feedback follows that transport work.
+This is not completed query execution.  `PlanCustomPath` now emits a packed,
+structurally self-validated ABI-v4 plan with postorder node IDs, dependencies,
+blocking/spill flags, estimates, work-mem budget, logical MRS slots, real heap
+page counts, and one physical column descriptor per PostgreSQL attribute.
+The scan descriptor intentionally does not assert the frozen-page flag: that
+must come from a real visibility/all-visible proof, not from forced mode.
+
+Expression payloads and join/group/sort keys are still marked pending, and the
+`CustomScan` executor deliberately errors instead of submitting a semantically
+incomplete plan or silently falling back.  The next stage must finish those
+descriptors, patch executor Params, submit the staged plan through CEMU Program
+Execute, and decode result tuples.  Per-relation AER cache feedback follows
+that transport work.
