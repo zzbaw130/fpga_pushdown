@@ -118,6 +118,12 @@ enum CsdSqlExpressionFlags {
     CSD_SQL_EXPR_CASE_INSENSITIVE = UINT16_C(1) << 0,
 };
 
+enum CsdSqlExpressionInstructionFlags {
+    CSD_SQL_EXPR_CONSTANT_NULL = UINT16_C(1) << 0,
+    /* Host executor must replace this PUSH_CONSTANT before Program Execute. */
+    CSD_SQL_EXPR_PARAMETER_PLACEHOLDER = UINT16_C(1) << 1,
+};
+
 enum CsdSqlAggregateOp {
     CSD_SQL_AGG_COUNT = 1,
     CSD_SQL_AGG_SUM,

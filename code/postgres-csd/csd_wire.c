@@ -10,6 +10,7 @@
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
+#include "csd_expr.h"
 #include "csd_plan.h"
 #include "csd_pg.h"
 
@@ -28,6 +29,9 @@ typedef struct CsdWireBuilder
 	uint32 node_count;
 	uint32 next_node;
 	uint32 next_input_range;
+	uint32 expression_count;
+	uint32 parameter_count;
+	uint32 pending_expression_count;
 } CsdWireBuilder;
 
 static uint32 csd_wire_count_nodes(List *metadata);
@@ -124,6 +128,17 @@ csd_wire_count_nodes(List *metadata)
 	List *children = (List *) list_nth(metadata, 4);
 	ListCell *cell;
 	uint32 count = 1;
+	const char *name = strVal(list_nth(metadata, 0));
+
+	if (strcmp(name, "Scan") == 0)
+	{
+		List *payload = (List *) list_nth(metadata, 7);
+		List *clauses = (List *) list_nth(payload, 2);
+		List *lowerable = csd_scan_lowerable_clauses(clauses, NULL);
+
+		if (lowerable != NIL)
+			++count;
+	}
 
 	foreach(cell, children)
 	{
@@ -276,6 +291,42 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 	csd_wire_append_payload(builder, &node, metadata, name, detail);
 	memcpy(builder->bytes.data + sizeof(CsdSqlPlanHeader) +
 		   node_id * sizeof(CsdSqlPlanNode), &node, sizeof(node));
+	if (node.opcode == CSD_SQL_OP_SCAN)
+	{
+		List *payload = (List *) list_nth(metadata, 7);
+		List *clauses = (List *) list_nth(payload, 2);
+		List *lowerable = csd_scan_lowerable_clauses(clauses,
+			&builder->pending_expression_count);
+
+		if (lowerable != NIL)
+		{
+			Oid relation_oid = (Oid) strtoul(strVal(list_nth(payload, 0)), NULL, 10);
+			Relation relation = table_open(relation_oid, NoLock);
+			CsdSqlPlanNode filter = {0};
+			uint32 filter_id = builder->next_node++;
+			uint32 expression_offset;
+			uint32 expression_length;
+
+			filter.node_id = filter_id;
+			filter.opcode = CSD_SQL_OP_FILTER;
+			filter.left_input = node_id;
+			filter.right_input = CSD_SQL_INVALID_NODE;
+			filter.aux_input = CSD_SQL_INVALID_NODE;
+			filter.estimated_rows = node.estimated_rows;
+			filter.estimated_bytes = node.estimated_bytes;
+			filter.arg1 = 1;
+			csd_append_scan_expression(&builder->bytes, lowerable, (Index) detail,
+				RelationGetDescr(relation), &expression_offset,
+				&expression_length, &builder->parameter_count);
+			filter.expression_offset = expression_offset;
+			filter.expression_length = expression_length;
+			table_close(relation, NoLock);
+			++builder->expression_count;
+			memcpy(builder->bytes.data + sizeof(CsdSqlPlanHeader) +
+				   filter_id * sizeof(CsdSqlPlanNode), &filter, sizeof(filter));
+			return filter_id;
+		}
+	}
 	return node_id;
 }
 
@@ -326,6 +377,23 @@ csd_wire_validate(const StringInfoData *bytes)
 				scan_bytes > node.expression_length)
 				goto invalid;
 		}
+		else if (node.opcode == CSD_SQL_OP_FILTER)
+		{
+			CsdSqlExpressionSpec expression;
+			uint64 expression_bytes;
+
+			if (node.expression_length < sizeof(expression))
+				goto invalid;
+			memcpy(&expression, bytes->data + node.expression_offset,
+				   sizeof(expression));
+			expression_bytes = sizeof(expression) +
+				(uint64) expression.instruction_count *
+				sizeof(struct CsdSqlExpressionInstruction);
+			if (expression.output_count == 0 || expression.instruction_count == 0 ||
+				expression.max_stack == 0 || expression.max_stack > 256 ||
+				expression_bytes > node.expression_length)
+				goto invalid;
+		}
 	}
 	return;
 
@@ -336,7 +404,9 @@ invalid:
 }
 
 bytea *
-csd_lower_wire_plan(List *metadata, uint32 *node_count)
+csd_lower_wire_plan(List *metadata, uint32 *node_count,
+					uint32 *expression_count, uint32 *parameter_count,
+					uint32 *pending_expression_count)
 {
 	CsdWireBuilder builder;
 	CsdSqlPlanHeader header = {0};
@@ -378,6 +448,12 @@ csd_lower_wire_plan(List *metadata, uint32 *node_count)
 	memcpy(VARDATA(result), builder.bytes.data, builder.bytes.len);
 	if (node_count != NULL)
 		*node_count = builder.node_count;
+	if (expression_count != NULL)
+		*expression_count = builder.expression_count;
+	if (parameter_count != NULL)
+		*parameter_count = builder.parameter_count;
+	if (pending_expression_count != NULL)
+		*pending_expression_count = builder.pending_expression_count;
 	pfree(builder.bytes.data);
 	return result;
 }

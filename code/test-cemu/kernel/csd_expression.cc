@@ -171,8 +171,10 @@
             } else if (instruction.opcode == CSD_SQL_EXPR_PUSH_CONSTANT) {
                 if (!is_supported_type(instruction.datum_type))
                     return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+                if (instruction.flags & CSD_SQL_EXPR_PARAMETER_PLACEHOLDER)
+                    return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
                 Value constant;
-                constant.is_null = (instruction.flags & 1U) != 0;
+                constant.is_null = (instruction.flags & CSD_SQL_EXPR_CONSTANT_NULL) != 0;
                 constant.type = instruction.datum_type;
                 constant.integer = instruction.immediate;
                 constant.numeric_scale = instruction.datum_type == CSD_SQL_TYPE_NUMERIC ? instruction.numeric_scale : 0;

@@ -1,0 +1,641 @@
+#include "postgres.h"
+
+#include <ctype.h>
+
+#include "catalog/pg_type.h"
+#include "datatype/timestamp.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/primnodes.h"
+#include "optimizer/clauses.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/int8.h"
+#include "utils/lsyscache.h"
+#include "utils/timestamp.h"
+
+#include "csd_expr.h"
+#include "csd_plan.h"
+
+typedef struct CsdExpressionBuilder
+{
+	StringInfo target;
+	StringInfoData constants;
+	struct CsdSqlExpressionInstruction *instructions;
+	uint32 instruction_count;
+	uint32 instruction_capacity;
+	int stack_depth;
+	int max_stack;
+	Index scan_rti;
+	TupleDesc descriptor;
+	uint32 parameter_count;
+} CsdExpressionBuilder;
+
+static void csd_compile_expression(CsdExpressionBuilder *builder, Node *node);
+
+static uint8
+csd_expression_type(Oid type_oid)
+{
+	switch (type_oid)
+	{
+		case INT2OID: return CSD_SQL_TYPE_INT16;
+		case INT4OID: return CSD_SQL_TYPE_INT32;
+		case INT8OID: return CSD_SQL_TYPE_INT64;
+		case DATEOID: return CSD_SQL_TYPE_DATE;
+		case TIMESTAMPOID: return CSD_SQL_TYPE_DATE;
+		case BOOLOID: return CSD_SQL_TYPE_BOOL;
+		case NUMERICOID: return CSD_SQL_TYPE_NUMERIC;
+		case CHAROID:
+		case BPCHAROID:
+		case VARCHAROID:
+		case TEXTOID:
+			return CSD_SQL_TYPE_BYTES;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("PostgreSQL expression type OID %u has no CSD datum type",
+							type_oid)));
+	}
+	pg_unreachable();
+}
+
+static int16
+csd_numeric_typmod_scale(int32 typmod)
+{
+	return typmod >= VARHDRSZ ? (int16) ((typmod - VARHDRSZ) & 0xffff) : 0;
+}
+
+static void
+csd_expression_stack(CsdExpressionBuilder *builder, int delta)
+{
+	builder->stack_depth += delta;
+	if (builder->stack_depth < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("CSD expression compiler produced a stack underflow")));
+	builder->max_stack = Max(builder->max_stack, builder->stack_depth);
+	if (builder->max_stack > 256)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("CSD expression stack exceeds 256 entries")));
+}
+
+static struct CsdSqlExpressionInstruction *
+csd_expression_instruction(CsdExpressionBuilder *builder, uint8 opcode)
+{
+	struct CsdSqlExpressionInstruction *instruction;
+
+	if (builder->instruction_count == PG_UINT16_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("CSD expression exceeds 65535 instructions")));
+	if (builder->instruction_count == builder->instruction_capacity)
+	{
+		builder->instruction_capacity = builder->instruction_capacity == 0 ? 32 :
+			builder->instruction_capacity * 2;
+		if (builder->instructions == NULL)
+			builder->instructions = palloc0(builder->instruction_capacity *
+				sizeof(*builder->instructions));
+		else
+			builder->instructions = repalloc(builder->instructions,
+				builder->instruction_capacity * sizeof(*builder->instructions));
+	}
+	instruction = &builder->instructions[builder->instruction_count++];
+	MemSet(instruction, 0, sizeof(*instruction));
+	instruction->opcode = opcode;
+	return instruction;
+}
+
+static void
+csd_expression_unary(CsdExpressionBuilder *builder, uint8 opcode,
+					 uint8 datum_type, int16 scale)
+{
+	struct CsdSqlExpressionInstruction *instruction =
+		csd_expression_instruction(builder, opcode);
+
+	if (builder->stack_depth < 1)
+		csd_expression_stack(builder, -1);
+	instruction->datum_type = datum_type;
+	instruction->numeric_scale = scale;
+}
+
+static void
+csd_expression_binary(CsdExpressionBuilder *builder, uint8 opcode,
+					  uint8 datum_type, int16 scale)
+{
+	struct CsdSqlExpressionInstruction *instruction =
+		csd_expression_instruction(builder, opcode);
+
+	if (builder->stack_depth < 2)
+		csd_expression_stack(builder, -2);
+	instruction->datum_type = datum_type;
+	instruction->numeric_scale = scale;
+	csd_expression_stack(builder, -1);
+}
+
+static int64
+csd_numeric_constant(Datum value, int16 *scale)
+{
+	Oid output_function;
+	bool variable_length;
+	char *text;
+	char *cursor;
+	char digits[128];
+	int digit_count = 0;
+	int fractional = 0;
+	bool after_decimal = false;
+	int64 result;
+
+	getTypeOutputInfo(NUMERICOID, &output_function, &variable_length);
+	text = OidOutputFunctionCall(output_function, value);
+	for (cursor = text; *cursor != '\0'; ++cursor)
+	{
+		if (*cursor == '.')
+		{
+			if (after_decimal)
+				goto invalid;
+			after_decimal = true;
+			continue;
+		}
+		if ((cursor == text && (*cursor == '-' || *cursor == '+')) ||
+			isdigit((unsigned char) *cursor))
+		{
+			if (digit_count >= (int) sizeof(digits) - 1)
+				goto invalid;
+			digits[digit_count++] = *cursor;
+			if (after_decimal && isdigit((unsigned char) *cursor))
+				++fractional;
+			continue;
+		}
+		goto invalid;
+	}
+	if (fractional > 18 || digit_count == 0)
+		goto invalid;
+	digits[digit_count] = '\0';
+	*scale = fractional;
+	if (!scanint8(digits, true, &result))
+		goto invalid;
+	return result;
+
+invalid:
+	ereport(ERROR,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("numeric constant %s cannot be represented by CSD fixed point",
+					text)));
+	pg_unreachable();
+}
+
+static void
+csd_compile_constant(CsdExpressionBuilder *builder, Oid type_oid, int32 typmod,
+					 Datum value, bool is_null)
+{
+	struct CsdSqlExpressionInstruction *instruction =
+		csd_expression_instruction(builder, CSD_SQL_EXPR_PUSH_CONSTANT);
+	uint8 datum_type = csd_expression_type(type_oid);
+
+	instruction->datum_type = datum_type;
+	if (is_null)
+		instruction->flags |= CSD_SQL_EXPR_CONSTANT_NULL;
+	else if (datum_type == CSD_SQL_TYPE_INT16)
+		instruction->immediate = DatumGetInt16(value);
+	else if (datum_type == CSD_SQL_TYPE_INT32)
+		instruction->immediate = DatumGetInt32(value);
+	else if (datum_type == CSD_SQL_TYPE_DATE)
+	{
+		if (type_oid == DATEOID)
+			instruction->immediate = DatumGetInt32(value);
+		else
+		{
+			Timestamp timestamp = DatumGetTimestamp(value);
+
+			if (timestamp % USECS_PER_DAY != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("CSD date comparator cannot represent a timestamp with time-of-day")));
+			instruction->immediate = timestamp / USECS_PER_DAY;
+		}
+	}
+	else if (datum_type == CSD_SQL_TYPE_INT64)
+		instruction->immediate = DatumGetInt64(value);
+	else if (datum_type == CSD_SQL_TYPE_BOOL)
+		instruction->immediate = DatumGetBool(value) ? 1 : 0;
+	else if (datum_type == CSD_SQL_TYPE_NUMERIC)
+	{
+		int16 scale;
+
+		instruction->immediate = csd_numeric_constant(value, &scale);
+		instruction->numeric_scale = scale;
+	}
+	else
+	{
+		struct varlena *bytes = PG_DETOAST_DATUM_PACKED(value);
+		Size length = VARSIZE_ANY_EXHDR(bytes);
+
+		if (length > PG_UINT32_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("CSD byte constant is too large")));
+		instruction->bytes_offset = builder->constants.len;
+		instruction->bytes_length = length;
+		appendBinaryStringInfo(&builder->constants, VARDATA_ANY(bytes), length);
+	}
+	if (datum_type == CSD_SQL_TYPE_NUMERIC && instruction->numeric_scale == 0)
+		instruction->numeric_scale = csd_numeric_typmod_scale(typmod);
+	csd_expression_stack(builder, 1);
+}
+
+static uint16
+csd_scan_column(CsdExpressionBuilder *builder, Var *variable)
+{
+	uint16 output_column = 0;
+	int attribute;
+
+	if (variable->varno != builder->scan_rti || variable->varattno <= 0 ||
+		variable->varattno > builder->descriptor->natts)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CSD scan expression references a non-local variable")));
+	for (attribute = 0; attribute < variable->varattno - 1; ++attribute)
+		if (!TupleDescAttr(builder->descriptor, attribute)->attisdropped)
+			++output_column;
+	if (TupleDescAttr(builder->descriptor, variable->varattno - 1)->attisdropped)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("CSD scan expression references a dropped column")));
+	return output_column;
+}
+
+static uint8
+csd_operator_opcode(const char *name)
+{
+	if (strcmp(name, "+") == 0) return CSD_SQL_EXPR_ADD;
+	if (strcmp(name, "-") == 0) return CSD_SQL_EXPR_SUBTRACT;
+	if (strcmp(name, "*") == 0) return CSD_SQL_EXPR_MULTIPLY;
+	if (strcmp(name, "/") == 0) return CSD_SQL_EXPR_DIVIDE;
+	if (strcmp(name, "=") == 0) return CSD_SQL_EXPR_EQUAL;
+	if (strcmp(name, "<>") == 0) return CSD_SQL_EXPR_NOT_EQUAL;
+	if (strcmp(name, "<") == 0) return CSD_SQL_EXPR_LESS;
+	if (strcmp(name, "<=") == 0) return CSD_SQL_EXPR_LESS_EQUAL;
+	if (strcmp(name, ">") == 0) return CSD_SQL_EXPR_GREATER;
+	if (strcmp(name, ">=") == 0) return CSD_SQL_EXPR_GREATER_EQUAL;
+	if (strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0)
+		return CSD_SQL_EXPR_LIKE;
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("operator %s has no CSD bytecode opcode", name)));
+	pg_unreachable();
+}
+
+static void
+csd_compile_operator(CsdExpressionBuilder *builder, OpExpr *expression)
+{
+	const char *name = get_opname(expression->opno);
+	ListCell *cell;
+	int argument_count = list_length(expression->args);
+	uint8 opcode;
+	uint8 datum_type;
+	int16 scale;
+
+	if (argument_count == 1 && strcmp(name, "-") == 0)
+	{
+		csd_compile_expression(builder, linitial(expression->args));
+		csd_expression_unary(builder, CSD_SQL_EXPR_NEGATE,
+			csd_expression_type(expression->opresulttype),
+			csd_numeric_typmod_scale(exprTypmod((Node *) expression)));
+		return;
+	}
+	if (argument_count != 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CSD operator %s requires one or two operands", name)));
+	foreach(cell, expression->args)
+		csd_compile_expression(builder, (Node *) lfirst(cell));
+	opcode = csd_operator_opcode(name);
+	datum_type = expression->opresulttype == BOOLOID ? CSD_SQL_TYPE_BOOL :
+		csd_expression_type(expression->opresulttype);
+	scale = expression->opresulttype == NUMERICOID ?
+		csd_numeric_typmod_scale(exprTypmod((Node *) expression)) : 0;
+	csd_expression_binary(builder, opcode, datum_type, scale);
+	if (strcmp(name, "!~~") == 0)
+		csd_expression_unary(builder, CSD_SQL_EXPR_NOT, CSD_SQL_TYPE_BOOL, 0);
+}
+
+static void
+csd_compile_scalar_array(CsdExpressionBuilder *builder,
+						ScalarArrayOpExpr *expression)
+{
+	Node *left = (Node *) linitial(expression->args);
+	Node *right = (Node *) lsecond(expression->args);
+	const char *name = get_opname(expression->opno);
+	uint8 comparison = csd_operator_opcode(name);
+	uint8 combine = expression->useOr ? CSD_SQL_EXPR_OR : CSD_SQL_EXPR_AND;
+	int elements = 0;
+
+	if (IsA(right, ArrayExpr))
+	{
+		ListCell *cell;
+
+		foreach(cell, ((ArrayExpr *) right)->elements)
+		{
+			csd_compile_expression(builder, left);
+			csd_compile_expression(builder, (Node *) lfirst(cell));
+			csd_expression_binary(builder, comparison, CSD_SQL_TYPE_BOOL, 0);
+			if (elements++ > 0)
+				csd_expression_binary(builder, combine, CSD_SQL_TYPE_BOOL, 0);
+		}
+	}
+	else if (IsA(right, Const) && !((Const *) right)->constisnull)
+	{
+		Const *array_constant = (Const *) right;
+		ArrayType *array = DatumGetArrayTypeP(array_constant->constvalue);
+		Oid element_type = ARR_ELEMTYPE(array);
+		int16 element_length;
+		bool element_by_value;
+		char element_alignment;
+		Datum *values;
+		bool *nulls;
+		int value_count;
+		int index;
+
+		get_typlenbyvalalign(element_type, &element_length, &element_by_value,
+			&element_alignment);
+		deconstruct_array(array, element_type, element_length, element_by_value,
+			element_alignment, &values, &nulls, &value_count);
+		for (index = 0; index < value_count; ++index)
+		{
+			csd_compile_expression(builder, left);
+			csd_compile_constant(builder, element_type, -1, values[index], nulls[index]);
+			csd_expression_binary(builder, comparison, CSD_SQL_TYPE_BOOL, 0);
+			if (elements++ > 0)
+				csd_expression_binary(builder, combine, CSD_SQL_TYPE_BOOL, 0);
+		}
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CSD scalar-array comparison requires a constant array")));
+	if (elements == 0)
+		csd_compile_constant(builder, BOOLOID, -1,
+			BoolGetDatum(!expression->useOr), false);
+}
+
+static void
+csd_compile_case_from(CsdExpressionBuilder *builder, List *arguments,
+					  Node *default_result)
+{
+	CaseWhen *when;
+
+	if (arguments == NIL)
+	{
+		csd_compile_expression(builder, default_result);
+		return;
+	}
+	when = castNode(CaseWhen, linitial(arguments));
+	csd_compile_expression(builder, (Node *) when->expr);
+	csd_compile_expression(builder, (Node *) when->result);
+	csd_compile_case_from(builder, list_delete_first(list_copy(arguments)),
+		default_result);
+	csd_expression_instruction(builder, CSD_SQL_EXPR_SELECT)->datum_type =
+		csd_expression_type(exprType((Node *) when->result));
+	csd_expression_stack(builder, -2);
+}
+
+static void
+csd_compile_function(CsdExpressionBuilder *builder, FuncExpr *expression)
+{
+	const char *name = get_func_name(expression->funcid);
+	static const char *const casts[] = {
+		"timestamp", "numeric", "int2", "int4", "int8", "float4", "float8",
+		"text", "bpchar"
+	};
+	int index;
+
+	for (index = 0; index < lengthof(casts); ++index)
+		if (strcmp(name, casts[index]) == 0)
+		{
+			if (list_length(expression->args) != 1)
+				break;
+			csd_compile_expression(builder, linitial(expression->args));
+			return;
+		}
+	if (strcmp(name, "date_part") == 0 || strcmp(name, "extract") == 0)
+	{
+		if (list_length(expression->args) != 2)
+			goto unsupported;
+		csd_compile_expression(builder, lsecond(expression->args));
+		csd_expression_unary(builder, CSD_SQL_EXPR_EXTRACT_YEAR,
+			CSD_SQL_TYPE_INT32, 0);
+		return;
+	}
+	if (strcmp(name, "substring") == 0 || strcmp(name, "substr") == 0)
+	{
+		Const *start;
+		Const *length;
+		struct CsdSqlExpressionInstruction *instruction;
+
+		if (list_length(expression->args) != 3 ||
+			!IsA(list_nth(expression->args, 1), Const) ||
+			!IsA(list_nth(expression->args, 2), Const))
+			goto unsupported;
+		start = castNode(Const, list_nth(expression->args, 1));
+		length = castNode(Const, list_nth(expression->args, 2));
+		if (start->constisnull || length->constisnull ||
+			start->consttype != INT4OID || length->consttype != INT4OID)
+			goto unsupported;
+		csd_compile_expression(builder, linitial(expression->args));
+		instruction = csd_expression_instruction(builder, CSD_SQL_EXPR_SUBSTRING);
+		instruction->datum_type = CSD_SQL_TYPE_BYTES;
+		instruction->operand = DatumGetInt32(start->constvalue);
+		instruction->bytes_length = DatumGetInt32(length->constvalue);
+		return;
+	}
+
+unsupported:
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("function %s has no CSD bytecode lowering", name)));
+}
+
+static void
+csd_compile_expression(CsdExpressionBuilder *builder, Node *node)
+{
+	if (node == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("CSD expression cannot lower a NULL node")));
+	if (IsA(node, Var))
+	{
+		Var *variable = (Var *) node;
+		struct CsdSqlExpressionInstruction *instruction =
+			csd_expression_instruction(builder, CSD_SQL_EXPR_PUSH_COLUMN);
+
+		instruction->operand = csd_scan_column(builder, variable);
+		instruction->datum_type = csd_expression_type(variable->vartype);
+		instruction->numeric_scale = variable->vartype == NUMERICOID ?
+			csd_numeric_typmod_scale(variable->vartypmod) : 0;
+		csd_expression_stack(builder, 1);
+	}
+	else if (IsA(node, Const))
+	{
+		Const *constant = (Const *) node;
+
+		csd_compile_constant(builder, constant->consttype, constant->consttypmod,
+			constant->constvalue, constant->constisnull);
+	}
+	else if (IsA(node, Param))
+	{
+		Param *parameter = (Param *) node;
+		struct CsdSqlExpressionInstruction *instruction;
+
+		if (parameter->paramid > PG_UINT16_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("CSD parameter ID exceeds ABI operand width")));
+		instruction = csd_expression_instruction(builder,
+			CSD_SQL_EXPR_PUSH_CONSTANT);
+		instruction->datum_type = csd_expression_type(parameter->paramtype);
+		instruction->numeric_scale = parameter->paramtype == NUMERICOID ?
+			csd_numeric_typmod_scale(parameter->paramtypmod) : 0;
+		instruction->operand = parameter->paramid;
+		instruction->flags = CSD_SQL_EXPR_CONSTANT_NULL |
+			CSD_SQL_EXPR_PARAMETER_PLACEHOLDER;
+		++builder->parameter_count;
+		csd_expression_stack(builder, 1);
+	}
+	else if (IsA(node, OpExpr))
+		csd_compile_operator(builder, (OpExpr *) node);
+	else if (IsA(node, ScalarArrayOpExpr))
+		csd_compile_scalar_array(builder, (ScalarArrayOpExpr *) node);
+	else if (IsA(node, BoolExpr))
+	{
+		BoolExpr *boolean = (BoolExpr *) node;
+		ListCell *cell;
+		int compiled = 0;
+
+		foreach(cell, boolean->args)
+		{
+			csd_compile_expression(builder, (Node *) lfirst(cell));
+			if (compiled++ > 0)
+				csd_expression_binary(builder,
+					boolean->boolop == AND_EXPR ? CSD_SQL_EXPR_AND : CSD_SQL_EXPR_OR,
+					CSD_SQL_TYPE_BOOL, 0);
+		}
+		if (boolean->boolop == NOT_EXPR)
+			csd_expression_unary(builder, CSD_SQL_EXPR_NOT, CSD_SQL_TYPE_BOOL, 0);
+	}
+	else if (IsA(node, NullTest))
+	{
+		NullTest *test = (NullTest *) node;
+
+		csd_compile_expression(builder, (Node *) test->arg);
+		csd_expression_unary(builder,
+			test->nulltesttype == IS_NULL ? CSD_SQL_EXPR_IS_NULL :
+			CSD_SQL_EXPR_IS_NOT_NULL, CSD_SQL_TYPE_BOOL, 0);
+	}
+	else if (IsA(node, CaseExpr))
+	{
+		CaseExpr *case_expression = (CaseExpr *) node;
+
+		if (case_expression->arg != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("simple CASE requires preprocessing before CSD lowering")));
+		csd_compile_case_from(builder, case_expression->args,
+			(Node *) case_expression->defresult);
+	}
+	else if (IsA(node, FuncExpr))
+		csd_compile_function(builder, (FuncExpr *) node);
+	else if (IsA(node, RelabelType))
+		csd_compile_expression(builder, (Node *) ((RelabelType *) node)->arg);
+	else if (IsA(node, CoerceViaIO))
+		csd_compile_expression(builder, (Node *) ((CoerceViaIO *) node)->arg);
+	else if (IsA(node, CoerceToDomain))
+		csd_compile_expression(builder, (Node *) ((CoerceToDomain *) node)->arg);
+	else if (IsA(node, CollateExpr))
+		csd_compile_expression(builder, (Node *) ((CollateExpr *) node)->arg);
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("expression node tag %d has no CSD bytecode lowering",
+						(int) nodeTag(node))));
+}
+
+void
+csd_append_scan_expression(StringInfo target, List *clauses, Index scan_rti,
+						   TupleDesc descriptor, uint32 *offset, uint32 *length,
+						   uint32 *parameter_count)
+{
+	CsdExpressionBuilder builder;
+	struct CsdSqlExpressionSpec spec = {0};
+	ListCell *cell;
+	uint32 compiled = 0;
+	uint32 instruction_offset;
+	uint32 constants_offset;
+	uint32 index;
+
+	MemSet(&builder, 0, sizeof(builder));
+	builder.target = target;
+	builder.scan_rti = scan_rti;
+	builder.descriptor = descriptor;
+	initStringInfo(&builder.constants);
+	foreach(cell, clauses)
+	{
+		csd_compile_expression(&builder, (Node *) lfirst(cell));
+		if (compiled++ > 0)
+			csd_expression_binary(&builder, CSD_SQL_EXPR_AND,
+				CSD_SQL_TYPE_BOOL, 0);
+	}
+	if (compiled == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("cannot emit an empty CSD filter expression")));
+	csd_expression_instruction(&builder, CSD_SQL_EXPR_EMIT)->datum_type =
+		CSD_SQL_TYPE_BOOL;
+	csd_expression_stack(&builder, -1);
+	if (builder.stack_depth != 0 || builder.max_stack == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("CSD expression compiler left an invalid stack depth")));
+
+	*offset = target->len;
+	spec.output_count = 1;
+	spec.instruction_count = builder.instruction_count;
+	spec.max_stack = builder.max_stack;
+	appendBinaryStringInfo(target, (const char *) &spec, sizeof(spec));
+	instruction_offset = target->len;
+	constants_offset = instruction_offset + builder.instruction_count *
+		sizeof(*builder.instructions);
+	for (index = 0; index < builder.instruction_count; ++index)
+		if (builder.instructions[index].bytes_length != 0 &&
+			builder.instructions[index].opcode == CSD_SQL_EXPR_PUSH_CONSTANT)
+			builder.instructions[index].bytes_offset += constants_offset;
+	appendBinaryStringInfo(target, (const char *) builder.instructions,
+		builder.instruction_count * sizeof(*builder.instructions));
+	appendBinaryStringInfo(target, builder.constants.data, builder.constants.len);
+	*length = target->len - *offset;
+	if (parameter_count != NULL)
+		*parameter_count += builder.parameter_count;
+	pfree(builder.instructions);
+	pfree(builder.constants.data);
+}
+
+List *
+csd_scan_lowerable_clauses(List *clauses, uint32 *pending_count)
+{
+	List *lowerable = NIL;
+	ListCell *cell;
+
+	foreach(cell, clauses)
+	{
+		Node *clause = (Node *) lfirst(cell);
+
+		/* A hashed SubPlan must become a CSD semi/anti join, not scalar bytecode. */
+		if (contain_subplans(clause))
+		{
+			if (pending_count != NULL)
+				++*pending_count;
+			continue;
+		}
+		lowerable = lappend(lowerable, clause);
+	}
+	return lowerable;
+}

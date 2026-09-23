@@ -58,6 +58,8 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 failures=0
+pending_expressions=0
+parameter_relocations=0
 
 for query in $(seq 1 22); do
     sql="${ROOT}/scripts/gen_data/queries/${query}.explain.sql"
@@ -80,7 +82,7 @@ for query in $(seq 1 22); do
             continue
         fi
         csd_scans="$(grep -c 'Custom Scan (CsdScan)' "${output}")"
-        wire_plans="$(grep -c 'CSD Wire Status: ABI v4 scan descriptors' "${output}" || true)"
+        wire_plans="$(grep -c 'CSD Wire Status: ABI v4 scan/filter lowering' "${output}" || true)"
         if [[ "${wire_plans}" -ne "${csd_scans}" ]]; then
             printf 'Q%02d FAIL (missing ABI v4 wire plan: scans=%s wire=%s)\n' \
                 "${query}" "${csd_scans}" "${wire_plans}"
@@ -95,6 +97,12 @@ for query in $(seq 1 22); do
             failures=$((failures + 1))
             continue
         fi
+        while IFS= read -r pending; do
+            pending_expressions=$((pending_expressions + pending))
+        done < <(sed -n 's/.*CSD Pending Expressions: \([0-9][0-9]*\).*/\1/p' "${output}")
+        while IFS= read -r relocations; do
+            parameter_relocations=$((parameter_relocations + relocations))
+        done < <(sed -n 's/.*CSD Parameter Relocations: \([0-9][0-9]*\).*/\1/p' "${output}")
     elif [[ "${MODE}" == host ]] && grep -q 'Custom Scan (CsdScan)' "${output}"; then
         printf 'Q%02d FAIL (CsdScan present in host mode)\n' "${query}"
         failures=$((failures + 1))
@@ -110,3 +118,7 @@ if [[ "${failures}" -ne 0 ]]; then
 fi
 
 echo "All 22 TPC-H planner tests passed in ${MODE} mode."
+if [[ "${MODE}" == csd ]]; then
+    echo "Pending non-scalar expressions: ${pending_expressions}"
+    echo "Executor parameter relocations: ${parameter_relocations}"
+fi

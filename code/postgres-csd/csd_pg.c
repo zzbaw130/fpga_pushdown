@@ -155,6 +155,9 @@ csd_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	Const *wire_plan;
 	bytea *wire_bytes;
 	uint32 wire_nodes = 0;
+	uint32 wire_expressions = 0;
+	uint32 wire_parameters = 0;
+	uint32 pending_expressions = 0;
 
 	(void) root;
 	(void) clauses;
@@ -168,12 +171,19 @@ csd_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	/* Expressions will be encoded into the ABI wire plan before execution. */
 	scan->custom_exprs = NIL;
 	scan->custom_private = copyObject(best_path->custom_private);
-	wire_bytes = csd_lower_wire_plan(best_path->custom_private, &wire_nodes);
+	wire_bytes = csd_lower_wire_plan(best_path->custom_private, &wire_nodes,
+		&wire_expressions, &wire_parameters, &pending_expressions);
 	wire_plan = makeConst(BYTEAOID, -1, InvalidOid, -1,
 					  PointerGetDatum(wire_bytes), false, false);
 	scan->custom_private = lappend(scan->custom_private, wire_plan);
 	scan->custom_private = lappend(scan->custom_private,
 		makeInteger((int) wire_nodes));
+	scan->custom_private = lappend(scan->custom_private,
+		makeInteger((int) wire_expressions));
+	scan->custom_private = lappend(scan->custom_private,
+		makeInteger((int) wire_parameters));
+	scan->custom_private = lappend(scan->custom_private,
+		makeInteger((int) pending_expressions));
 	/*
 	 * A base-relation CustomScan reads the relation's physical row type, so
 	 * setrefs must process its quals as ordinary scan expressions.  Supplying
@@ -253,7 +263,13 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	ExplainPropertyInteger("CSD Wire Nodes", NULL,
 						   intVal(list_nth(scan->custom_private, 9)), es);
 	ExplainPropertyInteger("CSD Wire Bytes", NULL, VARSIZE_ANY_EXHDR(wire_bytes), es);
-	ExplainPropertyText("CSD Wire Status", "ABI v4 scan descriptors; expressions pending", es);
+	ExplainPropertyInteger("CSD Expression Programs", NULL,
+						   intVal(list_nth(scan->custom_private, 10)), es);
+	ExplainPropertyInteger("CSD Parameter Relocations", NULL,
+						   intVal(list_nth(scan->custom_private, 11)), es);
+	ExplainPropertyInteger("CSD Pending Expressions", NULL,
+						   intVal(list_nth(scan->custom_private, 12)), es);
+	ExplainPropertyText("CSD Wire Status", "ABI v4 scan/filter lowering; blocking keys pending", es);
 	ExplainPropertyText("CSD Transport", "execution disabled", es);
 }
 
@@ -276,6 +292,6 @@ csd_engine_capabilities(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text(
 		"abi=4; scan; expression-vm; multikey-join; multikey-aggregate; "
-		"multikey-sort; spill-layout; planner-paths; wire-lowering=scan-schema; "
+		"multikey-sort; spill-layout; planner-paths; wire-lowering=scan-filter; "
 		"transport=disabled"));
 }
