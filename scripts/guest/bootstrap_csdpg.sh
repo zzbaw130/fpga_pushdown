@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run once as root in the guest.  The account UID/GID intentionally matches the
-# owner of the 9p-mounted PGDATA, so PostgreSQL can access it without root.
+# Run once as root in the guest. The account UID/GID intentionally matches the
+# source PGDATA so its ownership remains valid after staging it onto CEMU NVMe.
 set -euo pipefail
 
 DATA_ROOT="${CSD_DATA_ROOT:-/root/CEMU/data}"
@@ -43,11 +43,10 @@ echo "Provisioned ${PG_OS_USER} (uid=${owner_uid}, gid=${owner_gid})."
 echo "Shared files are available to ${PG_OS_USER} at ${USER_SHARE_ROOT}."
 echo "Change its password after first login: passwd ${PG_OS_USER}"
 
-# CEMU exposes program-control and program-execute character devices as root
-# only.  PostgreSQL and the CSD runner intentionally use the unprivileged
-# account above, so grant that account's *group* access after udev has created
-# the CEMU nodes on every guest boot.  This never grants access to the block
-# namespaces themselves.
+# Grant csdpg permission to open the CEMU control and execute nodes after udev
+# creates them on every boot. Linux still requires CAP_SYS_ADMIN for unknown
+# NVMe passthrough opcodes; the PostgreSQL executor must use the forthcoming
+# constrained Program Execute allowlist rather than a broad process capability.
 install -d -m 0755 /usr/local/sbin /etc/systemd/system
 cat >/usr/local/sbin/csd-grant-device-access <<EOF
 #!/usr/bin/env bash

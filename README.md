@@ -81,19 +81,22 @@ ssh -p 2223 csdpg@localhost
 ```
 
 Docker named volume 会保存来宾 qcow2 覆盖层，因此 `csdpg` 用户与来宾
-内编译的 PostgreSQL 会跨 `docker compose up --force-recreate` 保留。登录
-`csdpg` 后，直接在 9p 挂载的 `data/tpch_s<SF>` 上运行只读冒烟测试，
-不复制数据库：
+内编译的 PostgreSQL 会跨 `docker compose up --force-recreate` 保留。为保证
+PostgreSQL 数据访问和 CSD 页读取都经过同一个 CEMU NVMe namespace，先停止
+主机上的对应实例，再以 root 将 cluster 从 9p 共享目录一次性装载到 NVMe。
+当前开发和验证默认使用 SF=1：
 
 ```bash
-/mnt/cemu/scripts/guest/run_shared_tpch.sh 1
+# Guest root：自动挂载 NVMe/FDMFS 并复制 SF=1 PGDATA
+/root/CEMU/scripts/guest/stage_tpch_nvme.sh 1
+
+# Guest csdpg：使用 guest 内编译的 PostgreSQL 验证 NVMe 副本
+/mnt/cemu/scripts/guest/run_nvme_tpch.sh 1
 ```
 
-运行直接挂载测试前必须停止对应的主机 PostgreSQL 实例。PostgreSQL 即使
-只读查询也会创建 PID 文件和少量状态文件，因此同一 PGDATA 不能同时被
-主机和来宾使用。9p 直接运行仅用于功能验证；正式 CSD 性能实验应让
-PostgreSQL 主机端使用 CSD 的本地块设备，避免将 9p 的额外开销当作 CSD
-性能。
+装载脚本拒绝复制带有 `postmaster.pid` 的活动 cluster，并在 NVMe 上已有同名
+副本时要求显式使用 `--force`。9p 只承担一次性数据导入，不进入查询执行或
+CSD 性能测量路径。CEMU 设备重新初始化后需要重新运行装载脚本。
 
 CSD 计划 ABI、FPGA 风格算子、spill-to-flash、AER 缓存回填和 PostgreSQL
 `csd.exe_path` 放置策略的实现边界见 [CSD 设计文档](docs/csd_design.md)。
