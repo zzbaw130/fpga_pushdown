@@ -73,6 +73,8 @@ enum CsdSqlColumnFlags {
     CSD_SQL_COLUMN_OUTPUT = UINT16_C(1) << 0,
     /* Data in a varlena datum must not be external/TOASTed. */
     CSD_SQL_COLUMN_NO_EXTERNAL = UINT16_C(1) << 1,
+    /* PostgreSQL bpchar comparison ignores physical blank padding. */
+    CSD_SQL_COLUMN_TRIM_SPACE = UINT16_C(1) << 2,
 };
 
 enum CsdSqlDatumType {

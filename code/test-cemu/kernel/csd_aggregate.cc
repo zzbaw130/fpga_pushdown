@@ -10,6 +10,33 @@
         return key;
     }
 
+	/* Match PostgreSQL numeric division's minimum of 16 significant decimal
+	 * digits.  Numeric stores four decimal digits per base-10000 weight, so the
+	 * display scale is 16 - qweight * 4 (subject to the input dscale floor). */
+	static int16_t average_scale(__int128 sum, int64_t count, int16_t input_scale)
+	{
+		if (sum == 0 || count <= 0)
+			return std::max<int16_t>(16, input_scale);
+		__int128 magnitude = sum < 0 ? -sum : sum;
+		__int128 denominator = count;
+		if (!multiply_power10(&denominator, input_scale)) return -1;
+		int qweight = 0;
+		if (magnitude >= denominator) {
+			while (denominator <= magnitude / 10000) {
+				denominator *= 10000;
+				++qweight;
+			}
+		} else {
+			qweight = -1;
+			while (magnitude <= denominator / 10000) {
+				magnitude *= 10000;
+				--qweight;
+			}
+		}
+		const int scale = std::max<int>(input_scale, 16 - qweight * 4);
+		return scale <= 36 ? static_cast<int16_t>(scale) : -1;
+	}
+
     /* Blocking banked hash aggregate with multi-key and DISTINCT state. */
     bool execute_aggregate(uint32_t index, const CsdSqlPlanNode &node, const Batch &input, Batch *output)
     {
@@ -36,13 +63,14 @@
             const CsdSqlAggregateColumn &aggregate = aggregates[aggregate_index];
             if ((aggregate.input_column != CSD_SQL_NO_COLUMN && aggregate.input_column >= input.columns) ||
                 !is_supported_type(aggregate.datum_type) || aggregate.operation < CSD_SQL_AGG_COUNT ||
-                aggregate.operation > CSD_SQL_AGG_AVG || aggregate.output_scale < 0 || aggregate.output_scale > 18)
+                aggregate.operation > CSD_SQL_AGG_AVG || aggregate.output_scale < -1 || aggregate.output_scale > 18)
                 return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
         }
         struct AggregateState {
             Row groups;
             std::vector<int64_t> count;
             std::vector<__int128> sum;
+			std::vector<int16_t> scale;
             std::vector<Value> minimum;
             std::vector<Value> maximum;
             std::vector<bool> has_value;
@@ -63,6 +91,7 @@
                     state.groups.push_back((*row)[group_columns[group]]);
                 state.count.assign(spec->aggregate_count, 0);
                 state.sum.assign(spec->aggregate_count, 0);
+				state.scale.assign(spec->aggregate_count, -1);
                 state.minimum.assign(spec->aggregate_count, Value());
                 state.maximum.assign(spec->aggregate_count, Value());
                 state.has_value.assign(spec->aggregate_count, false);
@@ -87,10 +116,21 @@
                 if (value == NULL || value->type == CSD_SQL_TYPE_BYTES)
                     return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
                 ++state.count[aggregate_index];
-                __int128 scaled = 0;
-                if (!scaled_integer(*value, aggregate.output_scale, &scaled))
-                    return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                state.sum[aggregate_index] += scaled;
+				if (aggregate.operation == CSD_SQL_AGG_SUM || aggregate.operation == CSD_SQL_AGG_AVG) {
+					const int16_t value_scale = value->type == CSD_SQL_TYPE_NUMERIC ? value->numeric_scale : 0;
+					int16_t target_scale = aggregate.output_scale;
+					if (target_scale < 0) {
+						target_scale = std::max<int16_t>(state.scale[aggregate_index], value_scale);
+						if (state.scale[aggregate_index] >= 0 && target_scale > state.scale[aggregate_index] &&
+							!multiply_power10(&state.sum[aggregate_index], target_scale - state.scale[aggregate_index]))
+							return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+					}
+					__int128 scaled = 0;
+					if (!scaled_integer(*value, target_scale, &scaled))
+						return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+					state.scale[aggregate_index] = target_scale;
+					state.sum[aggregate_index] += scaled;
+				}
                 if (!state.has_value[aggregate_index] || compare_value(*value, state.minimum[aggregate_index]) < 0)
                     state.minimum[aggregate_index] = *value;
                 if (!state.has_value[aggregate_index] || compare_value(*value, state.maximum[aggregate_index]) > 0)
@@ -102,6 +142,7 @@
             AggregateState state;
             state.count.assign(spec->aggregate_count, 0);
             state.sum.assign(spec->aggregate_count, 0);
+			state.scale.assign(spec->aggregate_count, -1);
             state.minimum.assign(spec->aggregate_count, Value());
             state.maximum.assign(spec->aggregate_count, Value());
             state.has_value.assign(spec->aggregate_count, false);
@@ -116,7 +157,9 @@
                 Value value;
                 value.type = aggregate.operation == CSD_SQL_AGG_COUNT ?
                     static_cast<uint8_t>(CSD_SQL_TYPE_INT64) : aggregate.datum_type;
-                value.numeric_scale = value.type == CSD_SQL_TYPE_NUMERIC ? aggregate.output_scale : 0;
+				value.numeric_scale = value.type == CSD_SQL_TYPE_NUMERIC ?
+					(state->scale[aggregate_index] >= 0 ? state->scale[aggregate_index] :
+					 (aggregate.output_scale >= 0 ? aggregate.output_scale : 0)) : 0;
                 switch (aggregate.operation) {
                 case CSD_SQL_AGG_COUNT:
                     value.is_null = false;
@@ -130,9 +173,41 @@
                     break;
                 case CSD_SQL_AGG_AVG:
                     if (!state->has_value[aggregate_index]) break;
-                    value.is_null = false;
-                    value.integer = static_cast<int64_t>(state->sum[aggregate_index] / state->count[aggregate_index]);
+					{
+						const int16_t source_scale = state->scale[aggregate_index];
+						int16_t result_scale = aggregate.output_scale >= 0 ?
+							aggregate.output_scale : average_scale(state->sum[aggregate_index],
+								state->count[aggregate_index], source_scale);
+						if (result_scale < 0)
+							return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+						__int128 quotient = 0;
+						for (;;) {
+							__int128 numerator = state->sum[aggregate_index];
+							__int128 denominator = state->count[aggregate_index];
+							bool scaled = true;
+							if (result_scale >= source_scale)
+								scaled = multiply_power10(&numerator, result_scale - source_scale);
+							else
+								scaled = multiply_power10(&denominator, source_scale - result_scale);
+							if (scaled) {
+								quotient = numerator / denominator;
+								__int128 remainder = numerator % denominator;
+								if (remainder < 0) remainder = -remainder;
+								if (remainder * 2 >= denominator)
+									quotient += numerator < 0 ? -1 : 1;
+								if (fits_i64(quotient)) break;
+							}
+							/* Explicit typmods are contracts.  Only a dynamic numeric AVG may
+							 * trade fractional digits for the fixed-point wire's range. */
+							if (aggregate.output_scale >= 0 || result_scale <= source_scale)
+								return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+							--result_scale;
+						}
+					value.is_null = false;
+						value.integer = static_cast<int64_t>(quotient);
+						value.numeric_scale = result_scale;
                     break;
+					}
                 case CSD_SQL_AGG_MIN:
                     value = state->minimum[aggregate_index];
                     break;

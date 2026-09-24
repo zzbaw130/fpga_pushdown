@@ -31,8 +31,6 @@ SOURCE="${SHARED_DATA_ROOT}/tpch_s${SF}"
 DEST_ROOT="${NVME_MOUNT}/pgdata"
 DEST="${DEST_ROOT}/tpch_s${SF}"
 INCOMING="${DEST}.incoming.$$"
-FDM_RANGE_COUNT="${CSD_FDM_RANGE_COUNT:-32}"
-FDM_RANGE_SIZE="${CSD_FDM_RANGE_SIZE:-32m}"
 FDM_GROUP="${CSD_FDM_GROUP:-${PG_OS_USER:-csdpg}}"
 
 [[ -b "${NVME_DEVICE}" ]] || { echo "Missing NVMe namespace: ${NVME_DEVICE}" >&2; exit 1; }
@@ -57,15 +55,12 @@ if [[ -b "${FDM_DEVICE}" ]]; then
     if ! mountpoint -q "${FDM_MOUNT}"; then
         mount -t fdmfs "${FDM_DEVICE}" "${FDM_MOUNT}"
     fi
-    for ((range = 0; range < FDM_RANGE_COUNT; ++range)); do
-        range_path="${FDM_MOUNT}/${range}"
-        if [[ ! -e "${range_path}" ]]; then
-            touch "${range_path}"
-            fallocate -l "${FDM_RANGE_SIZE}" "${range_path}"
-        fi
-        chgrp "${FDM_GROUP}" "${range_path}"
-        chmod 0660 "${range_path}"
-    done
+	# Query execution recreates numeric files at the exact size of each input,
+	# result, spill, plan and status range.  The mount therefore belongs to the
+	# dedicated PostgreSQL user; fixed 32 MiB benchmark files would strand half
+	# of the finite FDM before a real TPC-H query starts.
+	chown "${FDM_GROUP}:${FDM_GROUP}" "${FDM_MOUNT}"
+	find "${FDM_MOUNT}" -maxdepth 1 -type f -name '[0-9]*' -delete
 fi
 
 mkdir -p "${DEST_ROOT}"

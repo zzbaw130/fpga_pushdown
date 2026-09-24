@@ -188,7 +188,7 @@ separate CSD commands and a top-level PostgreSQL `Limit` may remain as control
 orchestration, while host scan/join/aggregate/sort nodes are rejected by the
 planner test.
 
-This is not completed query execution.  `PlanCustomPath` now emits a packed,
+`PlanCustomPath` emits a packed,
 structurally self-validated ABI-v4 plan with postorder node IDs, dependencies,
 blocking/spill flags, estimates, work-mem budget, logical MRS slots, real heap
 page counts, and one physical column descriptor per PostgreSQL attribute.
@@ -219,8 +219,10 @@ The forced-CSD TPC-H suite therefore has zero pending non-scalar expressions.
 
 PostgreSQL `PARAM_EXEC` values used by independent scalar InitPlans become
 flagged constant relocations: an unpatched relocation is rejected by CEMU as a
-bad expression, never interpreted as SQL NULL. The `CustomScan` executor still
-errors instead of submitting an incomplete plan or silently falling back. The
-next stage must patch those executor Params, submit the staged plan through
-CEMU Program Execute, and decode result tuples. Per-relation AER cache feedback
-follows that transport work.
+bad expression, never interpreted as SQL NULL. The `CustomScan` executor
+patches these relocations lazily, stages physical heaps to FDMFS, creates an
+MRS, submits `NVME_IOCTL_IO_CMD`, checks the status range, and decodes result
+cells into PostgreSQL tuples. Duplicate logical scans share one physical staged
+heap, while output and spill remain separate query-local ranges. SF=1 execution
+of all 22 supplied queries matches HOST results exactly. Per-relation AER cache
+feedback remains the next transport-control milestone.

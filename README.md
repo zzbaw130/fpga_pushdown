@@ -117,12 +117,31 @@ PostgreSQL 规划器扩展位于 `code/postgres-csd`。它目前支持
 scan/project/join/aggregate/sort/limit 的真实 ABI v4 lowering 和递归算子成本
 元数据；Q2 的相关标量 SubPlan 会解相关为分组聚合加双键连接，Q16 在证明
 两侧列均为 NOT NULL 后转为 hash anti-join，因此 22 条查询已无 pending
-表达式。执行器仍会明确拒绝尚未接通的 NVMe 传输。可用 SF1 已启动实例验证：
+表达式。执行器将 heap 文件用 `copy_file_range` 暂存到 FDMFS，创建 CEMU MRS，
+通过原始 `NVME_IOCTL_IO_CMD` Program Execute 路径触发 TCG VM-Freeze，随后把
+结果 cell 解码回 PostgreSQL slot。相同 relation 的多个逻辑 Scan 共享一份 FDM
+暂存数据；query-local range 在成功或错误退出时都会回收，spill 预留会在 2GB
+memory namespace 紧张时自适应缩小。可用 SF1 已启动实例验证 planner：
 
 ```bash
 ./tests/test_csd_planner.sh --sf 1 --mode csd
 ./tests/test_csd_planner.sh --sf 1 --mode host --skip-build
 ```
+
+在 guest 内启动 NVMe PGDATA 后，可执行完整结果对比。脚本逐条运行 CSD/HOST、
+保存原始输出并要求 22 条结果精确一致：
+
+```bash
+cd /mnt/cemu
+./tests/test_csd_tpch_execution.sh --sf 1 \
+  --socket-dir /tmp/csdpg_tpch --port 57432 \
+  --shared-library /workspace/code/CEMU/tests/cemu/build/csd_sql.so
+```
+
+当前 SF=1 的全部 22 条查询已经在真实 CEMU Program Execute 路径执行并与
+同一 guest PostgreSQL 的 HOST 结果逐字符一致。该结论是功能正确性里程碑，
+不是最终性能结论；正式性能实验仍需固定 cache 状态、CEMU runtime 参数和
+主机墙钟/模拟时钟口径。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD

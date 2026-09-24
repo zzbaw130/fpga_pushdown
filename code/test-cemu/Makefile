@@ -1,5 +1,5 @@
 BUILD_DIR := build
-TARGETS = $(BUILD_DIR)/libcemu.a $(BUILD_DIR)/csd_sql_example
+TARGETS = $(BUILD_DIR)/libcemu.a $(BUILD_DIR)/csd_sql_example $(BUILD_DIR)/csd_sql_replay
 
 CC = gcc
 CXX = g++
@@ -25,6 +25,9 @@ $(BUILD_DIR)/libcemu.a: util.c util.h cemu_ioctl.h
 
 $(BUILD_DIR)/csd_sql_example: csd_sql_example.cpp $(BUILD_DIR)/libcemu.a kernel/csd_plan.h
 	$(CXX) $(CXXFLAGS) -o $@ csd_sql_example.cpp $(BUILD_DIR)/libcemu.a
+
+$(BUILD_DIR)/csd_sql_replay: csd_sql_replay.cpp kernel/csd_sql.cc kernel/csd_plan.h
+	$(CXX) $(CXXFLAGS) -std=c++11 -pthread -o $@ csd_sql_replay.cpp kernel/csd_sql.cc
 
 clean:
 	rm -rf $(BUILD_DIR)

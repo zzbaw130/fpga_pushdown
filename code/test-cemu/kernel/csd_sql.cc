@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -369,10 +370,11 @@ private:
         *result = reinterpret_cast<const T *>(static_cast<const char *>(plan_data_) + node.expression_offset);
         return true;
     }
-    bool fail(uint16_t code, uint32_t node)
+    bool fail(uint16_t code, uint32_t node, uint32_t detail = 0)
     {
         { std::lock_guard<std::mutex> guard(status_mutex_);
-          if (!failed_) { status_.status_code = code; status_.failed_node = node; failed_ = true; } }
+          if (!failed_) { status_.status_code = code; status_.failed_node = node;
+			  status_.reserved32 = detail; failed_ = true; } }
         write_status();
         return false;
     }

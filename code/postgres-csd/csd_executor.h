@@ -1,0 +1,24 @@
+#ifndef CSD_EXECUTOR_H
+#define CSD_EXECUTOR_H
+
+#include "postgres.h"
+
+#include "executor/nodeCustom.h"
+
+extern Node *csd_executor_create_state(CustomScan *scan);
+extern void csd_executor_begin(CustomScanState *node, EState *estate, int eflags);
+extern TupleTableSlot *csd_executor_next(CustomScanState *node);
+extern void csd_executor_end(CustomScanState *node);
+extern void csd_executor_rescan(CustomScanState *node);
+
+extern char *csd_control_device;
+extern char *csd_execute_device;
+extern char *csd_fdm_path;
+extern char *csd_shared_library;
+extern int csd_output_mb;
+extern int csd_spill_mb;
+extern int csd_parallel_workers;
+extern int csd_program_runtime;
+extern int csd_device_work_mem_mb;
+
+#endif

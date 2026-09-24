@@ -75,7 +75,7 @@ csd_expression_type(Oid type_oid)
 static int16
 csd_numeric_typmod_scale(int32 typmod)
 {
-	return typmod >= VARHDRSZ ? (int16) ((typmod - VARHDRSZ) & 0xffff) : 0;
+	return typmod >= VARHDRSZ ? (int16) ((typmod - VARHDRSZ) & 0xffff) : -1;
 }
 
 static void
@@ -204,7 +204,7 @@ csd_expression_numeric_scale(Node *expression)
 	int32 typmod;
 
 	if (expression == NULL)
-		return 0;
+		return -1;
 	if (IsA(expression, TargetEntry))
 		expression = (Node *) ((TargetEntry *) expression)->expr;
 	if (exprType(expression) != NUMERICOID)
@@ -229,10 +229,12 @@ csd_expression_numeric_scale(Node *expression)
 		int16 right = list_length(operation->args) > 1 ?
 			csd_expression_numeric_scale(lsecond(operation->args)) : 0;
 
+		if (left < 0 || right < 0)
+			return -1;
 		if (name != NULL && strcmp(name, "*") == 0)
 			return Min(18, left + right);
 		if (name != NULL && strcmp(name, "/") == 0)
-			return Min(18, Max(6, left));
+			return -1;
 		return Max(left, right);
 	}
 	if (IsA(expression, Aggref))
@@ -242,6 +244,8 @@ csd_expression_numeric_scale(Node *expression)
 			csd_expression_numeric_scale(linitial(aggregate->args));
 		const char *name = get_func_name(aggregate->aggfnoid);
 
+		if (scale < 0)
+			return -1;
 		return name != NULL && strcmp(name, "avg") == 0 ?
 			Min(18, Max(6, scale)) : scale;
 	}
@@ -253,7 +257,7 @@ csd_expression_numeric_scale(Node *expression)
 		return csd_expression_numeric_scale((Node *) ((CoerceToDomain *) expression)->arg);
 	if (IsA(expression, FuncExpr) && ((FuncExpr *) expression)->args != NIL)
 		return csd_expression_numeric_scale(linitial(((FuncExpr *) expression)->args));
-	return 0;
+	return -1;
 }
 
 static void
@@ -266,7 +270,11 @@ csd_compile_constant(CsdExpressionBuilder *builder, Oid type_oid, int32 typmod,
 
 	instruction->datum_type = datum_type;
 	if (is_null)
+	{
 		instruction->flags |= CSD_SQL_EXPR_CONSTANT_NULL;
+		if (datum_type == CSD_SQL_TYPE_NUMERIC)
+			instruction->numeric_scale = csd_numeric_typmod_scale(typmod);
+	}
 	else if (datum_type == CSD_SQL_TYPE_INT16)
 		instruction->immediate = DatumGetInt16(value);
 	else if (datum_type == CSD_SQL_TYPE_INT32)
@@ -310,8 +318,6 @@ csd_compile_constant(CsdExpressionBuilder *builder, Oid type_oid, int32 typmod,
 		instruction->bytes_length = length;
 		appendBinaryStringInfo(&builder->constants, VARDATA_ANY(bytes), length);
 	}
-	if (datum_type == CSD_SQL_TYPE_NUMERIC && instruction->numeric_scale == 0)
-		instruction->numeric_scale = csd_numeric_typmod_scale(typmod);
 	csd_expression_stack(builder, 1);
 }
 
@@ -813,8 +819,12 @@ csd_expr_schema_from_expressions(CsdExprSchema *schema, List *expressions)
 		schema->columns[count].typmod = exprTypmod(expression);
 		if (schema->columns[count].type_oid == NUMERICOID &&
 			schema->columns[count].typmod < VARHDRSZ)
-			schema->columns[count].typmod = VARHDRSZ +
-				csd_expression_numeric_scale(expression);
+		{
+			int16 scale = csd_expression_numeric_scale(expression);
+
+			if (scale >= 0)
+				schema->columns[count].typmod = VARHDRSZ + scale;
+		}
 		++count;
 	}
 }

@@ -23,6 +23,7 @@ services:
       - ./data:/workspace/data
       - ./results:/workspace/results
       - ./scripts:/workspace/scripts
+      - ./tests:/workspace/tests
       # Preserve the guest qcow2 overlay across compose recreations, including
       # the provisioned non-root csdpg account.
       - cemu_guest_disk:/workspace/code/dqib_amd64-pc

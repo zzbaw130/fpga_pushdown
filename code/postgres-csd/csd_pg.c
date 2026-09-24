@@ -10,6 +10,7 @@
 #include "utils/guc.h"
 
 #include "csd_pg.h"
+#include "csd_executor.h"
 
 PG_MODULE_MAGIC;
 
@@ -126,6 +127,35 @@ _PG_init(void)
 						 "Observed fraction of relation pages resident in host cache.", NULL,
 						 &csd_host_cache_fraction, 0.0, 0.0, 1.0,
 						 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable("csd.control_device", "CEMU control device.", NULL,
+						   &csd_control_device, "/dev/nvme0c3", PGC_USERSET, 0,
+						   NULL, NULL, NULL);
+	DefineCustomStringVariable("csd.execute_device", "CEMU NVMe execute device.", NULL,
+						   &csd_execute_device, "/dev/ng0n3", PGC_USERSET, 0,
+						   NULL, NULL, NULL);
+	DefineCustomStringVariable("csd.fdm_path", "FDMFS range directory.", NULL,
+						   &csd_fdm_path, "/mnt/fdm0", PGC_USERSET, 0,
+						   NULL, NULL, NULL);
+	DefineCustomStringVariable("csd.shared_library", "Host-visible CSD SQL shared library.", NULL,
+						   &csd_shared_library,
+						   "/workspace/code/CEMU/tests/cemu/build/csd_sql.so",
+						   PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.output_mb", "FDM space reserved for returned rows.", NULL,
+						&csd_output_mb, 64, 1, 1024, PGC_USERSET, 0,
+						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.spill_mb", "FDM space reserved for spill-to-flash.", NULL,
+						&csd_spill_mb, 256, 1, 8192, PGC_USERSET, 0,
+						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.parallel_workers", "CSD software FPGA worker lanes.", NULL,
+						&csd_parallel_workers, 4, 0, 32, PGC_USERSET, 0,
+						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.program_runtime", "CEMU modeled Program Execute runtime.", NULL,
+						&csd_program_runtime, 0, 0, INT_MAX, PGC_USERSET, 0,
+						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.device_work_mem_mb",
+						"Functional-model memory threshold before spill.", NULL,
+						&csd_device_work_mem_mb, 8192, 0, INT_MAX, PGC_USERSET, 0,
+						NULL, NULL, NULL);
 
 	RegisterCustomScanMethods(&csd_scan_methods);
 	previous_rel_hook = set_rel_pathlist_hook;
@@ -207,10 +237,8 @@ csd_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 static Node *
 csd_create_scan_state(CustomScan *scan)
 {
-	CustomScanState *state = palloc0(sizeof(CustomScanState));
+	CustomScanState *state = (CustomScanState *) csd_executor_create_state(scan);
 
-	(void) scan;
-	NodeSetTag(state, T_CustomScanState);
 	state->methods = &csd_exec_methods;
 	return (Node *) state;
 }
@@ -218,35 +246,25 @@ csd_create_scan_state(CustomScan *scan)
 static void
 csd_begin_scan(CustomScanState *node, EState *estate, int eflags)
 {
-	(void) node;
-	(void) estate;
-	(void) eflags;
+	csd_executor_begin(node, estate, eflags);
 }
 
 static TupleTableSlot *
 csd_exec_scan(CustomScanState *node)
 {
-	CustomScan *scan = (CustomScan *) node->ss.ps.plan;
-	const char *name = strVal(linitial(scan->custom_private));
-
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("CSD execution transport is not enabled for %s", name),
-			 errdetail("The planner path and lowering surface are active, but NVMe submission is intentionally not connected yet."),
-			 errhint("Use SET csd.exe_path = 'host' for execution; EXPLAIN is safe with 'csd' or 'auto'.")));
-	return NULL;
+	return csd_executor_next(node);
 }
 
 static void
 csd_end_scan(CustomScanState *node)
 {
-	(void) node;
+	csd_executor_end(node);
 }
 
 static void
 csd_rescan(CustomScanState *node)
 {
-	(void) node;
+	csd_executor_rescan(node);
 }
 
 static void
@@ -278,7 +296,7 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 						   intVal(list_nth(scan->custom_private, 13)), es);
 	ExplainPropertyText("CSD Wire Status",
 		"ABI v4 scan/expression/join/aggregate/sort descriptors", es);
-	ExplainPropertyText("CSD Transport", "execution disabled", es);
+	ExplainPropertyText("CSD Transport", "NVMe Program Execute", es);
 }
 
 static int
@@ -301,5 +319,5 @@ csd_engine_capabilities(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(
 		"abi=4; scan; expression-vm; multikey-join; multikey-aggregate; "
 		"multikey-sort; spill-layout; planner-paths; wire-lowering=operators; "
-		"subplan-rewrite; transport=disabled"));
+		"subplan-rewrite; transport=nvme-program-execute"));
 }

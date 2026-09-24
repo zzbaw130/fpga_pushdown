@@ -13,11 +13,20 @@
             node.expression_length < sizeof(CsdSqlScanSpec) + descriptors_bytes)
             return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
         const CsdSqlColumnSpec *columns = reinterpret_cast<const CsdSqlColumnSpec *>(spec + 1);
-        if (!(header_->flags & CSD_SQL_PLAN_FROZEN_SNAPSHOT) ||
-            !(spec->flags & CSD_SQL_SCAN_FROZEN_PAGES) || spec->attr_count == 0 ||
-            spec->output_count == 0 || spec->input_range >= static_cast<uint32_t>(args_->numr) ||
-            args_->mr_addr[spec->input_range] == NULL || args_->mr_len[spec->input_range] < 0)
-            return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+		if (!(header_->flags & CSD_SQL_PLAN_FROZEN_SNAPSHOT))
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x101);
+		if (!(spec->flags & CSD_SQL_SCAN_FROZEN_PAGES))
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x102);
+		if (spec->attr_count == 0)
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x103);
+		if (spec->output_count == 0)
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x104);
+		if (spec->input_range >= static_cast<uint32_t>(args_->numr))
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x105);
+		if (args_->mr_addr[spec->input_range] == NULL)
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x106);
+		if (args_->mr_len[spec->input_range] < 0)
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x107);
         for (uint16_t attribute = 0; attribute < spec->attr_count; ++attribute) {
             const CsdSqlColumnSpec &column = columns[attribute];
             if (column.attnum != attribute + 1 || !is_supported_type(column.datum_type) || column.attlen == 0 ||
@@ -116,7 +125,12 @@
             value.numeric_scale = column.datum_type == CSD_SQL_TYPE_NUMERIC ? column.numeric_scale : 0;
             value.is_null = is_null;
             if (!is_null) {
-                cursor = align_up(cursor, column.alignment);
+				/* PostgreSQL's att_align_pointer deliberately leaves a packed
+				 * varlena unaligned when the current byte is already a varlena
+				 * header.  Aligning every -1 attribute skips that header in real
+				 * TPC-H tuples containing adjacent Numeric/text columns. */
+				if (column.attlen != -1 || cursor >= tuple_length || tuple[cursor] == 0)
+					cursor = align_up(cursor, column.alignment);
                 if (cursor >= tuple_length) return fail(CSD_SQL_STATUS_BAD_PAGE, index);
                 uint64_t consumed = 0;
                 if (!decode_datum(index, column, tuple + cursor, tuple_length - cursor, &value, &consumed))
@@ -124,6 +138,10 @@
                 if (consumed > tuple_length - cursor)
                     return fail(CSD_SQL_STATUS_BAD_PAGE, index);
                 cursor += consumed;
+				if ((column.flags & CSD_SQL_COLUMN_TRIM_SPACE) &&
+					value.type == CSD_SQL_TYPE_BYTES)
+					while (!value.bytes.empty() && value.bytes[value.bytes.size() - 1] == ' ')
+						value.bytes.resize(value.bytes.size() - 1);
             }
             if (column.flags & CSD_SQL_COLUMN_OUTPUT) (*row)[column.output_column] = value;
         }
@@ -143,19 +161,22 @@
             case CSD_SQL_TYPE_INT64: if (column.attlen != 8) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index); value->integer = read_i64(source); return true;
             case CSD_SQL_TYPE_BOOL: if (column.attlen != 1) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index); value->integer = source[0] == 0 ? 0 : 1; return true;
             case CSD_SQL_TYPE_BYTES: value->bytes.assign(reinterpret_cast<const char *>(source), column.attlen); return true;
-            default: return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+			default: return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
+				(static_cast<uint32_t>(column.attnum) << 16) | 1);
             }
         }
         if (column.attlen != -1 || available == 0) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
         uint64_t header_bytes = 0, length = 0;
         if (source[0] & 0x01U) {
-            if (source[0] == 0x01U) return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+			if (source[0] == 0x01U) return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
+				(static_cast<uint32_t>(column.attnum) << 16) | 2);
             header_bytes = 1;
             length = source[0] >> 1;
         } else {
             if (available < 4) return fail(CSD_SQL_STATUS_BAD_PAGE, index);
             const uint32_t header = read_u32(source);
-            if (header & 0x03U) return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+			if (header & 0x03U) return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
+				(static_cast<uint32_t>(column.attnum) << 16) | 3);
             header_bytes = 4;
             length = header >> 2;
         }
@@ -166,28 +187,45 @@
             return true;
         }
         if (column.datum_type == CSD_SQL_TYPE_NUMERIC)
-            return decode_numeric(index, source + header_bytes, length - header_bytes, column.numeric_scale, value);
-        return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+			return decode_numeric(index, column.attnum, source + header_bytes,
+				length - header_bytes, column.numeric_scale, value);
+		return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
+			(static_cast<uint32_t>(column.attnum) << 16) | 4);
     }
 
-    bool decode_numeric(uint32_t index, const unsigned char *source, uint64_t length, int32_t target_scale, Value *value)
+	bool decode_numeric(uint32_t index, uint16_t attnum, const unsigned char *source,
+						uint64_t length, int32_t target_scale, Value *value)
     {
-        if (length < 2 || target_scale < 0 || target_scale > 18) return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+		const uint32_t detail = static_cast<uint32_t>(attnum) << 16;
+		if (length < 2 || target_scale < -1 || target_scale > 18)
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, detail | 5);
         const uint16_t header = read_u16(source);
         const uint16_t flag = header & 0xc000U;
         bool negative = false;
         int16_t weight = 0;
+		int16_t source_scale = 0;
         uint64_t header_bytes = 0;
         if (flag == 0x8000U) {
             negative = (header & 0x2000U) != 0;
-            weight = static_cast<int16_t>((header & 0x0040U) ? (header | static_cast<uint16_t>(~0x003fU)) : (header & 0x003fU));
+			source_scale = static_cast<int16_t>((header & 0x1f80U) >> 7);
+			/* NumericShort stores weight as a signed 7-bit field.  Do not
+			 * sign-extend the unrelated sign/dscale bits in the same header. */
+			weight = static_cast<int16_t>(header & 0x003fU);
+			if (header & 0x0040U)
+				weight = static_cast<int16_t>(weight | static_cast<int16_t>(~0x003f));
             header_bytes = 2;
         } else if (flag == 0x0000U || flag == 0x4000U) {
             if (length < 4) return fail(CSD_SQL_STATUS_BAD_PAGE, index);
             negative = flag == 0x4000U;
+			source_scale = static_cast<int16_t>(header & 0x3fffU);
             weight = read_i16(source + 2);
             header_bytes = 4;
-        } else return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+		} else return fail(CSD_SQL_STATUS_UNSUPPORTED, index, detail | 6);
+		if (source_scale > 18)
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, detail | 11);
+		if (target_scale < 0)
+			target_scale = source_scale;
+		value->numeric_scale = static_cast<int16_t>(target_scale);
         if ((length - header_bytes) % 2) return fail(CSD_SQL_STATUS_BAD_PAGE, index);
         __int128 scaled = 0;
         const uint64_t digits = (length - header_bytes) / 2;
@@ -197,21 +235,22 @@
             const int64_t exponent = (static_cast<int64_t>(weight) - static_cast<int64_t>(digit_index)) * 4 + target_scale;
             __int128 part = digit;
             if (exponent >= 0) {
-                if (exponent > 18) return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+				if (exponent > 18) return fail(CSD_SQL_STATUS_UNSUPPORTED, index, detail | 7);
                 for (int64_t power = 0; power < exponent; ++power) part *= 10;
             } else {
                 const int64_t divisor_power = -exponent;
-                if (divisor_power > 4) return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+				if (divisor_power > 4) return fail(CSD_SQL_STATUS_UNSUPPORTED, index, detail | 8);
                 int64_t divisor = 1;
                 for (int64_t power = 0; power < divisor_power; ++power) divisor *= 10;
-                if (digit % divisor) return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+				if (digit % divisor)
+					return fail(CSD_SQL_STATUS_UNSUPPORTED, index, detail | 9);
                 part /= divisor;
             }
             scaled += part;
         }
         if (negative) scaled = -scaled;
         if (scaled > std::numeric_limits<int64_t>::max() || scaled < std::numeric_limits<int64_t>::min())
-            return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+			return fail(CSD_SQL_STATUS_UNSUPPORTED, index, detail | 10);
         value->integer = static_cast<int64_t>(scaled);
         return true;
     }

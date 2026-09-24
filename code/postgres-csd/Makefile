@@ -1,7 +1,8 @@
 EXTENSION = csd_pg
 MODULE_big = csd_pg
-OBJS = csd_pg.o csd_cost.o csd_lower.o csd_expr.o csd_subplan.o csd_wire.o
-PG_CPPFLAGS = -I$(srcdir)/../test-cemu/kernel
+OBJS = csd_pg.o csd_cost.o csd_lower.o csd_expr.o csd_subplan.o csd_wire.o csd_executor.o
+CSD_TEST_DIR ?= $(srcdir)/../test-cemu
+PG_CPPFLAGS = -I$(CSD_TEST_DIR)/kernel -I$(CSD_TEST_DIR)
 DATA = csd_pg--0.1.sql
 PGFILEDESC = "csd_pg - CEMU computational-storage planner"
 

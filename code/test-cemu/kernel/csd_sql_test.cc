@@ -59,7 +59,8 @@ void put_i32(unsigned char *target, int32_t value)
 }
 
 void add_left_tuple(unsigned char *page, uint16_t item, uint16_t offset,
-                    int32_t key, uint16_t numeric_digit)
+                    int32_t key, uint16_t numeric_digit,
+                    uint16_t numeric_header = 0x8100U)
 {
     const uint16_t tuple_length = 36;
     put_u32(page + 24 + item * 4,
@@ -69,7 +70,7 @@ void add_left_tuple(unsigned char *page, uint16_t item, uint16_t offset,
     tuple[22] = 24;                 // t_hoff: no null bitmap, MAXALIGN'd.
     put_i32(tuple + 24, key);
     put_u32(tuple + 28, 8U << 2);   // 4-byte varlena header, 8 bytes total.
-    put_u16(tuple + 32, 0x8100U);   // NumericShort: scale 2, weight 0.
+    put_u16(tuple + 32, numeric_header);
     put_u16(tuple + 34, numeric_digit);
 }
 
@@ -133,7 +134,8 @@ void test_heap_pipeline_with_spill()
     put_u16(left_page.data() + 12, 24 + 3 * 4);
     put_u16(right_page.data() + 12, 24 + 2 * 4);
     add_left_tuple(left_page.data(), 0, 128, 1, 10);  // 10.00 -> 1000
-    add_left_tuple(left_page.data(), 1, 192, 2, 5);   // filtered out
+    /* NumericShort scale=2, weight=-1: 500 * 10000^-1 = 0.05. */
+    add_left_tuple(left_page.data(), 1, 192, 2, 500, 0x817fU); // filtered out
     add_left_tuple(left_page.data(), 2, 256, 3, 20);  // 20.00 -> 2000
     add_right_tuple(right_page.data(), 0, 128, 1, 100);
     add_right_tuple(right_page.data(), 1, 192, 3, 300);
@@ -169,7 +171,8 @@ void test_heap_pipeline_with_spill()
     left_value.attlen = -1;
     left_value.alignment = 4;
     left_value.datum_type = CSD_SQL_TYPE_NUMERIC;
-    left_value.numeric_scale = 2;
+	/* -1 asks the scan pipeline to derive dscale from each Numeric datum. */
+    left_value.numeric_scale = -1;
     left_value.flags = CSD_SQL_COLUMN_OUTPUT | CSD_SQL_COLUMN_NO_EXTERNAL;
     append(&plan, left_value);
     nodes[0].expression_length = sizeof(left_scan) + 2 * sizeof(CsdSqlColumnSpec);
@@ -215,7 +218,7 @@ void test_heap_pipeline_with_spill()
     instruction.numeric_scale = 2; instruction.immediate = 100; append(&plan, instruction);
     instruction = CsdSqlExpressionInstruction();
     instruction.opcode = CSD_SQL_EXPR_ADD; instruction.datum_type = CSD_SQL_TYPE_NUMERIC;
-    instruction.numeric_scale = 2; append(&plan, instruction);
+	instruction.numeric_scale = -1; append(&plan, instruction);
     instruction = CsdSqlExpressionInstruction();
     instruction.opcode = CSD_SQL_EXPR_EMIT; append(&plan, instruction);
     nodes[2].expression_length = sizeof(project) + 6 * sizeof(CsdSqlExpressionInstruction);
@@ -271,7 +274,7 @@ void test_heap_pipeline_with_spill()
     sum.input_column = 1;
     sum.operation = CSD_SQL_AGG_SUM;
     sum.datum_type = CSD_SQL_TYPE_NUMERIC;
-    sum.output_scale = 2;
+	sum.output_scale = -1;
     append(&plan, sum);
     nodes[6].expression_length = sizeof(aggregate) + 2 * sizeof(CsdSqlAggregateColumn);
 
@@ -822,6 +825,95 @@ void test_unpatched_parameter_is_rejected()
            CSD_SQL_STATUS_BAD_EXPRESSION);
 }
 
+void test_postgres_numeric_division_scale()
+{
+    std::vector<unsigned char> page(CSD_SQL_PAGE_BYTES, 0);
+    put_u16(page.data() + 12, 24 + 4);
+    add_right_tuple(page.data(), 0, 128, 1, 1);
+    std::vector<unsigned char> plan(sizeof(CsdSqlPlanHeader) + 2 * sizeof(CsdSqlPlanNode), 0);
+    CsdSqlPlanNode scan_node = make_node(0, CSD_SQL_OP_SCAN);
+    CsdSqlScanSpec scan = {};
+    scan.input_range = 0;
+    scan.page_count = 1;
+    scan.attr_count = 2;
+    scan.output_count = 1;
+    scan.flags = CSD_SQL_SCAN_FROZEN_PAGES;
+    scan_node.expression_offset = append(&plan, scan);
+    for (uint16_t attribute = 0; attribute < 2; ++attribute) {
+        CsdSqlColumnSpec column = {};
+        column.attnum = attribute + 1;
+        column.output_column = 0;
+        column.attlen = 4;
+        column.alignment = 4;
+        column.datum_type = CSD_SQL_TYPE_INT32;
+        column.flags = attribute == 0 ? CSD_SQL_COLUMN_OUTPUT : 0;
+        append(&plan, column);
+    }
+    scan_node.expression_length = sizeof(scan) + 2 * sizeof(CsdSqlColumnSpec);
+
+    CsdSqlPlanNode project_node = make_node(1, CSD_SQL_OP_PROJECT);
+    project_node.left_input = 0;
+    CsdSqlExpressionSpec project = {};
+    project.output_count = 2;
+    project.instruction_count = 8;
+    project.max_stack = 2;
+    project_node.expression_offset = append(&plan, project);
+    append(&plan, expression(CSD_SQL_EXPR_PUSH_CONSTANT, CSD_SQL_TYPE_INT64, 0, 4312626));
+    append(&plan, expression(CSD_SQL_EXPR_PUSH_CONSTANT, CSD_SQL_TYPE_INT64, 0, 100000000));
+    CsdSqlExpressionInstruction divide = expression(CSD_SQL_EXPR_DIVIDE, CSD_SQL_TYPE_NUMERIC);
+    divide.numeric_scale = -1;
+    append(&plan, divide);
+    append(&plan, expression(CSD_SQL_EXPR_EMIT));
+    CsdSqlExpressionInstruction left = expression(CSD_SQL_EXPR_PUSH_CONSTANT,
+        CSD_SQL_TYPE_NUMERIC, 0, 246331539);
+    left.numeric_scale = 2;
+    append(&plan, left);
+    CsdSqlExpressionInstruction right = expression(CSD_SQL_EXPR_PUSH_CONSTANT,
+        CSD_SQL_TYPE_NUMERIC, 0, 70);
+    right.numeric_scale = 1;
+    append(&plan, right);
+    append(&plan, divide);
+    append(&plan, expression(CSD_SQL_EXPR_EMIT));
+    project_node.expression_length = sizeof(project) +
+        8 * sizeof(CsdSqlExpressionInstruction);
+
+    CsdSqlPlanHeader header = {};
+    header.magic = CSD_SQL_PLAN_MAGIC;
+    header.version = CSD_SQL_PLAN_VERSION;
+    header.header_bytes = sizeof(header);
+    header.node_count = 2;
+    header.node_bytes = sizeof(CsdSqlPlanNode);
+    header.plan_bytes = plan.size();
+    header.root_node = 1;
+    header.flags = CSD_SQL_PLAN_FROZEN_SNAPSHOT;
+    header.output_range = 1;
+    header.spill_range = CSD_SQL_INVALID_RANGE;
+    overwrite(&plan, 0, header);
+    overwrite(&plan, sizeof(header), scan_node);
+    overwrite(&plan, sizeof(header) + sizeof(scan_node), project_node);
+
+    std::vector<unsigned char> output(1024, 0);
+    void *ranges[] = {page.data(), output.data()};
+    long long lengths[] = {static_cast<long long>(page.size()),
+                           static_cast<long long>(output.size())};
+    cemu_args args = {};
+    args.numr = 2;
+    args.mr_addr = ranges;
+    args.mr_len = lengths;
+    args.data_buffer = plan.data();
+    args.buffer_len = plan.size();
+    assert(csd_sql(&args) == 1);
+    const CsdSqlResultHeader *result =
+        reinterpret_cast<const CsdSqlResultHeader *>(output.data());
+    const CsdSqlResultCell *cells = reinterpret_cast<const CsdSqlResultCell *>(
+        output.data() + result->cells_offset);
+    assert(result->row_count == 1 && result->column_count == 2);
+    assert(cells[0].integer == INT64_C(4312626000000000000));
+    assert(cells[0].numeric_scale == 20);
+    assert(cells[1].integer == INT64_C(351902198571428571));
+    assert(cells[1].numeric_scale == 12);
+}
+
 } // namespace
 
 int main()
@@ -832,5 +924,6 @@ int main()
     test_group_only_distinct_aggregate();
     test_visibility_contract_is_required();
     test_unpatched_parameter_is_rejected();
+	test_postgres_numeric_division_scale();
     return 0;
 }

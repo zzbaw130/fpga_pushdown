@@ -303,10 +303,23 @@ csd_wire_count_nodes(List *metadata)
 	if (strcmp(name, "Scan") == 0)
 	{
 		List *payload = (List *) list_nth(metadata, 7);
+		List *targets = (List *) list_nth(payload, 1);
 		List *clauses = (List *) list_nth(payload, 2);
 		List *lowerable = csd_scan_lowerable_clauses(clauses, NULL);
 
+		/* COUNT(*) can legitimately give its scan an empty reltarget. */
+		if (targets != NIL)
+			++count;
 		if (lowerable != NIL)
+			++count;
+	}
+	else if (strstr(name, "Join") != NULL)
+	{
+		List *payload = (List *) list_nth(metadata, 7);
+		List *targets = (List *) list_nth(payload, 2);
+
+		/* A join core emits concatenated inputs; trim/reorder when requested. */
+		if (targets != NIL)
 			++count;
 	}
 	else if (strcmp(name, "Aggregate") == 0 || strcmp(name, "Distinct") == 0)
@@ -374,14 +387,17 @@ csd_wire_append_payload(CsdWireBuilder *builder, CsdSqlPlanNode *node,
 			column.attlen = pg_attribute->attlen;
 			column.alignment = csd_wire_alignment(pg_attribute->attalign);
 			column.datum_type = csd_wire_datum_type(pg_attribute->atttypid);
-			if (pg_attribute->atttypid == NUMERICOID && pg_attribute->atttypmod >= VARHDRSZ)
-				column.numeric_scale = (pg_attribute->atttypmod - VARHDRSZ) & 0xffff;
+			if (pg_attribute->atttypid == NUMERICOID)
+				column.numeric_scale = pg_attribute->atttypmod >= VARHDRSZ ?
+					(pg_attribute->atttypmod - VARHDRSZ) & 0xffff : -1;
 			if (!pg_attribute->attisdropped)
 			{
 				column.output_column = output_column++;
 				column.flags = CSD_SQL_COLUMN_OUTPUT;
 				if (pg_attribute->attlen == -1)
 					column.flags |= CSD_SQL_COLUMN_NO_EXTERNAL;
+				if (pg_attribute->atttypid == BPCHAROID)
+					column.flags |= CSD_SQL_COLUMN_TRIM_SPACE;
 			}
 			else
 				column.output_column = CSD_SQL_NO_COLUMN;
@@ -822,6 +838,7 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 	if (node.opcode == CSD_SQL_OP_SCAN)
 	{
 		List *payload = (List *) list_nth(metadata, 7);
+		List *targets = (List *) list_nth(payload, 1);
 		List *clauses = (List *) list_nth(payload, 2);
 		List *lowerable = csd_scan_lowerable_clauses(clauses,
 			&builder->pending_expression_count);
@@ -854,12 +871,21 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 				   filter_id * sizeof(CsdSqlPlanNode), &filter, sizeof(filter));
 			result.node_id = filter_id;
 			result.schema = csd_wire_scan_schema(metadata, (Index) detail);
-			return result;
 		}
-		result.schema = csd_wire_scan_schema(metadata, (Index) detail);
+		else
+		{
+			result.node_id = node_id;
+			result.schema = csd_wire_scan_schema(metadata, (Index) detail);
+		}
+		return targets == NIL ? result :
+			csd_wire_emit_expression_node(builder, CSD_SQL_OP_PROJECT,
+				result, targets, metadata);
 	}
 	else if (strstr(name, "Join") != NULL)
 	{
+		List *payload = (List *) list_nth(metadata, 7);
+		List *targets = (List *) list_nth(payload, 2);
+
 		if (child_index != 2)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -877,6 +903,10 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 				&child_results[1].schema);
 		csd_expr_schema_release(&child_results[0].schema);
 		csd_expr_schema_release(&child_results[1].schema);
+		result.node_id = node_id;
+		return targets == NIL ? result :
+			csd_wire_emit_expression_node(builder, CSD_SQL_OP_PROJECT,
+				result, targets, metadata);
 	}
 	else if (node.opcode != CSD_SQL_OP_PROJECT && child_index == 1)
 	{

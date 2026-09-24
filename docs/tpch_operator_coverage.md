@@ -23,13 +23,14 @@ only filter/project/aggregate/inner hash join/sort is not sufficient.
 
 ## ABI v4 engine status
 
-The CSD engine now has a semantic representation for every operator and
-expression family used by the 22 queries. PostgreSQL emits real scan,
+The CSD engine has a semantic representation and executable implementation for
+every operator and expression family used by the 22 queries. PostgreSQL emits real scan,
 projection, join, aggregate, sort, limit, and expression descriptors for all
 22 forced-CSD EXPLAIN cases. Q2's correlated scalar aggregate and Q16's
 null-safe `NOT IN` are rewritten into aggregate/join DAG branches, leaving zero
-pending expressions. This does **not** yet mean that every SQL file can execute
-end to end because the transport/result path is intentionally disabled.
+pending expressions. On SF=1, all 22 SQL files execute end to end through CEMU
+Program Execute and match the guest PostgreSQL HOST results exactly. The
+comparison is automated by `tests/test_csd_tpch_execution.sh`.
 
 | TPC-H requirement | ABI v4 lowering |
 | --- | --- |

@@ -11,6 +11,51 @@
 static List *csd_rewrite_node(PlannerInfo *root, List *metadata,
 							  uint32 *rewrite_count);
 
+/* Planner reltargets inside a correlated subplan normally omit the inner
+ * correlation key: PostgreSQL consumes it in an index condition and only
+ * returns the aggregate argument.  A standalone CSD DAG must carry that key
+ * from its scan through each join so the rewritten grouped aggregate can join
+ * back to the outer stream. */
+static bool
+csd_require_inner_var(List *metadata, Var *variable)
+{
+	const char *name = strVal(list_nth(metadata, 0));
+	List *children = (List *) list_nth(metadata, 4);
+	ListCell *cell;
+
+	if (strcmp(name, "Scan") == 0)
+	{
+		List *payload;
+		List *targets;
+
+		if ((Index) intVal(list_nth(metadata, 1)) != variable->varno)
+			return false;
+		payload = (List *) list_nth(metadata, 7);
+		targets = (List *) list_nth(payload, 1);
+		if (!list_member(targets, variable))
+			lfirst(list_nth_cell(payload, 1)) =
+				lappend(targets, copyObject(variable));
+		return true;
+	}
+	foreach(cell, children)
+	{
+		if (csd_require_inner_var((List *) lfirst(cell), variable))
+		{
+			if (strstr(name, "Join") != NULL)
+			{
+				List *payload = (List *) list_nth(metadata, 7);
+				List *targets = (List *) list_nth(payload, 2);
+
+				if (!list_member(targets, variable))
+					lfirst(list_nth_cell(payload, 2)) =
+						lappend(targets, copyObject(variable));
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
 static List *
 csd_subplan_metadata(PlannerInfo *root, SubPlan *subplan, Plan **subplan_plan)
 {
@@ -247,6 +292,7 @@ csd_rewrite_correlated_scalar(PlannerInfo *root, List *metadata, Node *clause,
 	OpExpr *correlation = NULL;
 	Node *inner_correlation = NULL;
 	Node *outer_correlation;
+	Node *outer_value;
 	List *aggregate_payload;
 	List *aggregate_targets;
 	Node *aggregate_result;
@@ -270,6 +316,13 @@ csd_rewrite_correlated_scalar(PlannerInfo *root, List *metadata, Node *clause,
 	outer_correlation = (Node *) linitial(subplan->args);
 	if (!csd_replace_param_argument(correlation, param_id, outer_correlation))
 		return metadata;
+	outer_value = IsA(linitial(((OpExpr *) clause)->args), SubPlan) ?
+		(Node *) lsecond(((OpExpr *) clause)->args) :
+		(Node *) linitial(((OpExpr *) clause)->args);
+	if (IsA(outer_correlation, Var))
+		(void) csd_require_inner_var(metadata, (Var *) outer_correlation);
+	if (IsA(outer_value, Var))
+		(void) csd_require_inner_var(metadata, (Var *) outer_value);
 	aggregate_payload = (List *) list_nth(inner_metadata, 7);
 	aggregate_targets = (List *) list_nth(aggregate_payload, 1);
 	if (aggregate_targets == NIL)
@@ -277,6 +330,16 @@ csd_rewrite_correlated_scalar(PlannerInfo *root, List *metadata, Node *clause,
 	aggregate_result = (Node *) linitial(aggregate_targets);
 	lfirst(list_nth_cell(aggregate_payload, 1)) =
 		lappend(aggregate_targets, copyObject(inner_correlation));
+	if (IsA(inner_correlation, Var))
+	{
+		List *children = (List *) list_nth(inner_metadata, 4);
+
+		if (children == NIL || !csd_require_inner_var(
+			(List *) linitial(children), (Var *) inner_correlation))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("CSD correlated aggregate could not expose its inner key")));
+	}
 	value_clause = copyObject((OpExpr *) clause);
 	if (!csd_replace_subplan_argument(value_clause, subplan, aggregate_result))
 		return metadata;

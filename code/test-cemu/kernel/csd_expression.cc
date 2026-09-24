@@ -44,9 +44,9 @@
 
     static bool scaled_integer(const Value &value, int16_t target_scale, __int128 *result)
     {
-        if (target_scale < 0 || target_scale > 18) return false;
+		if (target_scale < 0 || target_scale > 36) return false;
         const int16_t source_scale = value.type == CSD_SQL_TYPE_NUMERIC ? value.numeric_scale : 0;
-        if (source_scale < 0 || source_scale > 18) return false;
+		if (source_scale < 0 || source_scale > 36) return false;
         *result = value.integer;
         if (target_scale >= source_scale)
             return multiply_power10(result, target_scale - source_scale);
@@ -61,6 +61,47 @@
         return value <= std::numeric_limits<int64_t>::max() &&
                value >= std::numeric_limits<int64_t>::min();
     }
+
+	static void numeric_weight_first(const Value &value, int *weight, int *first_digit)
+	{
+		__int128 magnitude = value.integer < 0 ? -static_cast<__int128>(value.integer) :
+			static_cast<__int128>(value.integer);
+		const int scale = value.type == CSD_SQL_TYPE_NUMERIC ? value.numeric_scale : 0;
+		if (magnitude == 0) {
+			*weight = 0;
+			*first_digit = 0;
+			return;
+		}
+		int digits = 0;
+		for (__int128 cursor = magnitude; cursor != 0; cursor /= 10) ++digits;
+		const int decimal_exponent = digits - 1 - scale;
+		*weight = decimal_exponent >= 0 ? decimal_exponent / 4 :
+			-((-decimal_exponent + 3) / 4);
+		const int power = -scale - *weight * 4;
+		if (power >= 0)
+			multiply_power10(&magnitude, power);
+		else {
+			__int128 divisor = 1;
+			multiply_power10(&divisor, -power);
+			magnitude /= divisor;
+		}
+		*first_digit = static_cast<int>(magnitude);
+	}
+
+	/* PostgreSQL numeric.c::select_div_scale, bounded by the software wire's
+	 * 128-bit intermediate.  The final Value still has to fit int64. */
+	static int16_t division_scale(const Value &left, const Value &right)
+	{
+		int left_weight, right_weight, left_first, right_first;
+		numeric_weight_first(left, &left_weight, &left_first);
+		numeric_weight_first(right, &right_weight, &right_first);
+		int quotient_weight = left_weight - right_weight;
+		if (left_first <= right_first) --quotient_weight;
+		const int left_scale = left.type == CSD_SQL_TYPE_NUMERIC ? left.numeric_scale : 0;
+		const int right_scale = right.type == CSD_SQL_TYPE_NUMERIC ? right.numeric_scale : 0;
+		const int scale = std::max(std::max(16 - quotient_weight * 4, left_scale), right_scale);
+		return static_cast<int16_t>(std::max(0, std::min(36, scale)));
+	}
 
     static bool sql_like(const std::string &value, const std::string &pattern, bool insensitive)
     {
@@ -106,9 +147,21 @@
         result->type = instruction.datum_type == CSD_SQL_TYPE_INVALID ?
             static_cast<uint8_t>(CSD_SQL_TYPE_NUMERIC) : instruction.datum_type;
         result->numeric_scale = result->type == CSD_SQL_TYPE_NUMERIC ? instruction.numeric_scale : 0;
+		if (result->type == CSD_SQL_TYPE_NUMERIC && result->numeric_scale < 0) {
+			const int16_t left_scale = left.type == CSD_SQL_TYPE_NUMERIC ? left.numeric_scale : 0;
+			const int16_t right_scale = right.type == CSD_SQL_TYPE_NUMERIC ? right.numeric_scale : 0;
+			if (left_scale < 0 || right_scale < 0)
+				return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+			if (instruction.opcode == CSD_SQL_EXPR_MULTIPLY)
+				result->numeric_scale = std::min<int>(18, left_scale + right_scale);
+			else if (instruction.opcode == CSD_SQL_EXPR_DIVIDE)
+				result->numeric_scale = division_scale(left, right);
+			else
+				result->numeric_scale = std::max(left_scale, right_scale);
+		}
         if (left.is_null || right.is_null) return true;
         if (left.type == CSD_SQL_TYPE_BYTES || right.type == CSD_SQL_TYPE_BYTES ||
-            result->numeric_scale < 0 || result->numeric_scale > 18)
+			result->numeric_scale < 0 || result->numeric_scale > 36)
             return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
         __int128 value = 0;
         if (instruction.opcode == CSD_SQL_EXPR_ADD || instruction.opcode == CSD_SQL_EXPR_SUBTRACT) {
@@ -130,18 +183,30 @@
                     return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
                 value /= divisor;
             }
-        } else {
-            if (right.integer == 0) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-            value = left.integer;
-            const int exponent = (right.type == CSD_SQL_TYPE_NUMERIC ? right.numeric_scale : 0) +
-                                 result->numeric_scale -
-                                 (left.type == CSD_SQL_TYPE_NUMERIC ? left.numeric_scale : 0);
-            __int128 denominator = right.integer;
-            if (exponent >= 0) {
-                if (!multiply_power10(&value, exponent)) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-            } else if (!multiply_power10(&denominator, -exponent))
-                return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-            value /= denominator;
+		} else {
+			if (right.integer == 0) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+			const int left_scale = left.type == CSD_SQL_TYPE_NUMERIC ? left.numeric_scale : 0;
+			const int right_scale = right.type == CSD_SQL_TYPE_NUMERIC ? right.numeric_scale : 0;
+			const int minimum_scale = std::max(left_scale, right_scale);
+			for (;;) {
+				__int128 numerator = left.integer;
+				__int128 denominator = right.integer;
+				const int exponent = right_scale + result->numeric_scale - left_scale;
+				bool scaled = exponent >= 0 ? multiply_power10(&numerator, exponent) :
+					multiply_power10(&denominator, -exponent);
+				if (scaled) {
+					value = numerator / denominator;
+					__int128 remainder = numerator % denominator;
+					if (remainder < 0) remainder = -remainder;
+					__int128 absolute_denominator = denominator < 0 ? -denominator : denominator;
+					if (remainder * 2 >= absolute_denominator)
+						value += (numerator < 0) == (denominator < 0) ? 1 : -1;
+					if (fits_i64(value)) break;
+				}
+				if (instruction.numeric_scale >= 0 || result->numeric_scale <= minimum_scale)
+					return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+				--result->numeric_scale;
+			}
         }
         if (!fits_i64(value)) return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
         result->integer = static_cast<int64_t>(value);
