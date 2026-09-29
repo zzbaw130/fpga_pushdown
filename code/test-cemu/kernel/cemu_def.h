@@ -1,6 +1,10 @@
 #ifndef CEMU_DEF_H
 #define CEMU_DEF_H
 
+typedef long long (*cemu_nvm_io_fn)(void *context, unsigned int nsid,
+                                    unsigned long long byte_offset,
+                                    void *buffer, unsigned long long length);
+
 struct cemu_args {
     int numr;
     void **mr_addr;
@@ -9,6 +13,9 @@ struct cemu_args {
     long long cparam2;
     void *data_buffer;
     long long buffer_len;
+    void *service_context;
+    cemu_nvm_io_fn nvm_read;
+    cemu_nvm_io_fn nvm_write;
 } __attribute__((packed));
 
 // re-impl assert

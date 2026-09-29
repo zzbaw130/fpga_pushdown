@@ -21,7 +21,7 @@ only filter/project/aggregate/inner hash join/sort is not sufficient.
 | InitPlan / SubPlan / hashed SubPlan | subplan DAG; scalar result, set-membership, `EXISTS`, `IN`, and `NOT IN` inputs to an expression or join operator |
 | Gather / Gather Merge | not sent literally: the CSD scheduler partitions work over CUs and performs a final merge/reduce |
 
-## ABI v4 engine status
+## ABI v6 engine status
 
 The CSD engine has a semantic representation and executable implementation for
 every operator and expression family used by the 22 queries. PostgreSQL emits real scan,
@@ -32,7 +32,7 @@ pending expressions. On SF=1, all 22 SQL files execute end to end through CEMU
 Program Execute and match the guest PostgreSQL HOST results exactly. The
 comparison is automated by `tests/test_csd_tpch_execution.sh`.
 
-| TPC-H requirement | ABI v4 lowering |
+| TPC-H requirement | ABI v6 lowering |
 | --- | --- |
 | Decimal arithmetic and ratios | fixed-point expression `ADD/SUBTRACT/MULTIPLY/DIVIDE` with scale |
 | `CASE`, `OR`, `NOT`, `BETWEEN`, `IN` | postfix boolean program and `SELECT` mux; `BETWEEN`/`IN` expand to comparisons |

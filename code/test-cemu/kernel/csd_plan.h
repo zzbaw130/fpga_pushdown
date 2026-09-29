@@ -6,12 +6,14 @@
 /*
  * Stable little-endian wire ABI between PostgreSQL and the CEMU program.
  * PostgreSQL executor nodes are deliberately not sent across this boundary.
- * Version 4 adds the TPC-H expression bytecode, multi-column blocking
+ * Version 6 adds bounded FDM spill staging and writable NVMe spill extents.
+ * Version 5 added bounded FDM chunk buffers and NVMe physical extents to the
+ * scan ABI. Version 4 added the TPC-H expression bytecode, multi-column blocking
  * operators, fixed-point scale metadata, and explicit canonicalization
  * counters. PostgreSQL executor structs never cross this boundary.
  */
 #define CSD_SQL_PLAN_MAGIC       UINT32_C(0x43534450) /* "CSDP" */
-#define CSD_SQL_PLAN_VERSION     4
+#define CSD_SQL_PLAN_VERSION     6
 #define CSD_SQL_RESULT_MAGIC     UINT32_C(0x43534452) /* "CSDR" */
 #define CSD_SQL_INVALID_NODE     UINT32_C(0xffffffff)
 #define CSD_SQL_INVALID_RANGE    UINT32_C(0xffffffff)
@@ -56,6 +58,10 @@ enum CsdSqlPlanFlags {
     CSD_SQL_PLAN_STAGED_RANGE = UINT32_C(1) << 2,
     /* Emit functional-model operator timing to the CEMU process log. */
     CSD_SQL_PLAN_PROFILE = UINT32_C(1) << 3,
+    /* SCAN ranges are bounded FDM windows populated from NVMe extents. */
+    CSD_SQL_PLAN_CHUNKED_SCAN = UINT32_C(1) << 4,
+    /* spill_range is a bounded staging window; spill bytes live on Flash. */
+    CSD_SQL_PLAN_FLASH_SPILL = UINT32_C(1) << 5,
 };
 
 enum CsdSqlNodeFlags {
@@ -181,6 +187,9 @@ struct CsdSqlPlanHeader {
     uint32_t parallel_workers;
     uint64_t plan_id;
     uint64_t work_mem_bytes;
+    uint32_t spill_extent_count;
+    uint32_t spill_extent_offset;
+    uint64_t spill_bytes;
 } __attribute__((packed));
 
 /* Inputs must refer to an earlier node ID, or CSD_SQL_INVALID_NODE. */
@@ -203,11 +212,26 @@ struct CsdSqlPlanNode {
 
 /* SCAN expression: CsdSqlScanSpec immediately followed by attr_count columns. */
 struct CsdSqlScanSpec {
+    /* Bounded FDM work-buffer range, not a complete relation image. */
     uint32_t input_range;
     uint32_t first_page;
     uint32_t page_count;
     uint16_t attr_count;
     uint16_t output_count;
+    uint32_t flags;
+    uint32_t relation_oid;
+    uint32_t extent_count;
+    uint32_t extent_offset; /* absolute offset in the complete plan blob */
+    uint32_t chunk_bytes;
+    uint64_t relation_bytes;
+} __attribute__((packed));
+
+/* A logical relation is the ordered concatenation of all of its heap files. */
+struct CsdSqlNvmExtent {
+    uint64_t logical_offset;
+    uint64_t nvm_offset;
+    uint64_t length;
+    uint32_t nsid;
     uint32_t flags;
 } __attribute__((packed));
 
@@ -325,6 +349,9 @@ struct CsdSqlExecutionStatus {
     uint64_t estimated_bytes;
     uint64_t input_rows;
     uint64_t output_rows;
+    uint64_t flash_read_bytes;
+    uint64_t flash_write_bytes;
+    uint64_t input_chunks;
     uint64_t spill_write_bytes;
     uint64_t spill_read_bytes;
     uint64_t modeled_cycles;

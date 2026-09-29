@@ -143,8 +143,20 @@ _PG_init(void)
 	DefineCustomIntVariable("csd.output_mb", "FDM space reserved for returned rows.", NULL,
 						&csd_output_mb, 64, 1, 1024, PGC_USERSET, 0,
 						NULL, NULL, NULL);
-	DefineCustomIntVariable("csd.spill_mb", "FDM space reserved for spill-to-flash.", NULL,
-						&csd_spill_mb, 256, 1, 8192, PGC_USERSET, 0,
+	DefineCustomIntVariable("csd.spill_mb", "NVMe Flash capacity reserved for query spill runs.", NULL,
+						&csd_spill_mb, 4096, 1, INT_MAX, PGC_USERSET, 0,
+						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.spill_stage_mb", "Reusable FDM staging-window size for Flash spill I/O.", NULL,
+						&csd_spill_stage_mb, 32, 1, 1024, PGC_USERSET, 0,
+						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.chunk_mb", "Per-scan reusable FDM input-buffer size.", NULL,
+						&csd_chunk_mb, 32, 1, 1024, PGC_USERSET, 0,
+						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.fdm_capacity_mb", "Configured CEMU FDM capacity.", NULL,
+						&csd_fdm_capacity_mb, 4096, 64, INT_MAX, PGC_USERSET, 0,
+						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.nvm_nsid", "CEMU NVM namespace containing PGDATA.", NULL,
+						&csd_nvm_nsid, 1, 1, PG_UINT16_MAX, PGC_USERSET, 0,
 						NULL, NULL, NULL);
 	DefineCustomIntVariable("csd.parallel_workers", "CSD software FPGA worker lanes.", NULL,
 						&csd_parallel_workers, 32, 0, 32, PGC_USERSET, 0,
@@ -154,7 +166,7 @@ _PG_init(void)
 						NULL, NULL, NULL);
 	DefineCustomIntVariable("csd.device_work_mem_mb",
 						"Functional-model memory threshold before spill.", NULL,
-						&csd_device_work_mem_mb, 8192, 0, INT_MAX, PGC_USERSET, 0,
+						&csd_device_work_mem_mb, 512, 0, INT_MAX, PGC_USERSET, 0,
 						NULL, NULL, NULL);
 	DefineCustomBoolVariable("csd.profile", "Report CSD functional-model time by operator.", NULL,
 						 &csd_profile, false, PGC_USERSET, 0,
@@ -298,7 +310,7 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	ExplainPropertyInteger("CSD SubPlan Rewrites", NULL,
 						   intVal(list_nth(scan->custom_private, 13)), es);
 	ExplainPropertyText("CSD Wire Status",
-		"ABI v4 scan/expression/join/aggregate/sort descriptors", es);
+		"ABI v6 chunked scan/Flash-spill/expression/join/aggregate/sort descriptors", es);
 	ExplainPropertyText("CSD Transport", "NVMe Program Execute", es);
 }
 

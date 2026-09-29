@@ -341,7 +341,7 @@ csd_wire_opcode(const char *name)
 		return CSD_SQL_OP_MATERIALIZE;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("CSD metadata operator %s has no ABI v4 opcode", name)));
+				 errmsg("CSD metadata operator %s has no ABI v6 opcode", name)));
 	pg_unreachable();
 }
 
@@ -425,6 +425,8 @@ csd_wire_append_payload(CsdWireBuilder *builder, CsdSqlPlanNode *node,
 		scan.input_range = builder->next_input_range++;
 		scan.first_page = 0;
 		scan.page_count = RelationGetNumberOfBlocks(relation);
+		scan.relation_oid = relation_oid;
+		scan.relation_bytes = (uint64) scan.page_count * BLCKSZ;
 		scan.attr_count = descriptor->natts;
 		for (attribute = 0; attribute < descriptor->natts; ++attribute)
 			if (!TupleDescAttr(descriptor, attribute)->attisdropped &&
@@ -1089,7 +1091,7 @@ csd_wire_validate(const StringInfoData *bytes)
 invalid:
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("generated CSD ABI v4 wire plan failed structural validation")));
+				 errmsg("generated CSD ABI v6 wire plan failed structural validation")));
 }
 
 bytea *

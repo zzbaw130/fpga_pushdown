@@ -5,4 +5,5 @@ code/test-cemu/build/
 results/**/*.log
 results/**/*.pid
 results/csd_planner_sf*/
+results/tpch_*_validation/
 data

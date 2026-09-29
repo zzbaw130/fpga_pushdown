@@ -28,7 +28,9 @@ operators (`HASH_AGG`, `HASH_JOIN`, `SORT`, and `MATERIALIZE`) and keeps all
 other compatible operators in one streaming pipeline.  Thus a planner and a
 scheduler can use one interface even though the implementations differ.
 
-ABI v4 implements raw-heap `SCAN`, expression `FILTER`/`PROJECT`, multi-key
+ABI v6 implements bounded, extent-driven raw-heap `SCAN`, NVMe-backed spill
+staging, expression
+`FILTER`/`PROJECT`, multi-key
 hash/group aggregate, inner/left/semi/anti joins with residual predicates,
 multi-key external-style `SORT`/top-N, `MATERIALIZE`, `LIMIT`, and subplan DAG
 barriers. `INDEX_SCAN` is explicitly canonicalized to full `SCAN+FILTER`, and
@@ -51,13 +53,27 @@ fixed-point `int64` values carrying an explicit scale through scan,
 expressions, aggregates, spills, and result cells. Overflow and division by
 zero fail the plan rather than wrapping silently.
 
-`SCAN` reads raw 8-KiB PostgreSQL heap pages from an MRS and performs the
+`SCAN` reads raw 8-KiB PostgreSQL heap pages through a bounded FDM work window
+and performs the
 page-header, line-pointer, tuple-header, NULL bitmap, fixed-width datum,
-varlena and restricted `numeric` decoding inside CEMU.  It emits an internal
-bounded column batch, never a host pointer.  The visibility contract is
+varlena and restricted `numeric` decoding inside CEMU. It emits an internal
+column batch, never a guest pointer. The input window is bounded; the emitted
+batch is not yet hard-bounded until the FIFO/spill replay milestone. The visibility contract is
 intentionally strict: only planner-proven frozen/all-visible pages may use
 this path.  External/TOASTed or compressed varlena values and unsupported
 numeric encodings fail visibly rather than returning a partial answer.
+
+PostgreSQL obtains the main-fork heap files' physical NVM extents with FIEMAP
+and appends them to the plan. During one Program Execute, the CEMU service
+callback copies the next logical chunk directly from namespace 1 into the
+scan's FDM range. The default window is 32 MiB and is reused until the relation
+is exhausted, so a relation larger than FDM never has to be resident in full.
+The configured FDM namespace is 4 GiB; query-local scan windows, result, a
+bounded spill staging window, plan, and status reservations are
+capacity-checked before execution. `csd.spill_mb` reserves query-local ext4
+blocks on the PGDATA NVMe namespace (4 GiB by default), while
+`csd.spill_stage_mb` controls only the reusable FDM transfer window (32 MiB by
+default). Flash spill capacity is therefore not charged to the FDM budget.
 
 ## FPGA-style functional models
 
@@ -94,31 +110,36 @@ threads are FPGA hardware.
 `FILTER` and `PROJECT` also partition a batch into contiguous tuple tiles.
 `HASH_JOIN`, hash/group aggregate and external-style sort remain blocking operators:
 they use their own operator file and the shared Flash spill allocator is
-serialized.  The current task layer is DAG-level concurrency, not yet the
-full FIFO/double-buffer, per-batch streaming pipeline shown in Trinity.  That
+serialized. Scan input is now chunked and reusable, but each scan still
+accumulates its emitted `Batch` before a blocking consumer. The current task
+layer is DAG-level concurrency, not yet the full FIFO/double-buffer,
+per-batch streaming pipeline shown in Trinity. That
 requires a bounded batch-queue protocol between compatible operators and is
 kept as a distinct next step rather than being conflated with thread-level
 parallelism.
 
 ## Spill-to-flash
 
-Spill extents live in a reserved CSD namespace range, never in PostgreSQL's
-relation files.  An extent header contains plan ID, operator ID, partition or
-run number, tuple count, checksum, and generation.  The controller allocates
-and frees extents only after the whole query completes or aborts.  This gives
-join and sort the same semantic safety as PostgreSQL temporary files without
-making host page-cache traffic part of the operation.
+PostgreSQL creates a query-local, preallocated file in PGDATA and obtains its
+physical layout with FIEMAP. The open file pins those blocks while CEMU writes
+them directly through the internal NVM service. The file is unlinked on both
+success and error and is never used as a relation or read through the host
+page cache. Spill records contain operator/run identity, tuple and column
+counts, cell descriptors, and byte payloads.
 
 `SORT` emits bounded runs and merge intermediates to the designated spill
 range. The current aggregate/join model also serializes oversized blocking
 state there, but it does not yet replay radix partitions. The present C++
-functional model therefore validates spill allocation, layout and accounting;
-it is not yet a proof of a hard controller-memory bound because scan batches
-and sort run objects are retained in host memory. Bounded FIFO streaming plus
+functional model therefore validates Flash allocation, bounded staging writes,
+layout and accounting;
+it is not yet a proof of a hard controller-memory bound because emitted scan
+batches, hash state, and sort run objects are retained in the CEMU process.
+The spill range is now only a reusable FDM staging window; serialized records
+are written to real NVM scratch extents. Bounded FIFO streaming plus
 Flash deserialization/replay is a separate required milestone before SF32
-memory claims. Writes are counted when serialized; `spill_read_bytes` remains
-zero until a real replay path reads the extents, avoiding fictional I/O in the
-cost calibration.
+memory claims. `flash_write_bytes` and `spill_write_bytes` count real backend
+writes; `spill_read_bytes` remains zero until replay reads the extents,
+avoiding fictional I/O in cost calibration.
 
 ## Timing model
 
@@ -189,7 +210,7 @@ orchestration, while host scan/join/aggregate/sort nodes are rejected by the
 planner test.
 
 `PlanCustomPath` emits a packed,
-structurally self-validated ABI-v4 plan with postorder node IDs, dependencies,
+structurally self-validated ABI-v6 plan with postorder node IDs, dependencies,
 blocking/spill flags, estimates, work-mem budget, logical MRS slots, real heap
 page counts, and one physical column descriptor per PostgreSQL attribute.
 The scan descriptor intentionally does not assert the frozen-page flag: that
@@ -204,7 +225,7 @@ explicit fixed-point scale inferred from their columns, constants, and
 arithmetic operators rather than silently collapsing to integer scale.
 
 Join keys, aggregate group/argument descriptors, aggregate `DISTINCT`, sort
-keys/direction/null ordering, and limits are now serialized as real ABI-v4
+keys/direction/null ordering, and limits are now serialized as real ABI-v6
 payloads. Complex aggregate inputs are projected before the FPGA-style
 aggregate core; HAVING and final expressions form later streaming stages.
 PostgreSQL columns removed from a physical Group Key through functional
@@ -220,9 +241,8 @@ The forced-CSD TPC-H suite therefore has zero pending non-scalar expressions.
 PostgreSQL `PARAM_EXEC` values used by independent scalar InitPlans become
 flagged constant relocations: an unpatched relocation is rejected by CEMU as a
 bad expression, never interpreted as SQL NULL. The `CustomScan` executor
-patches these relocations lazily, stages physical heaps to FDMFS, creates an
-MRS, submits `NVME_IOCTL_IO_CMD`, checks the status range, and decodes result
-cells into PostgreSQL tuples. Duplicate logical scans share one physical staged
-heap, while output and spill remain separate query-local ranges. SF=1 execution
+patches these relocations lazily, maps heap files to physical NVM extents,
+creates bounded FDM scan windows and an MRS, submits `NVME_IOCTL_IO_CMD`, checks
+the status range, and decodes result cells into PostgreSQL tuples. SF=1 execution
 of all 22 supplied queries matches HOST results exactly. Per-relation AER cache
 feedback remains the next transport-control milestone.

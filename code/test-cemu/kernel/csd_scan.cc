@@ -37,11 +37,27 @@
         }
         uint64_t first_byte = 0, pages_bytes = 0;
         if (!checked_mul(spec->first_page, CSD_SQL_PAGE_BYTES, &first_byte) ||
-            !checked_mul(spec->page_count, CSD_SQL_PAGE_BYTES, &pages_bytes) ||
-            first_byte > static_cast<uint64_t>(args_->mr_len[spec->input_range]) ||
-            pages_bytes > static_cast<uint64_t>(args_->mr_len[spec->input_range]) - first_byte)
+            !checked_mul(spec->page_count, CSD_SQL_PAGE_BYTES, &pages_bytes))
             return fail(CSD_SQL_STATUS_BAD_PAGE, index);
-        const unsigned char *input = static_cast<const unsigned char *>(args_->mr_addr[spec->input_range]);
+        const bool chunked = (header_->flags & CSD_SQL_PLAN_CHUNKED_SCAN) != 0;
+        if (chunked) {
+            uint64_t extent_bytes = 0;
+            if (args_->nvm_read == NULL)
+                return fail(CSD_SQL_STATUS_NO_INPUT_RANGE, index, 0x108);
+            if (spec->chunk_bytes < CSD_SQL_PAGE_BYTES ||
+                (spec->chunk_bytes % CSD_SQL_PAGE_BYTES) != 0 ||
+                spec->chunk_bytes > static_cast<uint64_t>(args_->mr_len[spec->input_range]) ||
+                first_byte > spec->relation_bytes || pages_bytes > spec->relation_bytes - first_byte)
+                return fail(CSD_SQL_STATUS_BAD_PAGE, index, 0x109);
+            if (!checked_mul(spec->extent_count, sizeof(CsdSqlNvmExtent), &extent_bytes) ||
+                !blob_range(spec->extent_offset, extent_bytes) ||
+                (pages_bytes != 0 && spec->extent_count == 0))
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x10a);
+        } else if (first_byte > static_cast<uint64_t>(args_->mr_len[spec->input_range]) ||
+                   pages_bytes > static_cast<uint64_t>(args_->mr_len[spec->input_range]) - first_byte) {
+            return fail(CSD_SQL_STATUS_BAD_PAGE, index);
+        }
+        unsigned char *input = static_cast<unsigned char *>(args_->mr_addr[spec->input_range]);
         uint16_t output_columns = spec->output_count;
         if (pipeline != NULL)
             for (std::vector<uint32_t>::const_iterator stage = pipeline->begin();
@@ -57,6 +73,81 @@
                     output_columns = project_spec->output_count;
                 }
             }
+        output->columns = output_columns;
+        const uint32_t pages_per_window = chunked ?
+            spec->chunk_bytes / CSD_SQL_PAGE_BYTES : std::max<uint32_t>(1, spec->page_count);
+        uint64_t input_rows = 0;
+        for (uint32_t page_offset = 0; page_offset < spec->page_count;) {
+            const uint32_t window_pages = std::min<uint32_t>(pages_per_window,
+                spec->page_count - page_offset);
+            uint64_t window_offset = first_byte +
+                static_cast<uint64_t>(page_offset) * CSD_SQL_PAGE_BYTES;
+            const unsigned char *window = input + (chunked ? 0 : window_offset);
+            if (chunked && !load_scan_window(index, *spec, window_offset,
+                                             static_cast<uint64_t>(window_pages) * CSD_SQL_PAGE_BYTES,
+                                             input))
+                return false;
+            if (!decode_scan_window(index, *spec, columns, window, window_pages,
+                                    output_columns, pipeline, &input_rows, output))
+                return false;
+            page_offset += window_pages;
+        }
+        add_input_rows(input_rows);
+        add_cycles(static_cast<uint64_t>(spec->page_count) * 64 + input_rows, node);
+        if (pipeline != NULL)
+            for (std::vector<uint32_t>::const_iterator stage = pipeline->begin();
+                 stage != pipeline->end(); ++stage)
+                add_cycles(input_rows, nodes_[*stage]);
+        return true;
+    }
+
+    bool load_scan_window(uint32_t index, const CsdSqlScanSpec &spec,
+                          uint64_t logical_offset, uint64_t length,
+                          unsigned char *target)
+    {
+        const CsdSqlNvmExtent *extents = reinterpret_cast<const CsdSqlNvmExtent *>(
+            static_cast<const char *>(plan_data_) + spec.extent_offset);
+        uint64_t copied = 0;
+        for (uint32_t extent_index = 0; extent_index < spec.extent_count && copied < length;
+             ++extent_index) {
+            const CsdSqlNvmExtent &extent = extents[extent_index];
+            uint64_t extent_end = 0;
+            const uint64_t current = logical_offset + copied;
+            if (!checked_add(extent.logical_offset, extent.length, &extent_end))
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x10b);
+            if (current >= extent_end) continue;
+            if (current < extent.logical_offset)
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x10c);
+            const uint64_t within_extent = current - extent.logical_offset;
+            const uint64_t transfer = std::min<uint64_t>(length - copied,
+                extent.length - within_extent);
+            if (transfer == 0 ||
+                args_->nvm_read(args_->service_context, extent.nsid,
+                                extent.nvm_offset + within_extent,
+                                target + copied, transfer) != 0)
+                return fail(CSD_SQL_STATUS_NO_INPUT_RANGE, index, 0x10d);
+            copied += transfer;
+        }
+        if (copied != length)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x10e);
+        {
+            uint64_t total = 0;
+            std::lock_guard<std::mutex> guard(status_mutex_);
+            if (checked_add(status_.flash_read_bytes, length, &total))
+                status_.flash_read_bytes = total;
+            else status_.flash_read_bytes = std::numeric_limits<uint64_t>::max();
+            ++status_.input_chunks;
+        }
+        return true;
+    }
+
+    bool decode_scan_window(uint32_t index, const CsdSqlScanSpec &spec,
+                            const CsdSqlColumnSpec *columns,
+                            const unsigned char *input, uint32_t page_count,
+                            uint16_t output_columns,
+                            const std::vector<uint32_t> *pipeline,
+                            uint64_t *input_rows, Batch *output)
+    {
         struct DecodeTask {
             uint32_t first_page;
             uint32_t end_page;
@@ -64,12 +155,12 @@
             uint16_t lanes;
             size_t reserve_rows;
         };
-        std::vector<uint16_t> item_counts(spec->page_count, 0);
+        std::vector<uint16_t> item_counts(page_count, 0);
         const uint32_t tuple_bits = std::min<uint32_t>(kTupleBindWordBits,
-            std::max<uint32_t>(32, static_cast<uint32_t>(spec->attr_count) * 64));
+            std::max<uint32_t>(32, static_cast<uint32_t>(spec.attr_count) * 64));
         const uint32_t bind_lanes = std::max<uint32_t>(1, kTupleBindWordBits / tuple_bits);
-        for (uint32_t page_number = 0; page_number < spec->page_count; ++page_number) {
-            const unsigned char *page = input + first_byte + static_cast<uint64_t>(page_number) * CSD_SQL_PAGE_BYTES;
+        for (uint32_t page_number = 0; page_number < page_count; ++page_number) {
+            const unsigned char *page = input + static_cast<uint64_t>(page_number) * CSD_SQL_PAGE_BYTES;
             const uint16_t lower = read_u16(page + 12);
             if (lower < kPageHeaderBytes || lower > CSD_SQL_PAGE_BYTES ||
                 ((lower - kPageHeaderBytes) % 4) != 0)
@@ -77,15 +168,15 @@
             item_counts[page_number] = (lower - kPageHeaderBytes) / 4;
         }
         std::vector<DecodeTask> tasks;
-        if (spec->page_count > 0) {
+        if (page_count > 0) {
             const uint16_t lanes = static_cast<uint16_t>(std::max<uint32_t>(1,
                 std::min<uint32_t>(parallel_workers_, bind_lanes)));
-            const uint32_t page_tiles = std::min<uint32_t>(spec->page_count,
+            const uint32_t page_tiles = std::min<uint32_t>(page_count,
                 std::max<uint32_t>(1, parallel_workers_ * 2));
             tasks.reserve(static_cast<size_t>(page_tiles) * lanes);
             for (uint32_t tile = 0; tile < page_tiles; ++tile) {
-                const uint32_t first_page = spec->page_count * tile / page_tiles;
-                const uint32_t end_page = spec->page_count * (tile + 1) / page_tiles;
+                const uint32_t first_page = page_count * tile / page_tiles;
+                const uint32_t end_page = page_count * (tile + 1) / page_tiles;
                 for (uint16_t lane = 0; lane < lanes; ++lane) {
                     size_t reserve_rows = 0;
                     for (uint32_t page_number = first_page; page_number < end_page; ++page_number) {
@@ -106,36 +197,29 @@
             decoded[task_index].columns = output_columns;
             decoded[task_index].rows.reserve(task.reserve_rows);
             for (uint32_t page_number = task.first_page; page_number < task.end_page; ++page_number) {
-                const unsigned char *page = input + first_byte +
-                    static_cast<uint64_t>(page_number) * CSD_SQL_PAGE_BYTES;
-                if (!scan_page_lane(index, *spec, columns, page, item_counts[page_number],
+                const unsigned char *page = input + static_cast<uint64_t>(page_number) * CSD_SQL_PAGE_BYTES;
+                if (!scan_page_lane(index, spec, columns, page, item_counts[page_number],
                                     task.lane, task.lanes, output_columns, pipeline,
                                     &scanned_rows[task_index], &decoded[task_index]))
                     return;
             }
             decoded_ok[task_index] = 1;
         });
-        output->columns = output_columns;
         size_t output_rows = 0;
-        uint64_t input_rows = 0;
+        uint64_t scanned_total = 0;
         for (size_t task_index = 0; task_index < tasks.size(); ++task_index)
         {
             output_rows += decoded[task_index].rows.size();
-            input_rows += scanned_rows[task_index];
+            scanned_total += scanned_rows[task_index];
         }
-        output->rows.reserve(output_rows);
+        output->rows.reserve(output->rows.size() + output_rows);
         for (size_t task_index = 0; task_index < tasks.size(); ++task_index) {
             if (!decoded_ok[task_index]) return false;
             output->rows.insert(output->rows.end(),
                 std::make_move_iterator(decoded[task_index].rows.begin()),
                 std::make_move_iterator(decoded[task_index].rows.end()));
         }
-        add_input_rows(input_rows);
-        add_cycles(static_cast<uint64_t>(spec->page_count) * 64 + input_rows, node);
-        if (pipeline != NULL)
-            for (std::vector<uint32_t>::const_iterator stage = pipeline->begin();
-                 stage != pipeline->end(); ++stage)
-                add_cycles(input_rows, nodes_[*stage]);
+        *input_rows += scanned_total;
         return true;
     }
 

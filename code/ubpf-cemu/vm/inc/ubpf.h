@@ -58,6 +58,10 @@ extern "C"
      */
     struct ubpf_vm;
 
+    typedef long long (*ubpf_nvm_io_fn)(void *context, unsigned int nsid,
+                                        unsigned long long byte_offset,
+                                        void *buffer, unsigned long long length);
+
     struct ubpf_jit_args
     {
         int numr;
@@ -67,6 +71,9 @@ extern "C"
         long long cparam2;
         void* data_buffer;
         long long buffer_len;
+        void* service_context;
+        ubpf_nvm_io_fn nvm_read;
+        ubpf_nvm_io_fn nvm_write;
     } __attribute__((packed));
 
     /**

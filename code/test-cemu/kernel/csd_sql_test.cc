@@ -127,6 +127,137 @@ CsdSqlPlanNode make_node(uint32_t id, uint16_t opcode)
     return node;
 }
 
+struct FakeNvm {
+    std::vector<unsigned char> bytes;
+    uint32_t reads;
+    uint32_t writes;
+    FakeNvm() : reads(0), writes(0) {}
+};
+
+long long fake_nvm_read(void *context, unsigned int nsid,
+                        unsigned long long byte_offset, void *buffer,
+                        unsigned long long length)
+{
+    FakeNvm *nvm = static_cast<FakeNvm *>(context);
+    if (nsid != 1 || byte_offset > nvm->bytes.size() ||
+        length > nvm->bytes.size() - byte_offset)
+        return -1;
+    memcpy(buffer, nvm->bytes.data() + byte_offset, length);
+    ++nvm->reads;
+    return 0;
+}
+
+long long fake_nvm_write(void *context, unsigned int nsid,
+                         unsigned long long byte_offset, void *buffer,
+                         unsigned long long length)
+{
+    FakeNvm *nvm = static_cast<FakeNvm *>(context);
+    if (nsid != 1 || byte_offset > nvm->bytes.size() ||
+        length > nvm->bytes.size() - byte_offset)
+        return -1;
+    memcpy(nvm->bytes.data() + byte_offset, buffer, length);
+    ++nvm->writes;
+    return 0;
+}
+
+void test_chunked_nvm_scan()
+{
+    FakeNvm nvm;
+    nvm.bytes.resize(3 * CSD_SQL_PAGE_BYTES, 0);
+    unsigned char *first_page = nvm.bytes.data();
+    unsigned char *second_page = nvm.bytes.data() + 2 * CSD_SQL_PAGE_BYTES;
+    put_u16(first_page + 12, 24 + 4);
+    put_u16(second_page + 12, 24 + 4);
+    add_right_tuple(first_page, 0, 128, 1, 10);
+    add_right_tuple(second_page, 0, 128, 2, 20);
+
+    std::vector<unsigned char> plan(sizeof(CsdSqlPlanHeader) + sizeof(CsdSqlPlanNode), 0);
+    CsdSqlPlanNode node = make_node(0, CSD_SQL_OP_SCAN);
+    CsdSqlScanSpec scan = {};
+    scan.input_range = 0;
+    scan.page_count = 2;
+    scan.attr_count = 2;
+    scan.output_count = 2;
+    scan.flags = CSD_SQL_SCAN_FROZEN_PAGES;
+    scan.relation_oid = 42;
+    scan.chunk_bytes = CSD_SQL_PAGE_BYTES;
+    scan.relation_bytes = 2 * CSD_SQL_PAGE_BYTES;
+    scan.extent_count = 2;
+    node.expression_offset = append(&plan, scan);
+    CsdSqlColumnSpec key = {};
+    key.attnum = 1;
+    key.output_column = 0;
+    key.attlen = 4;
+    key.alignment = 4;
+    key.datum_type = CSD_SQL_TYPE_INT32;
+    key.flags = CSD_SQL_COLUMN_OUTPUT;
+    append(&plan, key);
+    CsdSqlColumnSpec value = key;
+    value.attnum = 2;
+    value.output_column = 1;
+    append(&plan, value);
+    node.expression_length = sizeof(scan) + 2 * sizeof(CsdSqlColumnSpec);
+    scan.extent_offset = plan.size();
+    CsdSqlNvmExtent first_extent = {};
+    first_extent.logical_offset = 0;
+    first_extent.nvm_offset = 0;
+    first_extent.length = CSD_SQL_PAGE_BYTES;
+    first_extent.nsid = 1;
+    append(&plan, first_extent);
+    CsdSqlNvmExtent second_extent = first_extent;
+    second_extent.logical_offset = CSD_SQL_PAGE_BYTES;
+    second_extent.nvm_offset = 2 * CSD_SQL_PAGE_BYTES;
+    append(&plan, second_extent);
+    overwrite(&plan, node.expression_offset, scan);
+
+    CsdSqlPlanHeader header = {};
+    header.magic = CSD_SQL_PLAN_MAGIC;
+    header.version = CSD_SQL_PLAN_VERSION;
+    header.header_bytes = sizeof(header);
+    header.node_count = 1;
+    header.node_bytes = sizeof(node);
+    header.plan_bytes = plan.size();
+    header.root_node = 0;
+    header.flags = CSD_SQL_PLAN_STATUS_LAST_RANGE | CSD_SQL_PLAN_FROZEN_SNAPSHOT |
+                   CSD_SQL_PLAN_STAGED_RANGE | CSD_SQL_PLAN_CHUNKED_SCAN;
+    header.output_range = 1;
+    header.spill_range = CSD_SQL_INVALID_RANGE;
+    header.parallel_workers = 4;
+    overwrite(&plan, 0, header);
+    overwrite(&plan, sizeof(header), node);
+
+    std::vector<unsigned char> work(CSD_SQL_PAGE_BYTES, 0);
+    std::vector<unsigned char> output(4096, 0);
+    std::vector<unsigned char> status(sizeof(CsdSqlExecutionStatus), 0);
+    void *ranges[] = {work.data(), output.data(), plan.data(), status.data()};
+    long long lengths[] = {static_cast<long long>(work.size()),
+                           static_cast<long long>(output.size()),
+                           static_cast<long long>(plan.size()),
+                           static_cast<long long>(status.size())};
+    cemu_args args = {};
+    args.numr = 4;
+    args.mr_addr = ranges;
+    args.mr_len = lengths;
+    args.cparam1 = plan.size();
+    args.cparam2 = 2;
+    args.service_context = &nvm;
+    args.nvm_read = fake_nvm_read;
+    assert(csd_sql(&args) == 2);
+
+    const CsdSqlResultHeader *result =
+        reinterpret_cast<const CsdSqlResultHeader *>(output.data());
+    const CsdSqlResultCell *cells = reinterpret_cast<const CsdSqlResultCell *>(
+        output.data() + result->cells_offset);
+    const CsdSqlExecutionStatus *execution =
+        reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
+    assert(result->row_count == 2 && result->column_count == 2);
+    assert(cells[0].integer == 1 && cells[1].integer == 10);
+    assert(cells[2].integer == 2 && cells[3].integer == 20);
+    assert(nvm.reads == 2);
+    assert(execution->flash_read_bytes == 2 * CSD_SQL_PAGE_BYTES);
+    assert(execution->input_chunks == 2);
+}
+
 void test_heap_pipeline_with_spill()
 {
     std::vector<unsigned char> left_page(CSD_SQL_PAGE_BYTES, 0);
@@ -278,6 +409,15 @@ void test_heap_pipeline_with_spill()
     append(&plan, sum);
     nodes[6].expression_length = sizeof(aggregate) + 2 * sizeof(CsdSqlAggregateColumn);
 
+    FakeNvm spill_nvm;
+    spill_nvm.bytes.resize(4096, 0);
+    CsdSqlNvmExtent spill_extent = {};
+    spill_extent.logical_offset = 0;
+    spill_extent.nvm_offset = 0;
+    spill_extent.length = spill_nvm.bytes.size();
+    spill_extent.nsid = 1;
+    const uint32_t spill_extent_offset = append(&plan, spill_extent);
+
     CsdSqlPlanHeader header = {};
     header.magic = CSD_SQL_PLAN_MAGIC;
     header.version = CSD_SQL_PLAN_VERSION;
@@ -287,12 +427,15 @@ void test_heap_pipeline_with_spill()
     header.plan_bytes = plan.size();
     header.root_node = 6;
     header.flags = CSD_SQL_PLAN_STATUS_LAST_RANGE | CSD_SQL_PLAN_FROZEN_SNAPSHOT |
-                   CSD_SQL_PLAN_STAGED_RANGE;
+                   CSD_SQL_PLAN_STAGED_RANGE | CSD_SQL_PLAN_FLASH_SPILL;
     header.output_range = 2;
     header.spill_range = 3;
     header.plan_id = 0x1234;
     header.work_mem_bytes = 64; // forces the two-row sort to create Flash runs
     header.parallel_workers = 4;
+    header.spill_extent_count = 1;
+    header.spill_extent_offset = spill_extent_offset;
+    header.spill_bytes = spill_nvm.bytes.size();
     overwrite(&plan, 0, header);
     for (uint32_t index = 0; index < nodes.size(); ++index)
         overwrite(&plan, sizeof(header) + index * sizeof(CsdSqlPlanNode), nodes[index]);
@@ -314,6 +457,8 @@ void test_heap_pipeline_with_spill()
     args.mr_len = lengths;
     args.cparam1 = staged_plan.size();
     args.cparam2 = 4;
+    args.service_context = &spill_nvm;
+    args.nvm_write = fake_nvm_write;
 
     const long long execution_result = csd_sql(&args);
     if (execution_result != 1)
@@ -334,6 +479,11 @@ void test_heap_pipeline_with_spill()
     assert(status->validated_nodes == 7);
     assert(status->executed_nodes == 7);
     assert(status->spill_write_bytes > 0);
+    assert(status->flash_write_bytes == status->spill_write_bytes);
+    assert(spill_nvm.writes > 0);
+    uint32_t spill_magic = 0;
+    memcpy(&spill_magic, spill_nvm.bytes.data(), sizeof(spill_magic));
+    assert(spill_magic == UINT32_C(0x4353504c));
 }
 
 void test_tpch_expression_and_multikey_pipeline()
@@ -918,6 +1068,7 @@ void test_postgres_numeric_division_scale()
 
 int main()
 {
+    test_chunked_nvm_scan();
     test_heap_pipeline_with_spill();
     test_tpch_expression_and_multikey_pipeline();
     test_join_canonicalization_and_residual();

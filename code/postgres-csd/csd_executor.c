@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
 #include <linux/nvme_ioctl.h>
 #include <math.h>
 #include <stdint.h>
@@ -24,6 +26,7 @@
 #include "executor/nodeCustom.h"
 #include "executor/nodeSubplan.h"
 #include "fmgr.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/value.h"
 #include "storage/bufmgr.h"
@@ -44,6 +47,7 @@
 typedef struct CsdSqlPlanHeader CsdSqlPlanHeader;
 typedef struct CsdSqlPlanNode CsdSqlPlanNode;
 typedef struct CsdSqlScanSpec CsdSqlScanSpec;
+typedef struct CsdSqlNvmExtent CsdSqlNvmExtent;
 typedef struct CsdSqlExpressionSpec CsdSqlExpressionSpec;
 typedef struct CsdSqlExpressionInstruction CsdSqlExpressionInstruction;
 typedef struct CsdSqlJoinSpec CsdSqlJoinSpec;
@@ -93,6 +97,8 @@ typedef struct CsdTransport
 	int lock_fd;
 	int control_fd;
 	int execute_fd;
+	int spill_fd;
+	char *spill_path;
 	int *range_fds;
 	long long *range_sizes;
 	int range_count;
@@ -108,10 +114,14 @@ char *csd_execute_device = NULL;
 char *csd_fdm_path = NULL;
 char *csd_shared_library = NULL;
 int csd_output_mb = 64;
-int csd_spill_mb = 256;
+int csd_spill_mb = 4096;
+int csd_spill_stage_mb = 32;
+int csd_chunk_mb = 32;
+int csd_fdm_capacity_mb = 4096;
+int csd_nvm_nsid = 1;
 int csd_parallel_workers = 32;
 int csd_program_runtime = 0;
-int csd_device_work_mem_mb = 8192;
+int csd_device_work_mem_mb = 512;
 bool csd_profile = false;
 
 static uint64
@@ -125,12 +135,25 @@ csd_align_range(uint64 bytes)
 }
 
 static void
+csd_account_fdm_range(uint64 *total, uint64 bytes)
+{
+	uint64 aligned = csd_align_range(Max(bytes, CSD_RANGE_ALIGNMENT));
+
+	if (*total > PG_UINT64_MAX - aligned)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("CSD FDM reservation size overflow")));
+	*total += aligned;
+}
+
+static void
 csd_transport_init(CsdTransport *transport)
 {
 	MemSet(transport, 0, sizeof(*transport));
 	transport->lock_fd = -1;
 	transport->control_fd = -1;
 	transport->execute_fd = -1;
+	transport->spill_fd = -1;
 }
 
 static void
@@ -147,6 +170,13 @@ csd_transport_cleanup(CsdTransport *transport)
 	if (transport->control_fd >= 0 && transport->downloaded)
 		(void) ioctl(transport->control_fd, IOCTL_CEMU_UNLOAD,
 					 &transport->download);
+	if (transport->spill_fd >= 0)
+		close(transport->spill_fd);
+	if (transport->spill_path != NULL)
+	{
+		(void) unlink(transport->spill_path);
+		pfree(transport->spill_path);
+	}
 	for (index = 0; index < transport->range_count; ++index)
 		if (transport->range_fds != NULL && transport->range_fds[index] >= 0)
 		{
@@ -155,7 +185,7 @@ csd_transport_cleanup(CsdTransport *transport)
 			(void) truncate_result;
 			close(transport->range_fds[index]);
 		}
-	/* FDM ranges are query-local Flash scratch.  Leaving high-numbered files
+	/* FDM ranges are query-local bounded memory windows. Leaving high-numbered files
 	 * behind after a many-relation query can starve the next, smaller plan even
 	 * though it recreates all of its own low-numbered ranges. */
 	for (index = 0; index < transport->range_count; ++index)
@@ -207,73 +237,220 @@ csd_collect_relations(List *metadata, List *relations)
 	return relations;
 }
 
-static uint64
-csd_relation_bytes(Oid relation_oid)
+static void
+csd_append_extent(StringInfo extents, uint64 logical_offset,
+				  uint64 nvm_offset, uint64 length, uint32 flags)
 {
-	Relation relation = table_open(relation_oid, AccessShareLock);
-	uint64 bytes = (uint64) RelationGetNumberOfBlocks(relation) * BLCKSZ;
+	CsdSqlNvmExtent extent;
 
-	table_close(relation, NoLock);
-	return bytes;
+	if (extents->len >= (int) sizeof(extent))
+	{
+		CsdSqlNvmExtent *previous = (CsdSqlNvmExtent *)
+			(extents->data + extents->len - sizeof(extent));
+
+		if (previous->logical_offset + previous->length == logical_offset &&
+			previous->nvm_offset + previous->length == nvm_offset &&
+			previous->nsid == (uint32) csd_nvm_nsid)
+		{
+			previous->length += length;
+			previous->flags |= flags;
+			return;
+		}
+	}
+	extent.logical_offset = logical_offset;
+	extent.nvm_offset = nvm_offset;
+	extent.length = length;
+	extent.nsid = csd_nvm_nsid;
+	extent.flags = flags;
+	appendBinaryStringInfo(extents, (const char *) &extent, sizeof(extent));
 }
 
+/*
+ * Translate a PostgreSQL heap file into physical offsets in the emulated NVM
+ * namespace.  PGDATA is mounted directly from /dev/nvme0n1, so FIEMAP's
+ * physical offsets use the same byte-address space as CEMU's backend.
+ */
 static void
-csd_copy_relation(Oid relation_oid, int output_fd, uint64 expected_bytes)
+csd_append_segment_extents(StringInfo extents, Oid relation_oid,
+						   const char *path, uint64 logical_base,
+						   uint64 expected_bytes, bool writable_spill)
+{
+	struct fiemap query;
+	struct fiemap *map;
+	struct stat stat_buffer;
+	Size map_bytes;
+	uint64 cursor = 0;
+	uint32 index;
+	int fd = open(path, (writable_spill ? O_RDWR : O_RDONLY) | PG_BINARY, 0);
+
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open CSD heap segment \"%s\": %m", path)));
+	if (fstat(fd, &stat_buffer) != 0 || stat_buffer.st_size < 0 ||
+		(uint64) stat_buffer.st_size < expected_bytes)
+	{
+		int saved_errno = errno;
+
+		close(fd);
+		errno = saved_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("CSD heap segment \"%s\" is shorter than expected", path)));
+	}
+	MemSet(&query, 0, sizeof(query));
+	query.fm_start = 0;
+	query.fm_length = expected_bytes;
+	query.fm_flags = FIEMAP_FLAG_SYNC;
+	if (ioctl(fd, FS_IOC_FIEMAP, &query) != 0 || query.fm_mapped_extents == 0)
+	{
+		int saved_errno = errno;
+
+		close(fd);
+		errno = saved_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not map CSD heap segment \"%s\": %m", path)));
+	}
+	if (query.fm_mapped_extents > (MaxAllocSize - sizeof(*map)) /
+		sizeof(struct fiemap_extent))
+	{
+		close(fd);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("relation %u has too many physical extents", relation_oid)));
+	}
+	map_bytes = sizeof(*map) +
+		(Size) query.fm_mapped_extents * sizeof(struct fiemap_extent);
+	map = palloc0(map_bytes);
+	map->fm_start = 0;
+	map->fm_length = expected_bytes;
+	map->fm_flags = FIEMAP_FLAG_SYNC;
+	map->fm_extent_count = query.fm_mapped_extents;
+	if (ioctl(fd, FS_IOC_FIEMAP, map) != 0)
+	{
+		int saved_errno = errno;
+
+		pfree(map);
+		close(fd);
+		errno = saved_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read CSD heap extents for \"%s\": %m", path)));
+	}
+	close(fd);
+	for (index = 0; index < map->fm_mapped_extents && cursor < expected_bytes; ++index)
+	{
+		const struct fiemap_extent *physical = &map->fm_extents[index];
+		const uint32 invalid_flags = FIEMAP_EXTENT_UNKNOWN |
+			FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_ENCODED |
+			FIEMAP_EXTENT_DATA_ENCRYPTED | FIEMAP_EXTENT_NOT_ALIGNED |
+			FIEMAP_EXTENT_DATA_INLINE;
+		uint64 extent_start = physical->fe_logical;
+		uint64 extent_end;
+		uint64 copy_start;
+		uint64 copy_end;
+
+		if (physical->fe_length > PG_UINT64_MAX - extent_start)
+			break;
+		extent_end = extent_start + physical->fe_length;
+		if (extent_end <= cursor)
+			continue;
+		if (extent_start > cursor || (physical->fe_flags & invalid_flags) != 0 ||
+			(!writable_spill &&
+			 (physical->fe_flags & FIEMAP_EXTENT_UNWRITTEN) != 0))
+			break;
+		copy_start = cursor;
+		copy_end = Min(extent_end, expected_bytes);
+		if (((logical_base + copy_start) & 511) != 0 ||
+			((physical->fe_physical + copy_start - extent_start) & 511) != 0 ||
+			((copy_end - copy_start) & 511) != 0)
+			break;
+		csd_append_extent(extents, logical_base + copy_start,
+			physical->fe_physical + copy_start - extent_start,
+			copy_end - copy_start, physical->fe_flags);
+		cursor = copy_end;
+	}
+	pfree(map);
+	if (cursor != expected_bytes)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("CSD %s contains a hole or unsupported physical extent at byte %llu",
+					writable_spill ? "spill file" : "relation",
+					(unsigned long long) (logical_base + cursor)),
+				 errdetail("Path: %s, relation OID: %u", path, relation_oid),
+				 errhint("Ensure PGDATA resides directly on the configured CEMU NVM namespace.")));
+}
+
+static uint64
+csd_collect_relation_extents(Oid relation_oid, StringInfo extents)
 {
 	Relation relation = table_open(relation_oid, NoLock);
 	char *relative = relpathbackend(relation->rd_node, relation->rd_backend,
 								 MAIN_FORKNUM);
 	char *base = psprintf("%s/%s", DataDir, relative);
-	uint64 copied = 0;
+	uint64 relation_bytes = (uint64) RelationGetNumberOfBlocks(relation) * BLCKSZ;
+	uint64 logical_base = 0;
 	int segment = 0;
 
-	while (copied < expected_bytes)
+	while (logical_base < relation_bytes)
 	{
 		char *path = segment == 0 ? pstrdup(base) : psprintf("%s.%d", base, segment);
-		uint64 segment_bytes = Min(expected_bytes - copied,
+		uint64 segment_bytes = Min(relation_bytes - logical_base,
 			(uint64) RELSEG_SIZE * BLCKSZ);
-		/* FDMFS hands the source iterator directly to the NVMe backend. */
-		int input_fd = open(path, O_RDONLY | O_DIRECT | PG_BINARY, 0);
-		off_t input_offset = 0;
-		off_t output_offset = (off_t) copied;
 
-		if (input_fd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open CSD heap segment \"%s\": %m", path)));
-		while (segment_bytes > 0)
-		{
-			size_t request = (size_t) Min(segment_bytes, UINT64_C(1) << 30);
-			ssize_t bytes = copy_file_range(input_fd, &input_offset, output_fd,
-										&output_offset, request, 0);
-
-			if (bytes < 0)
-			{
-				int saved_errno = errno;
-				close(input_fd);
-				errno = saved_errno;
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not stage relation %u into CSD memory: %m",
-								relation_oid)));
-			}
-			if (bytes == 0)
-			{
-				close(input_fd);
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("short copy while staging relation %u", relation_oid)));
-			}
-			segment_bytes -= bytes;
-			copied += bytes;
-		}
-		close(input_fd);
-		pfree(path);
+		csd_append_segment_extents(extents, relation_oid, path, logical_base,
+			segment_bytes, false);
+		logical_base += segment_bytes;
 		++segment;
+		pfree(path);
 	}
 	pfree(base);
 	pfree(relative);
 	table_close(relation, NoLock);
+	return relation_bytes;
+}
+
+/*
+ * Reserve filesystem-owned blocks on the PGDATA NVMe namespace, then expose
+ * their physical extents to the CSD.  The CSD reads and writes these blocks
+ * through the internal NVM service; the guest never treats their contents as
+ * a PostgreSQL file.  Keeping the file open pins the allocation for the whole
+ * Program Execute operation, and cleanup unlinks it afterwards.
+ */
+static void
+csd_create_flash_spill(CsdTransport *transport, uint64 spill_bytes,
+					   uint64 plan_id, StringInfo extents)
+{
+	int allocation_error;
+
+	transport->spill_path = psprintf("%s/pg_csd_spill_%d_%llu.tmp", DataDir,
+		MyProcPid, (unsigned long long) plan_id);
+	if (unlink(transport->spill_path) != 0 && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not recycle CSD Flash spill file \"%s\": %m",
+					transport->spill_path)));
+	transport->spill_fd = open(transport->spill_path,
+		O_CREAT | O_EXCL | O_RDWR | PG_BINARY, 0600);
+	if (transport->spill_fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create CSD Flash spill file \"%s\": %m",
+					transport->spill_path)));
+	allocation_error = posix_fallocate(transport->spill_fd, 0,
+		(off_t) spill_bytes);
+	if (allocation_error != 0)
+	{
+		errno = allocation_error;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not reserve %llu bytes of CSD Flash spill space: %m",
+					(unsigned long long) spill_bytes),
+				 errhint("Reduce csd.spill_mb or free space on the PGDATA NVMe namespace.")));
+	}
+	csd_append_segment_extents(extents, InvalidOid, transport->spill_path,
+		0, spill_bytes, true);
 }
 
 static int
@@ -327,41 +504,6 @@ csd_create_range(uint32 range, uint64 bytes)
 			(errcode_for_file_access(),
 			 errmsg("could not allocate %llu bytes for CSD range \"%s\": %m",
 					(unsigned long long) csd_align_range(bytes), path)));
-	pg_unreachable();
-}
-
-/* Treat csd.spill_mb as the preferred reservation.  FDMFS has no useful
- * statvfs capacity reporting, so shrink an unused spill reservation when the
- * relation ranges already occupy most of the memory namespace.  If a plan
- * really spills beyond the granted range the kernel reports SPILL_TOO_SMALL. */
-static int
-csd_create_spill_range(uint32 range, uint64 requested_bytes,
-					   uint64 *allocated_bytes)
-{
-	const uint64 minimum_bytes = UINT64_C(1) << 20;
-	uint64 attempt = csd_align_range(Max(requested_bytes, minimum_bytes));
-	int allocation_error = 0;
-
-	for (;;)
-	{
-		int fd = csd_try_create_range(range, attempt, &allocation_error);
-
-		if (fd >= 0)
-		{
-			*allocated_bytes = attempt;
-			return fd;
-		}
-		if ((allocation_error != ENOSPC && allocation_error != ENOMEM) ||
-			attempt <= minimum_bytes)
-			break;
-		attempt = Max(minimum_bytes, csd_align_range(attempt / 2));
-	}
-	errno = allocation_error;
-	ereport(ERROR,
-			(errcode_for_file_access(),
-			 errmsg("could not reserve CSD spill range (requested %llu bytes, minimum %llu bytes): %m",
-					(unsigned long long) requested_bytes,
-					(unsigned long long) minimum_bytes)));
 	pg_unreachable();
 }
 
@@ -509,11 +651,16 @@ csd_patch_expression(char *plan, uint32 plan_bytes, uint32 offset, uint32 length
 }
 
 static void
-csd_patch_plan(char *plan, Size plan_length, EState *estate)
+csd_patch_plan(char **plan_pointer, Size *plan_length_pointer, EState *estate,
+			   List *relations)
 {
+	char *plan = *plan_pointer;
+	Size plan_length = *plan_length_pointer;
 	CsdSqlPlanHeader *header = (CsdSqlPlanHeader *) plan;
 	CsdSqlPlanNode *nodes;
+	ListCell *relation_cell = list_head(relations);
 	uint32 index;
+	uint64 chunk_bytes = (uint64) csd_chunk_mb * 1024 * 1024;
 
 	if (plan_length < sizeof(*header) || header->plan_bytes != plan_length ||
 		header->node_count == 0 ||
@@ -521,8 +668,14 @@ csd_patch_plan(char *plan, Size plan_length, EState *estate)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid staged CSD plan")));
+	if (chunk_bytes == 0 || chunk_bytes > PG_UINT32_MAX ||
+		(chunk_bytes % BLCKSZ) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("csd.chunk_mb must describe a nonzero, page-aligned buffer no larger than 4 GB")));
 	header->flags |= CSD_SQL_PLAN_STATUS_LAST_RANGE |
-		CSD_SQL_PLAN_FROZEN_SNAPSHOT | CSD_SQL_PLAN_STAGED_RANGE;
+		CSD_SQL_PLAN_FROZEN_SNAPSHOT | CSD_SQL_PLAN_STAGED_RANGE |
+		CSD_SQL_PLAN_CHUNKED_SCAN;
 	header->parallel_workers = csd_parallel_workers;
 	header->plan_id = ((uint64) MyProcPid << 32) ^ (uint64) GetCurrentTimestamp();
 	if (csd_device_work_mem_mb > 0)
@@ -535,6 +688,12 @@ csd_patch_plan(char *plan, Size plan_length, EState *estate)
 		if (node->opcode == CSD_SQL_OP_SCAN || node->opcode == CSD_SQL_OP_INDEX_SCAN)
 		{
 			CsdSqlScanSpec *scan;
+			StringInfoData extents;
+			Oid relation_oid;
+			uint32 expression_offset = node->expression_offset;
+			uint64 relation_bytes;
+			uint32 extent_count;
+			Size old_length;
 
 			if (node->expression_offset > plan_length ||
 				node->expression_length < sizeof(*scan) ||
@@ -543,7 +702,49 @@ csd_patch_plan(char *plan, Size plan_length, EState *estate)
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("invalid CSD scan descriptor")));
 			scan = (CsdSqlScanSpec *) (plan + node->expression_offset);
+			if (relation_cell == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("CSD plan has more scan nodes than relation metadata")));
+			relation_oid = lfirst_oid(relation_cell);
+			relation_cell = lnext(relation_cell);
+			if (scan->relation_oid != relation_oid)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("CSD scan relation %u does not match executor relation %u",
+								scan->relation_oid, relation_oid)));
+			initStringInfo(&extents);
+			relation_bytes = csd_collect_relation_extents(relation_oid, &extents);
+			if (extents.len % sizeof(CsdSqlNvmExtent) != 0 ||
+				(uint64) extents.len / sizeof(CsdSqlNvmExtent) > PG_UINT32_MAX ||
+				plan_length > PG_UINT32_MAX - (uint32) extents.len)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("CSD physical extent plan exceeds the wire ABI limit")));
+			extent_count = extents.len / sizeof(CsdSqlNvmExtent);
+			old_length = plan_length;
+			if (extents.len > 0)
+			{
+				plan_length += extents.len;
+				plan = repalloc(plan, plan_length);
+				memcpy(plan + old_length, extents.data, extents.len);
+			}
+			pfree(extents.data);
+			header = (CsdSqlPlanHeader *) plan;
+			header->plan_bytes = plan_length;
+			nodes = (CsdSqlPlanNode *) (plan + header->header_bytes);
+			node = &nodes[index];
+			scan = (CsdSqlScanSpec *) (plan + expression_offset);
 			scan->flags |= CSD_SQL_SCAN_FROZEN_PAGES;
+			scan->extent_offset = old_length;
+			scan->extent_count = extent_count;
+			scan->chunk_bytes = chunk_bytes;
+			scan->relation_bytes = relation_bytes;
+			if (relation_bytes != (uint64) scan->page_count * BLCKSZ)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("relation %u changed size while building the CSD plan",
+								relation_oid)));
 		}
 		if (node->opcode == CSD_SQL_OP_FILTER || node->opcode == CSD_SQL_OP_PROJECT)
 			csd_patch_expression(plan, plan_length, node->expression_offset,
@@ -559,6 +760,12 @@ csd_patch_plan(char *plan, Size plan_length, EState *estate)
 					join->residual_length, estate);
 		}
 	}
+	if (relation_cell != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("CSD relation metadata contains entries without scan nodes")));
+	*plan_pointer = plan;
+	*plan_length_pointer = plan_length;
 }
 
 static void
@@ -609,12 +816,12 @@ csd_read_range(int fd, void *target, Size length, const char *description)
 }
 
 static void
-csd_run_transport(CsdExecutorState *state, char *plan, Size plan_length,
-				  List *relations)
+csd_run_transport(CsdExecutorState *state, List *relations)
 {
+	char *plan = state->plan_data;
+	Size plan_length = state->plan_length;
 	CsdSqlPlanHeader *header = (CsdSqlPlanHeader *) plan;
 	CsdTransport transport;
-	ListCell *cell;
 	uint32 relation_count = list_length(relations);
 	uint32 output_range = relation_count;
 	uint32 spill_range = output_range + 1;
@@ -622,96 +829,89 @@ csd_run_transport(CsdExecutorState *state, char *plan, Size plan_length,
 	uint32 status_range = plan_range + 1;
 	uint64 output_bytes = (uint64) csd_output_mb * 1024 * 1024;
 	uint64 spill_bytes = (uint64) csd_spill_mb * 1024 * 1024;
-	uint64 allocated_spill_bytes;
+	uint64 spill_stage_bytes = (uint64) csd_spill_stage_mb * 1024 * 1024;
+	uint64 chunk_bytes = (uint64) csd_chunk_mb * 1024 * 1024;
+	uint64 fdm_capacity_bytes = (uint64) csd_fdm_capacity_mb * 1024 * 1024;
+	uint64 reserved_fdm_bytes = 0;
 	char *lock_path = pstrdup("/tmp/csd_executor.lock");
 	char program_payload[PATH_MAX + 32];
 	CsdNvmeProgramExecuteCmd *execute_command;
 	struct nvme_passthru_cmd command;
 	CsdSqlExecutionStatus status;
 	CsdSqlResultHeader result;
-	Oid *relation_oids;
-	uint64 *relation_bytes;
-	uint32 *allocation_order;
 	uint64 total_result_bytes;
 	uint32 index = 0;
-	uint32 order_index;
 
 	csd_transport_init(&transport);
 	PG_TRY();
 	{
+		StringInfoData spill_extents;
+		Size old_plan_length;
+
 		transport.lock_fd = open(lock_path, O_CREAT | O_RDWR | PG_BINARY, 0600);
 		if (transport.lock_fd < 0 || flock(transport.lock_fd, LOCK_EX) != 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not lock CSD FDM workspace: %m")));
+		/* Pin a query-local file allocation on the NVMe namespace and append its
+		 * physical layout to the already patched execution plan.  This capacity
+		 * is Flash, not FDM, so it is deliberately absent from the memory budget. */
+		initStringInfo(&spill_extents);
+		csd_create_flash_spill(&transport, spill_bytes, header->plan_id,
+			&spill_extents);
+		if (spill_extents.len == 0 ||
+			spill_extents.len % sizeof(CsdSqlNvmExtent) != 0 ||
+			(uint64) spill_extents.len / sizeof(CsdSqlNvmExtent) > PG_UINT32_MAX ||
+			plan_length > PG_UINT32_MAX - (uint32) spill_extents.len)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("CSD Flash spill extent plan exceeds the wire ABI limit")));
+		old_plan_length = plan_length;
+		plan_length += spill_extents.len;
+		plan = repalloc(plan, plan_length);
+		memcpy(plan + old_plan_length, spill_extents.data, spill_extents.len);
+		pfree(spill_extents.data);
+		state->plan_data = plan;
+		state->plan_length = plan_length;
+		header = (CsdSqlPlanHeader *) plan;
+		header->plan_bytes = plan_length;
+		header->flags |= CSD_SQL_PLAN_FLASH_SPILL;
+		header->spill_extent_offset = old_plan_length;
+		header->spill_extent_count =
+			(plan_length - old_plan_length) / sizeof(CsdSqlNvmExtent);
+		header->spill_bytes = spill_bytes;
+
 		transport.range_count = status_range + 1;
 		transport.range_fds = palloc(sizeof(int) * transport.range_count);
 		transport.range_sizes = palloc0(sizeof(long long) * transport.range_count);
 		for (index = 0; index < (uint32) transport.range_count; ++index)
 			transport.range_fds[index] = -1;
-		relation_oids = palloc(sizeof(Oid) * relation_count);
-		relation_bytes = palloc(sizeof(uint64) * relation_count);
-		allocation_order = palloc(sizeof(uint32) * relation_count);
-		index = 0;
-		foreach(cell, relations)
-		{
-			relation_oids[index] = lfirst_oid(cell);
-			relation_bytes[index] = csd_relation_bytes(relation_oids[index]);
-			transport.range_sizes[index] = relation_bytes[index];
-			allocation_order[index] = index;
-			++index;
-		}
-		/* FDMFS allocates each range as a large contiguous extent.  Preserve
-		 * logical range IDs, but reserve/copy the largest heaps first to avoid
-		 * fragmentation when lineitem follows smaller join inputs. */
 		for (index = 0; index < relation_count; ++index)
-			for (order_index = index + 1; order_index < relation_count; ++order_index)
-				if (relation_bytes[allocation_order[order_index]] >
-					relation_bytes[allocation_order[index]])
-				{
-					uint32 swap = allocation_order[index];
-
-					allocation_order[index] = allocation_order[order_index];
-					allocation_order[order_index] = swap;
-				}
-		for (order_index = 0; order_index < relation_count; ++order_index)
+			csd_account_fdm_range(&reserved_fdm_bytes, chunk_bytes);
+		csd_account_fdm_range(&reserved_fdm_bytes, output_bytes);
+		csd_account_fdm_range(&reserved_fdm_bytes, spill_stage_bytes);
+		csd_account_fdm_range(&reserved_fdm_bytes, plan_length);
+		csd_account_fdm_range(&reserved_fdm_bytes, CSD_RANGE_ALIGNMENT);
+		if (reserved_fdm_bytes > fdm_capacity_bytes)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("CSD query requires %llu bytes of FDM but csd.fdm_capacity_mb allows %llu bytes",
+							(unsigned long long) reserved_fdm_bytes,
+							(unsigned long long) fdm_capacity_bytes),
+					 errhint("Reduce csd.chunk_mb, csd.output_mb, or csd.spill_stage_mb.")));
+		/* Each logical scan owns one reusable bounded work window.  Relation
+		 * bytes arrive from NVM extents inside Program Execute, so no heap is
+		 * copied wholesale into FDMFS here. */
+		for (index = 0; index < relation_count; ++index)
 		{
-			uint32 duplicate_index = relation_count;
-			uint32 candidate;
-
-			index = allocation_order[order_index];
-			/* A plan may scan the same heap several times (TPC-H Q17/Q18/Q21).
-			 * Keep distinct logical MRS IDs for the wire plan, but alias them to
-			 * one staged FDM inode instead of consuming the namespace repeatedly. */
-			for (candidate = 0; candidate < relation_count; ++candidate)
-				if (candidate != index && relation_oids[candidate] == relation_oids[index] &&
-					transport.range_fds[candidate] >= 0)
-				{
-					duplicate_index = candidate;
-					break;
-				}
-			if (duplicate_index < relation_count)
-			{
-				transport.range_fds[index] = dup(transport.range_fds[duplicate_index]);
-				if (transport.range_fds[index] < 0)
-					ereport(ERROR,
-							(errcode_for_file_access(),
-							 errmsg("could not alias duplicate CSD relation range: %m")));
-				continue;
-			}
-			transport.range_fds[index] = csd_create_range(index,
-				relation_bytes[index]);
-			csd_copy_relation(relation_oids[index], transport.range_fds[index],
-				relation_bytes[index]);
+			transport.range_sizes[index] = chunk_bytes;
+			transport.range_fds[index] = csd_create_range(index, chunk_bytes);
 		}
-		pfree(allocation_order);
-		pfree(relation_bytes);
-		pfree(relation_oids);
 		transport.range_sizes[output_range] = output_bytes;
 		transport.range_fds[output_range] = csd_create_range(output_range, output_bytes);
-		transport.range_fds[spill_range] = csd_create_spill_range(spill_range,
-			spill_bytes, &allocated_spill_bytes);
-		transport.range_sizes[spill_range] = allocated_spill_bytes;
+		transport.range_fds[spill_range] = csd_create_range(spill_range,
+			spill_stage_bytes);
+		transport.range_sizes[spill_range] = spill_stage_bytes;
 		transport.range_sizes[plan_range] = csd_align_range(plan_length);
 		transport.range_fds[plan_range] = csd_create_range(plan_range, plan_length);
 		transport.range_sizes[status_range] = CSD_RANGE_ALIGNMENT;
@@ -811,9 +1011,14 @@ csd_run_transport(CsdExecutorState *state, char *plan, Size plan_length,
 			uint32 opcode;
 
 			ereport(NOTICE,
-					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f",
+					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f flash_read_bytes=%llu flash_write_bytes=%llu input_chunks=%llu spill_write_bytes=%llu spill_read_bytes=%llu",
 							(unsigned long long) status.operator_calls[CSD_SQL_OP_SCAN],
-							(double) status.operator_ns[CSD_SQL_OP_SCAN] / 1000000.0)));
+							(double) status.operator_ns[CSD_SQL_OP_SCAN] / 1000000.0,
+							(unsigned long long) status.flash_read_bytes,
+							(unsigned long long) status.flash_write_bytes,
+							(unsigned long long) status.input_chunks,
+							(unsigned long long) status.spill_write_bytes,
+							(unsigned long long) status.spill_read_bytes)));
 
 			for (opcode = CSD_SQL_OP_SCAN; opcode < CSD_SQL_PROFILE_SLOTS; ++opcode)
 				if (status.operator_calls[opcode] != 0)
@@ -986,10 +1191,9 @@ csd_executor_next(CustomScanState *node)
 	 * a valid executor dispatch function. */
 	if (!state->executed)
 	{
-		csd_patch_plan(state->plan_data, state->plan_length,
-			node->ss.ps.state);
-		csd_run_transport(state, state->plan_data, state->plan_length,
-			state->relations);
+		csd_patch_plan(&state->plan_data, &state->plan_length,
+			node->ss.ps.state, state->relations);
+		csd_run_transport(state, state->relations);
 		pfree(state->plan_data);
 		state->plan_data = NULL;
 		list_free(state->relations);

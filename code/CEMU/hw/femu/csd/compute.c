@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include "compute.h"
@@ -28,6 +29,50 @@ struct csd_thread_arg {
 };
 
 static void *compute_thread(void *arg);
+
+/*
+ * Services exposed only to an executing CEMU program.  They let a functional
+ * model refill a bounded FDM work buffer from an NVM physical extent without
+ * routing the bytes through the guest or PCIe.  The plan still controls every
+ * namespace and byte range; these helpers only perform the checked backend
+ * transfer.
+ */
+static long long compute_nvm_io(void *context, unsigned int nsid,
+                                unsigned long long byte_offset, void *buffer,
+                                unsigned long long length, int is_write)
+{
+    FemuCtrl *n = context;
+    NvmeNamespace *mns;
+    uint64_t backend_size;
+
+    if (n == NULL || buffer == NULL || length == 0) {
+        return -EINVAL;
+    }
+    mns = nvme_find_namespace(n, nsid);
+    if (mns == NULL || mns->backend == NULL || mns->backend->size < 0) {
+        return -ENODEV;
+    }
+    backend_size = (uint64_t)mns->backend->size;
+    if (byte_offset > backend_size || length > backend_size - byte_offset) {
+        return -ERANGE;
+    }
+    backend_rw_internal(mns->backend, buffer, byte_offset, length, is_write);
+    return 0;
+}
+
+static long long compute_nvm_read(void *context, unsigned int nsid,
+                                  unsigned long long byte_offset, void *buffer,
+                                  unsigned long long length)
+{
+    return compute_nvm_io(context, nsid, byte_offset, buffer, length, 0);
+}
+
+static long long compute_nvm_write(void *context, unsigned int nsid,
+                                   unsigned long long byte_offset, void *buffer,
+                                   unsigned long long length)
+{
+    return compute_nvm_io(context, nsid, byte_offset, buffer, length, 1);
+}
 
 struct ProgramInitArgs {
     uint32_t nsid;
@@ -763,6 +808,9 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     job->args.cparam2 = cparam2;
     job->args.data_buffer = dlen ? data_buffer : NULL;
     job->args.buffer_len = dlen;
+    job->args.service_context = n;
+    job->args.nvm_read = compute_nvm_read;
+    job->args.nvm_write = compute_nvm_write;
     if (!program->is_indirect) {
         sched_enqueue_job(compute_ns(req->ns), req);
     }

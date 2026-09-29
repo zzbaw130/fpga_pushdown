@@ -13,6 +13,9 @@ services:
       - CSD_COUNT=1
     volumes:
       - ./code/test-cemu:/workspace/code/CEMU/tests/cemu
+      # Canonical source path used by the PostgreSQL extension's PGXS include
+      # flags; the CEMU path above remains the emulator-visible kernel path.
+      - ./code/test-cemu:/workspace/code/test-cemu
       # run-csd.sh is copied into build/ during image construction; mount it
       # here so launch configuration changes do not require a full CEMU rebuild.
       - ./code/CEMU/femu-scripts/run-csd.sh:/workspace/code/CEMU/build/run-csd.sh:ro
@@ -20,6 +23,9 @@ services:
       # PostgreSQL is compiled once inside the persistent CEMU guest from this
       # source tree, then installed in its qcow2 overlay.
       - ./code/postgres:/workspace/code/postgres
+      # The extension must also be compiled inside the guest against that
+      # guest-built PostgreSQL; never execute a host-built csd_pg.so there.
+      - ./code/postgres-csd:/workspace/code/postgres-csd
       - ./data:/workspace/data
       - ./results:/workspace/results
       - ./scripts:/workspace/scripts

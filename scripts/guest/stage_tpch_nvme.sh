@@ -41,11 +41,20 @@ FDM_GROUP="${CSD_FDM_GROUP:-${PG_OS_USER:-csdpg}}"
 }
 
 mkdir -p "${NVME_MOUNT}"
-if ! mountpoint -q "${NVME_MOUNT}"; then
+if mountpoint -q "${NVME_MOUNT}"; then
+	mounted_source="$(findmnt -n -o SOURCE --target "${NVME_MOUNT}")"
+	mounted_type="$(findmnt -n -o FSTYPE --target "${NVME_MOUNT}")"
+	[[ "${mounted_source}" == "${NVME_DEVICE}" && "${mounted_type}" == ext4 ]] || {
+		echo "${NVME_MOUNT} must be an ext4 mount of ${NVME_DEVICE}; found ${mounted_source} (${mounted_type})." >&2
+		exit 1
+	}
+else
     if ! blkid "${NVME_DEVICE}" >/dev/null 2>&1; then
         mkfs.ext4 -F "${NVME_DEVICE}" >/dev/null
     fi
-    mount "${NVME_DEVICE}" "${NVME_MOUNT}"
+	# Specify ext4 explicitly. FDMFS accepts arbitrary block devices, so generic
+	# filesystem probing can otherwise mount a blank NVM namespace as FDM memory.
+	mount -t ext4 "${NVME_DEVICE}" "${NVME_MOUNT}"
 fi
 
 # Initialize the standard FDMFS memory-range pool without the unrelated fio
@@ -55,10 +64,10 @@ if [[ -b "${FDM_DEVICE}" ]]; then
     if ! mountpoint -q "${FDM_MOUNT}"; then
         mount -t fdmfs "${FDM_DEVICE}" "${FDM_MOUNT}"
     fi
-	# Query execution recreates numeric files at the exact size of each input,
-	# result, spill, plan and status range.  The mount therefore belongs to the
-	# dedicated PostgreSQL user; fixed 32 MiB benchmark files would strand half
-	# of the finite FDM before a real TPC-H query starts.
+	# Query execution recreates numeric files for bounded scan windows plus the
+	# result, spill-staging, plan and status ranges. The mount therefore belongs
+	# to the dedicated PostgreSQL user; benchmark files would reserve unrelated
+	# chunks from the finite 4 GiB FDM namespace.
 	chown "${FDM_GROUP}:${FDM_GROUP}" "${FDM_MOUNT}"
 	find "${FDM_MOUNT}" -maxdepth 1 -type f -name '[0-9]*' -delete
 fi
