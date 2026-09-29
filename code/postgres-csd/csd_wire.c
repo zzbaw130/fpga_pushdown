@@ -67,6 +67,55 @@ csd_wire_expression(Node *node)
 	return IsA(node, TargetEntry) ? (Node *) ((TargetEntry *) node)->expr : node;
 }
 
+static Bitmapset *
+csd_wire_scan_required_attrs(List *metadata, Index scan_rti,
+							 TupleDesc descriptor)
+{
+	List *payload = (List *) list_nth(metadata, 7);
+	List *targets = (List *) list_nth(payload, 1);
+	List *clauses = (List *) list_nth(payload, 2);
+	Bitmapset *attrs = NULL;
+	ListCell *cell;
+	List *sources = list_concat(list_copy(targets), list_copy(clauses));
+
+	foreach(cell, sources)
+	{
+		Node *expression = csd_wire_expression((Node *) lfirst(cell));
+		List *variables = pull_var_clause(expression,
+			PVC_RECURSE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS |
+			PVC_RECURSE_PLACEHOLDERS);
+		ListCell *variable_cell;
+
+		foreach(variable_cell, variables)
+		{
+			Var *variable = (Var *) lfirst(variable_cell);
+
+			if (!IsA(variable, Var) || variable->varlevelsup != 0 ||
+				variable->varno != scan_rti)
+				continue;
+			if (variable->varattno < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("CSD scan does not support PostgreSQL system columns")));
+			attrs = bms_add_member(attrs, variable->varattno);
+		}
+		list_free(variables);
+	}
+	list_free(sources);
+	if (attrs == NULL)
+	{
+		int attribute;
+
+		for (attribute = 0; attribute < descriptor->natts; ++attribute)
+			if (!TupleDescAttr(descriptor, attribute)->attisdropped)
+			{
+				attrs = bms_add_member(attrs, attribute + 1);
+				break;
+			}
+	}
+	return attrs;
+}
+
 static bool
 csd_wire_collect_aggregates(Node *node, void *context)
 {
@@ -201,8 +250,12 @@ csd_wire_scan_schema(List *metadata, Index scan_rti)
 	Oid relation_oid = (Oid) strtoul(strVal(list_nth(payload, 0)), NULL, 10);
 	Relation relation = table_open(relation_oid, NoLock);
 	CsdExprSchema schema;
+	Bitmapset *required_attrs = csd_wire_scan_required_attrs(metadata, scan_rti,
+		RelationGetDescr(relation));
 
-	csd_expr_schema_from_scan(&schema, scan_rti, RelationGetDescr(relation));
+	csd_expr_schema_from_scan(&schema, scan_rti, RelationGetDescr(relation),
+		required_attrs);
+	bms_free(required_attrs);
 	table_close(relation, NoLock);
 	return schema;
 }
@@ -359,6 +412,8 @@ csd_wire_append_payload(CsdWireBuilder *builder, CsdSqlPlanNode *node,
 		Oid relation_oid = (Oid) strtoul(strVal(list_nth(payload, 0)), NULL, 10);
 		Relation relation = table_open(relation_oid, NoLock);
 		TupleDesc descriptor = RelationGetDescr(relation);
+		Bitmapset *required_attrs = csd_wire_scan_required_attrs(metadata,
+			(Index) detail, descriptor);
 		uint16 output_column = 0;
 		int attribute;
 
@@ -372,7 +427,9 @@ csd_wire_append_payload(CsdWireBuilder *builder, CsdSqlPlanNode *node,
 		scan.page_count = RelationGetNumberOfBlocks(relation);
 		scan.attr_count = descriptor->natts;
 		for (attribute = 0; attribute < descriptor->natts; ++attribute)
-			if (!TupleDescAttr(descriptor, attribute)->attisdropped)
+			if (!TupleDescAttr(descriptor, attribute)->attisdropped &&
+				(bms_is_member(0, required_attrs) ||
+				 bms_is_member(attribute + 1, required_attrs)))
 				++output_column;
 		scan.output_count = output_column;
 		scan.flags = CSD_SQL_SCAN_STRICT_PAGE_FORMAT;
@@ -390,7 +447,9 @@ csd_wire_append_payload(CsdWireBuilder *builder, CsdSqlPlanNode *node,
 			if (pg_attribute->atttypid == NUMERICOID)
 				column.numeric_scale = pg_attribute->atttypmod >= VARHDRSZ ?
 					(pg_attribute->atttypmod - VARHDRSZ) & 0xffff : -1;
-			if (!pg_attribute->attisdropped)
+			if (!pg_attribute->attisdropped &&
+				(bms_is_member(0, required_attrs) ||
+				 bms_is_member(attribute + 1, required_attrs)))
 			{
 				column.output_column = output_column++;
 				column.flags = CSD_SQL_COLUMN_OUTPUT;
@@ -403,6 +462,7 @@ csd_wire_append_payload(CsdWireBuilder *builder, CsdSqlPlanNode *node,
 				column.output_column = CSD_SQL_NO_COLUMN;
 			csd_wire_append(&builder->bytes, &column, sizeof(column));
 		}
+		bms_free(required_attrs);
 		table_close(relation, NoLock);
 	}
 	else if (node->opcode == CSD_SQL_OP_HASH_AGG)
@@ -842,11 +902,11 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 		List *clauses = (List *) list_nth(payload, 2);
 		List *lowerable = csd_scan_lowerable_clauses(clauses,
 			&builder->pending_expression_count);
+		result.node_id = node_id;
+		result.schema = csd_wire_scan_schema(metadata, (Index) detail);
 
 		if (lowerable != NIL)
 		{
-			Oid relation_oid = (Oid) strtoul(strVal(list_nth(payload, 0)), NULL, 10);
-			Relation relation = table_open(relation_oid, NoLock);
 			CsdSqlPlanNode filter = {0};
 			uint32 filter_id = builder->next_node++;
 			uint32 expression_offset;
@@ -860,22 +920,15 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 			filter.estimated_rows = node.estimated_rows;
 			filter.estimated_bytes = node.estimated_bytes;
 			filter.arg1 = 1;
-			csd_append_scan_expression(&builder->bytes, lowerable, (Index) detail,
-				RelationGetDescr(relation), &expression_offset,
+			csd_append_scan_expression(&builder->bytes, lowerable, &result.schema,
+				&expression_offset,
 				&expression_length, &builder->parameter_count);
 			filter.expression_offset = expression_offset;
 			filter.expression_length = expression_length;
-			table_close(relation, NoLock);
 			++builder->expression_count;
 			memcpy(builder->bytes.data + sizeof(CsdSqlPlanHeader) +
 				   filter_id * sizeof(CsdSqlPlanNode), &filter, sizeof(filter));
 			result.node_id = filter_id;
-			result.schema = csd_wire_scan_schema(metadata, (Index) detail);
-		}
-		else
-		{
-			result.node_id = node_id;
-			result.schema = csd_wire_scan_schema(metadata, (Index) detail);
 		}
 		return targets == NIL ? result :
 			csd_wire_emit_expression_node(builder, CSD_SQL_OP_PROJECT,

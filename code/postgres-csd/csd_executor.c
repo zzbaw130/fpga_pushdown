@@ -109,9 +109,10 @@ char *csd_fdm_path = NULL;
 char *csd_shared_library = NULL;
 int csd_output_mb = 64;
 int csd_spill_mb = 256;
-int csd_parallel_workers = 4;
+int csd_parallel_workers = 32;
 int csd_program_runtime = 0;
 int csd_device_work_mem_mb = 8192;
+bool csd_profile = false;
 
 static uint64
 csd_align_range(uint64 bytes)
@@ -719,6 +720,13 @@ csd_run_transport(CsdExecutorState *state, char *plan, Size plan_length,
 
 		header->output_range = output_range;
 		header->spill_range = spill_range;
+		if (csd_profile)
+		{
+			header->flags |= CSD_SQL_PLAN_PROFILE;
+			ereport(NOTICE,
+					(errmsg("CSD profile enabled for plan %llu (flags=%u)",
+							(unsigned long long) header->plan_id, header->flags)));
+		}
 		csd_write_range(transport.range_fds[plan_range], plan, plan_length);
 
 		transport.control_fd = open(csd_control_device, O_RDWR | PG_BINARY, 0);
@@ -798,6 +806,24 @@ csd_run_transport(CsdExecutorState *state, char *plan, Size plan_length,
 					(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
 					 errmsg("CSD SQL execution failed with status %u at node %u (detail %u)",
 							status.status_code, status.failed_node, status.reserved32)));
+		if (csd_profile)
+		{
+			uint32 opcode;
+
+			ereport(NOTICE,
+					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f",
+							(unsigned long long) status.operator_calls[CSD_SQL_OP_SCAN],
+							(double) status.operator_ns[CSD_SQL_OP_SCAN] / 1000000.0)));
+
+			for (opcode = CSD_SQL_OP_SCAN; opcode < CSD_SQL_PROFILE_SLOTS; ++opcode)
+				if (status.operator_calls[opcode] != 0)
+					ereport(NOTICE,
+							(errmsg("CSD profile opcode=%u calls=%llu rows=%llu elapsed_ms=%.3f",
+									opcode,
+									(unsigned long long) status.operator_calls[opcode],
+									(unsigned long long) status.operator_rows[opcode],
+									(double) status.operator_ns[opcode] / 1000000.0)));
+		}
 		csd_read_range(transport.range_fds[output_range], &result, sizeof(result),
 			"CSD result header");
 		if (result.magic != CSD_SQL_RESULT_MAGIC || result.version != CSD_SQL_PLAN_VERSION ||

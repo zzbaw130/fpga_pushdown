@@ -1,14 +1,23 @@
-    bool execute_materialize(uint32_t index, const CsdSqlPlanNode &node, const Batch &input, Batch *output)
+    bool execute_materialize(uint32_t index, const CsdSqlPlanNode &node, Batch &input,
+                             Batch *output, bool consume_input)
     {
-        *output = input;
+        const size_t input_rows = input.rows.size();
         if (!spill_if_needed(index, node, input)) return false;
-        add_cycles(input.rows.size(), node);
+        if (consume_input) {
+            output->columns = input.columns;
+            output->rows.swap(input.rows);
+        } else *output = input;
+        add_cycles(input_rows, node);
         return true;
     }
 
-    bool execute_limit(uint32_t index, const CsdSqlPlanNode &node, const Batch &input, Batch *output)
+    bool execute_limit(uint32_t index, const CsdSqlPlanNode &node, Batch &input,
+                       Batch *output, bool consume_input)
     {
-        *output = input;
+        if (consume_input) {
+            output->columns = input.columns;
+            output->rows.swap(input.rows);
+        } else *output = input;
         if (node.arg0 < output->rows.size()) output->rows.resize(node.arg0);
         add_cycles(output->rows.size(), node);
         (void) index;

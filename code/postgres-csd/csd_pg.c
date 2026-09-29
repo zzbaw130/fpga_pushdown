@@ -147,7 +147,7 @@ _PG_init(void)
 						&csd_spill_mb, 256, 1, 8192, PGC_USERSET, 0,
 						NULL, NULL, NULL);
 	DefineCustomIntVariable("csd.parallel_workers", "CSD software FPGA worker lanes.", NULL,
-						&csd_parallel_workers, 4, 0, 32, PGC_USERSET, 0,
+						&csd_parallel_workers, 32, 0, 32, PGC_USERSET, 0,
 						NULL, NULL, NULL);
 	DefineCustomIntVariable("csd.program_runtime", "CEMU modeled Program Execute runtime.", NULL,
 						&csd_program_runtime, 0, 0, INT_MAX, PGC_USERSET, 0,
@@ -156,6 +156,9 @@ _PG_init(void)
 						"Functional-model memory threshold before spill.", NULL,
 						&csd_device_work_mem_mb, 8192, 0, INT_MAX, PGC_USERSET, 0,
 						NULL, NULL, NULL);
+	DefineCustomBoolVariable("csd.profile", "Report CSD functional-model time by operator.", NULL,
+						 &csd_profile, false, PGC_USERSET, 0,
+						 NULL, NULL, NULL);
 
 	RegisterCustomScanMethods(&csd_scan_methods);
 	previous_rel_hook = set_rel_pathlist_hook;

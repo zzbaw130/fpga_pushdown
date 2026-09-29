@@ -103,15 +103,79 @@
 		return static_cast<int16_t>(std::max(0, std::min(36, scale)));
 	}
 
-    static bool sql_like(const std::string &value, const std::string &pattern, bool insensitive)
+    struct EvalValue {
+        bool is_null;
+        uint8_t type;
+        int64_t integer;
+        int16_t numeric_scale;
+        const char *bytes_data;
+        size_t bytes_size;
+
+        EvalValue() : is_null(true), type(CSD_SQL_TYPE_INVALID), integer(0),
+                      numeric_scale(0), bytes_data(NULL), bytes_size(0) {}
+    };
+
+    static EvalValue eval_value(const Value &value)
     {
-        std::vector<uint8_t> previous(pattern.size() + 1, 0), current(pattern.size() + 1, 0);
+        EvalValue result;
+        result.is_null = value.is_null;
+        result.type = value.type;
+        result.integer = value.integer;
+        result.numeric_scale = value.numeric_scale;
+        if (!value.is_null && value.type == CSD_SQL_TYPE_BYTES) {
+            result.bytes_data = value.bytes.data();
+            result.bytes_size = value.bytes.size();
+        }
+        return result;
+    }
+
+    static Value materialize_eval_value(const EvalValue &value)
+    {
+        Value result;
+        result.is_null = value.is_null;
+        result.type = value.type;
+        result.integer = value.integer;
+        result.numeric_scale = value.numeric_scale;
+        if (!value.is_null && value.type == CSD_SQL_TYPE_BYTES && value.bytes_size != 0)
+            result.bytes.assign(value.bytes_data, value.bytes_size);
+        return result;
+    }
+
+    static int compare_eval_value(const EvalValue &left, const EvalValue &right)
+    {
+        if (left.is_null != right.is_null) return left.is_null ? -1 : 1;
+        if (left.is_null) return 0;
+        if (left.type == CSD_SQL_TYPE_BYTES || right.type == CSD_SQL_TYPE_BYTES) {
+            const size_t common = std::min(left.bytes_size, right.bytes_size);
+            const int comparison = common == 0 ? 0 :
+                std::memcmp(left.bytes_data, right.bytes_data, common);
+            if (comparison != 0) return comparison < 0 ? -1 : 1;
+            return left.bytes_size == right.bytes_size ? 0 :
+                (left.bytes_size < right.bytes_size ? -1 : 1);
+        }
+        if (left.type == CSD_SQL_TYPE_NUMERIC || right.type == CSD_SQL_TYPE_NUMERIC) {
+            const int16_t left_scale = left.type == CSD_SQL_TYPE_NUMERIC ? left.numeric_scale : 0;
+            const int16_t right_scale = right.type == CSD_SQL_TYPE_NUMERIC ? right.numeric_scale : 0;
+            const int16_t scale = std::max(left_scale, right_scale);
+            __int128 left_integer = left.integer;
+            __int128 right_integer = right.integer;
+            for (int16_t power = left_scale; power < scale; ++power) left_integer *= 10;
+            for (int16_t power = right_scale; power < scale; ++power) right_integer *= 10;
+            return left_integer == right_integer ? 0 : (left_integer < right_integer ? -1 : 1);
+        }
+        return left.integer == right.integer ? 0 : (left.integer < right.integer ? -1 : 1);
+    }
+
+    static bool sql_like(const char *value, size_t value_size,
+                         const char *pattern, size_t pattern_size, bool insensitive)
+    {
+        std::vector<uint8_t> previous(pattern_size + 1, 0), current(pattern_size + 1, 0);
         previous[0] = 1;
-        for (size_t pattern_index = 0; pattern_index < pattern.size() && pattern[pattern_index] == '%'; ++pattern_index)
+        for (size_t pattern_index = 0; pattern_index < pattern_size && pattern[pattern_index] == '%'; ++pattern_index)
             previous[pattern_index + 1] = 1;
-        for (size_t value_index = 0; value_index < value.size(); ++value_index) {
-            current.assign(pattern.size() + 1, 0);
-            for (size_t pattern_index = 0; pattern_index < pattern.size(); ++pattern_index) {
+        for (size_t value_index = 0; value_index < value_size; ++value_index) {
+            current.assign(pattern_size + 1, 0);
+            for (size_t pattern_index = 0; pattern_index < pattern_size; ++pattern_index) {
                 const unsigned char pattern_char = static_cast<unsigned char>(pattern[pattern_index]);
                 const unsigned char value_char = static_cast<unsigned char>(value[value_index]);
                 if (pattern_char == '%')
@@ -122,9 +186,9 @@
             }
             previous.swap(current);
         }
-        for (size_t pattern_index = 0; pattern_index < pattern.size(); ++pattern_index)
+        for (size_t pattern_index = 0; pattern_index < pattern_size; ++pattern_index)
             if (pattern[pattern_index] == '%') previous[pattern_index + 1] |= previous[pattern_index];
-        return previous[pattern.size()] != 0;
+        return previous[pattern_size] != 0;
     }
 
     static int32_t postgres_date_year(int64_t postgres_days)
@@ -220,7 +284,8 @@
         const CsdSqlExpressionSpec *spec = NULL;
         const CsdSqlExpressionInstruction *instructions = NULL;
         if (!expression_program(index, offset, length, &spec, &instructions)) return false;
-        std::vector<Value> stack;
+        static thread_local std::vector<EvalValue> stack;
+        stack.clear();
         stack.reserve(spec->max_stack);
         outputs->clear();
         outputs->reserve(spec->output_count);
@@ -232,13 +297,13 @@
                 const Row *source = instruction.opcode == CSD_SQL_EXPR_PUSH_COLUMN ? &row : aux_row;
                 if (source == NULL || instruction.operand >= source->size())
                     return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                stack.push_back((*source)[instruction.operand]);
+                stack.push_back(eval_value((*source)[instruction.operand]));
             } else if (instruction.opcode == CSD_SQL_EXPR_PUSH_CONSTANT) {
                 if (!is_supported_type(instruction.datum_type))
                     return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
                 if (instruction.flags & CSD_SQL_EXPR_PARAMETER_PLACEHOLDER)
                     return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                Value constant;
+                EvalValue constant;
                 constant.is_null = (instruction.flags & CSD_SQL_EXPR_CONSTANT_NULL) != 0;
                 constant.type = instruction.datum_type;
                 constant.integer = instruction.immediate;
@@ -246,29 +311,34 @@
                 if (instruction.datum_type == CSD_SQL_TYPE_BYTES && !constant.is_null) {
                     if (!blob_range(instruction.bytes_offset, instruction.bytes_length))
                         return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                    constant.bytes.assign(static_cast<const char *>(plan_data_) + instruction.bytes_offset,
-                                          instruction.bytes_length);
+                    constant.bytes_data = static_cast<const char *>(plan_data_) + instruction.bytes_offset;
+                    constant.bytes_size = instruction.bytes_length;
                 }
                 stack.push_back(constant);
             } else if (instruction.opcode == CSD_SQL_EXPR_EMIT) {
                 if (stack.empty() || outputs->size() >= spec->output_count)
                     return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                outputs->push_back(stack.back());
+                outputs->push_back(materialize_eval_value(stack.back()));
                 stack.pop_back();
             } else if (instruction.opcode == CSD_SQL_EXPR_NOT || instruction.opcode == CSD_SQL_EXPR_IS_NULL ||
                        instruction.opcode == CSD_SQL_EXPR_IS_NOT_NULL || instruction.opcode == CSD_SQL_EXPR_NEGATE ||
                        instruction.opcode == CSD_SQL_EXPR_EXTRACT_YEAR || instruction.opcode == CSD_SQL_EXPR_SUBSTRING) {
                 if (stack.empty()) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                Value input = stack.back();
+                EvalValue input = stack.back();
                 stack.pop_back();
-                Value result;
+                EvalValue result;
                 if (instruction.opcode == CSD_SQL_EXPR_IS_NULL || instruction.opcode == CSD_SQL_EXPR_IS_NOT_NULL) {
-                    result = boolean_value(instruction.opcode == CSD_SQL_EXPR_IS_NULL ? input.is_null : !input.is_null);
+                    result.is_null = false;
+                    result.type = CSD_SQL_TYPE_BOOL;
+                    result.integer = instruction.opcode == CSD_SQL_EXPR_IS_NULL ?
+                        input.is_null : !input.is_null;
                 } else if (input.is_null) {
                     result.type = instruction.datum_type;
                 } else if (instruction.opcode == CSD_SQL_EXPR_NOT) {
                     if (input.type != CSD_SQL_TYPE_BOOL) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                    result = boolean_value(input.integer == 0);
+                    result.is_null = false;
+                    result.type = CSD_SQL_TYPE_BOOL;
+                    result.integer = input.integer == 0;
                 } else if (instruction.opcode == CSD_SQL_EXPR_NEGATE) {
                     if (input.type == CSD_SQL_TYPE_BYTES || input.integer == std::numeric_limits<int64_t>::min())
                         return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
@@ -285,24 +355,35 @@
                     const size_t start = instruction.operand - 1;
                     result.is_null = false;
                     result.type = CSD_SQL_TYPE_BYTES;
-                    if (start < input.bytes.size()) result.bytes = input.bytes.substr(start, instruction.bytes_length);
+                    if (start < input.bytes_size) {
+                        result.bytes_data = input.bytes_data + start;
+                        result.bytes_size = std::min<size_t>(instruction.bytes_length,
+                                                             input.bytes_size - start);
+                    }
                 }
                 stack.push_back(result);
             } else if (instruction.opcode == CSD_SQL_EXPR_SELECT) {
                 if (stack.size() < 3) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                Value otherwise = stack.back(); stack.pop_back();
-                Value when_true = stack.back(); stack.pop_back();
-                Value condition = stack.back(); stack.pop_back();
+                EvalValue otherwise = stack.back(); stack.pop_back();
+                EvalValue when_true = stack.back(); stack.pop_back();
+                EvalValue condition = stack.back(); stack.pop_back();
                 if (!condition.is_null && condition.type != CSD_SQL_TYPE_BOOL)
                     return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                stack.push_back(!condition.is_null && condition.integer != 0 ? when_true : otherwise);
+                if (!condition.is_null && condition.integer != 0)
+                    stack.push_back(when_true);
+                else stack.push_back(otherwise);
             } else {
                 if (stack.size() < 2) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                Value right = stack.back(); stack.pop_back();
-                Value left = stack.back(); stack.pop_back();
-                Value result;
+                EvalValue right = stack.back(); stack.pop_back();
+                EvalValue left = stack.back(); stack.pop_back();
+                EvalValue result;
                 if (instruction.opcode >= CSD_SQL_EXPR_ADD && instruction.opcode <= CSD_SQL_EXPR_DIVIDE) {
-                    if (!arithmetic_value(index, instruction, left, right, &result)) return false;
+                    Value arithmetic_result;
+                    const Value left_value = materialize_eval_value(left);
+                    const Value right_value = materialize_eval_value(right);
+                    if (!arithmetic_value(index, instruction, left_value, right_value,
+                                          &arithmetic_result)) return false;
+                    result = eval_value(arithmetic_result);
                 } else if (instruction.opcode >= CSD_SQL_EXPR_EQUAL && instruction.opcode <= CSD_SQL_EXPR_GREATER_EQUAL) {
                     result.type = CSD_SQL_TYPE_BOOL;
                     if (!left.is_null && !right.is_null) {
@@ -310,7 +391,7 @@
                             left.type != CSD_SQL_TYPE_BOOL && right.type != CSD_SQL_TYPE_BOOL;
                         if (left.type != right.type && !numeric_compatible)
                             return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                        const int comparison = compare_value(left, right);
+                        const int comparison = compare_eval_value(left, right);
                         result.is_null = false;
                         switch (instruction.opcode) {
                         case CSD_SQL_EXPR_EQUAL: result.integer = comparison == 0; break;
@@ -328,12 +409,18 @@
                     const bool left_true = !left.is_null && left.integer != 0;
                     const bool right_true = !right.is_null && right.integer != 0;
                     if (instruction.opcode == CSD_SQL_EXPR_AND) {
-                        if ((!left.is_null && !left_true) || (!right.is_null && !right_true)) result = boolean_value(false);
-                        else if (!left.is_null && !right.is_null) result = boolean_value(true);
+                        if ((!left.is_null && !left_true) || (!right.is_null && !right_true)) {
+                            result.is_null = false; result.type = CSD_SQL_TYPE_BOOL; result.integer = 0;
+                        } else if (!left.is_null && !right.is_null) {
+                            result.is_null = false; result.type = CSD_SQL_TYPE_BOOL; result.integer = 1;
+                        }
                         else result.type = CSD_SQL_TYPE_BOOL;
                     } else {
-                        if (left_true || right_true) result = boolean_value(true);
-                        else if (!left.is_null && !right.is_null) result = boolean_value(false);
+                        if (left_true || right_true) {
+                            result.is_null = false; result.type = CSD_SQL_TYPE_BOOL; result.integer = 1;
+                        } else if (!left.is_null && !right.is_null) {
+                            result.is_null = false; result.type = CSD_SQL_TYPE_BOOL; result.integer = 0;
+                        }
                         else result.type = CSD_SQL_TYPE_BOOL;
                     }
                 } else if (instruction.opcode == CSD_SQL_EXPR_LIKE) {
@@ -341,8 +428,10 @@
                     if (!left.is_null && !right.is_null) {
                         if (left.type != CSD_SQL_TYPE_BYTES || right.type != CSD_SQL_TYPE_BYTES)
                             return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                        result = boolean_value(sql_like(left.bytes, right.bytes,
-                            (instruction.flags & CSD_SQL_EXPR_CASE_INSENSITIVE) != 0));
+                        result.is_null = false;
+                        result.integer = sql_like(left.bytes_data, left.bytes_size,
+                            right.bytes_data, right.bytes_size,
+                            (instruction.flags & CSD_SQL_EXPR_CASE_INSENSITIVE) != 0);
                     }
                 } else return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
                 stack.push_back(result);

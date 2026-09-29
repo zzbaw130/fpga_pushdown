@@ -15,7 +15,8 @@
         return false;
     }
 
-    bool execute_sort(uint32_t index, const CsdSqlPlanNode &node, const Batch &input, Batch *output)
+    bool execute_sort(uint32_t index, const CsdSqlPlanNode &node, Batch &input,
+                      Batch *output, bool consume_input)
     {
         const CsdSqlSortSpec *spec = NULL;
         uint64_t keys_bytes = 0;
@@ -27,9 +28,11 @@
         for (uint16_t key = 0; key < spec->key_count; ++key)
             if (keys[key].key_column >= input.columns) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
         output->columns = input.columns;
+        const size_t input_rows = input.rows.size();
         const uint64_t input_bytes = batch_bytes(input);
         if (input_bytes <= work_mem_bytes_) {
-            output->rows = input.rows;
+            if (consume_input) output->rows.swap(input.rows);
+            else output->rows = input.rows;
             std::stable_sort(output->rows.begin(), output->rows.end(), [spec, keys](const Row &left, const Row &right) {
                 return sort_less(left, right, keys, spec->key_count);
             });
@@ -75,8 +78,8 @@
             if (!runs.empty()) output->rows.swap(runs[0]);
         }
         if (spec->top_n != 0 && output->rows.size() > spec->top_n) output->rows.resize(spec->top_n);
-        const uint64_t logarithm = input.rows.size() <= 1 ? 1 :
-            static_cast<uint64_t>(std::ceil(std::log(static_cast<double>(input.rows.size())) / std::log(2.0)));
-        add_cycles(input.rows.size() * logarithm, node);
+        const uint64_t logarithm = input_rows <= 1 ? 1 :
+            static_cast<uint64_t>(std::ceil(std::log(static_cast<double>(input_rows)) / std::log(2.0)));
+        add_cycles(input_rows * logarithm, node);
         return true;
     }

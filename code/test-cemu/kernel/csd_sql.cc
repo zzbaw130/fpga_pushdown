@@ -2,8 +2,10 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -28,6 +30,8 @@ const uint32_t kMaxParallelWorkers = 32;
 const uint32_t kTupleBindWordBits = 1024;
 /* A nested stage consumes the caller's CSD core rather than creating more cores. */
 static thread_local bool g_csd_worker_active = false;
+/* A task-level scheduler assigns a bounded share of FPGA-style lanes. */
+static thread_local uint32_t g_csd_worker_budget = 0;
 
 struct Value {
     bool is_null;
@@ -137,6 +141,15 @@ public:
         if (!validate_plan()) return error_return();
         std::vector<Batch> results(header_->node_count);
         std::vector<uint8_t> complete(header_->node_count, 0);
+        std::vector<uint32_t> consumers(header_->node_count, 0);
+        std::vector<uint32_t> sole_consumer(header_->node_count, CSD_SQL_INVALID_NODE);
+        std::vector<uint8_t> precomputed(header_->node_count, 0);
+        for (uint32_t index = 0; index < header_->node_count; ++index) {
+            const CsdSqlPlanNode &node = nodes_[index];
+            add_consumer(node.left_input, index, consumers, sole_consumer);
+            add_consumer(node.right_input, index, consumers, sole_consumer);
+            add_consumer(node.aux_input, index, consumers, sole_consumer);
+        }
         uint32_t completed = 0;
         while (completed < header_->node_count) {
             std::vector<uint32_t> ready;
@@ -147,15 +160,21 @@ public:
                 return error_return();
             }
             std::vector<uint8_t> success(ready.size(), 0);
-            run_parallel(ready.size(), [&](size_t slot) {
-                success[slot] = execute_node(ready[slot], &results[ready[slot]], results) ? 1 : 0;
+            run_ready_nodes(ready, [&](size_t slot) {
+                success[slot] = execute_node(ready[slot], &results[ready[slot]], results,
+                                             consumers, sole_consumer, precomputed) ? 1 : 0;
             });
             for (size_t slot = 0; slot < ready.size(); ++slot) {
                 if (!success[slot]) return error_return();
-                complete[ready[slot]] = 1;
+                const uint32_t node_index = ready[slot];
+                const CsdSqlPlanNode &node = nodes_[node_index];
+                complete[node_index] = 1;
                 ++completed;
                 std::lock_guard<std::mutex> guard(status_mutex_);
                 ++status_.executed_nodes;
+                release_input(node.left_input, consumers, results);
+                release_input(node.right_input, consumers, results);
+                release_input(node.aux_input, consumers, results);
             }
         }
         const Batch &root = results[header_->root_node];
@@ -165,6 +184,7 @@ public:
             status_.status_code = CSD_SQL_STATUS_OK;
             status_.output_rows = root.rows.size();
         }
+        if (header_->flags & CSD_SQL_PLAN_PROFILE) write_profile();
         write_status();
         return static_cast<long long>(root.rows.size());
     }
@@ -239,10 +259,31 @@ private:
     {
         return input == CSD_SQL_INVALID_NODE || complete[input] != 0;
     }
+    static void release_input(uint32_t input, std::vector<uint32_t> &consumers,
+                              std::vector<Batch> &results)
+    {
+        if (input == CSD_SQL_INVALID_NODE) return;
+        if (consumers[input] > 0 && --consumers[input] == 0) {
+            std::vector<Row> released;
+            results[input].rows.swap(released);
+            results[input].columns = 0;
+        }
+    }
+    static void add_consumer(uint32_t input, uint32_t consumer,
+                             std::vector<uint32_t> &consumers,
+                             std::vector<uint32_t> &sole_consumer)
+    {
+        if (input == CSD_SQL_INVALID_NODE) return;
+        if (consumers[input] == 0) sole_consumer[input] = consumer;
+        else sole_consumer[input] = CSD_SQL_INVALID_NODE;
+        ++consumers[input];
+    }
     template <typename Function>
     void run_parallel(size_t task_count, Function function)
     {
-        const size_t workers = std::min<size_t>(parallel_workers_, task_count);
+        const size_t lane_budget = g_csd_worker_budget == 0 ? parallel_workers_ :
+                                   g_csd_worker_budget;
+        const size_t workers = std::min<size_t>(lane_budget, task_count);
         if (workers <= 1 || g_csd_worker_active) {
             for (size_t task = 0; task < task_count; ++task) function(task);
             return;
@@ -252,18 +293,103 @@ private:
         for (size_t worker = 0; worker < workers; ++worker)
             threads.push_back(std::thread([&]() {
                 g_csd_worker_active = true;
+                g_csd_worker_budget = 1;
                 for (;;) {
                     const size_t task = next_task.fetch_add(1);
                     if (task >= task_count) break;
                     function(task);
                 }
+                g_csd_worker_budget = 0;
                 g_csd_worker_active = false;
             }));
         for (std::vector<std::thread>::iterator thread = threads.begin(); thread != threads.end(); ++thread)
             thread->join();
     }
 
-    bool execute_node(uint32_t index, Batch *output, const std::vector<Batch> &results)
+    /*
+     * Task-level parallelism and intra-operator lanes share one resource
+     * budget.  Allocate lanes in proportion to the square root of estimated
+     * bytes.  A purely byte-proportional split starves a smaller scan whose
+     * predicate may be much denser (TPC-H Q19's part input), while an even
+     * split underfeeds lineitem.  Square-root weighting models replicated FPGA
+     * pipelines without either extreme.
+     */
+    template <typename Function>
+    void run_ready_nodes(const std::vector<uint32_t> &ready, Function function)
+    {
+        if (ready.size() <= 1) {
+            if (!ready.empty()) function(0);
+            return;
+        }
+        if (parallel_workers_ <= 1 || ready.size() > parallel_workers_) {
+            run_parallel(ready.size(), function);
+            return;
+        }
+        std::vector<uint32_t> budgets(ready.size(), 1);
+        std::vector<double> weights(ready.size(), 1.0);
+        for (size_t slot = 0; slot < ready.size(); ++slot) {
+            const CsdSqlPlanNode &node = nodes_[ready[slot]];
+            const uint64_t work = std::max<uint64_t>(UINT64_C(1),
+                std::max<uint64_t>(node.estimated_bytes, node.estimated_rows));
+            weights[slot] = std::sqrt(static_cast<double>(work));
+        }
+        for (uint32_t lane = static_cast<uint32_t>(ready.size());
+             lane < parallel_workers_; ++lane) {
+            size_t selected = 0;
+            double selected_score = weights[0] / (budgets[0] + 1);
+            for (size_t slot = 1; slot < ready.size(); ++slot) {
+                const double score = weights[slot] / (budgets[slot] + 1);
+                if (score > selected_score) {
+                    selected = slot;
+                    selected_score = score;
+                }
+            }
+            ++budgets[selected];
+        }
+        std::vector<std::thread> threads;
+        threads.reserve(ready.size());
+        for (size_t slot = 0; slot < ready.size(); ++slot)
+            threads.push_back(std::thread([&, slot]() {
+                g_csd_worker_budget = budgets[slot];
+                function(slot);
+                g_csd_worker_budget = 0;
+            }));
+        for (std::vector<std::thread>::iterator thread = threads.begin();
+             thread != threads.end(); ++thread)
+            thread->join();
+    }
+
+    bool execute_node(uint32_t index, Batch *output, std::vector<Batch> &results,
+                      const std::vector<uint32_t> &consumers,
+                      const std::vector<uint32_t> &sole_consumer,
+                      std::vector<uint8_t> &precomputed)
+    {
+        const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        const bool succeeded = execute_node_impl(index, output, results, consumers,
+                                                 sole_consumer, precomputed);
+        const uint64_t elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+        const uint16_t opcode = nodes_[index].opcode;
+        if (opcode < CSD_SQL_PROFILE_SLOTS) {
+            std::lock_guard<std::mutex> guard(status_mutex_);
+            ++status_.operator_calls[opcode];
+            status_.operator_ns[opcode] += elapsed_ns;
+            if (succeeded) status_.operator_rows[opcode] += output->rows.size();
+            if (header_->flags & CSD_SQL_PLAN_PROFILE)
+                std::fprintf(stderr,
+                    "CSD_NODE plan=%llu node=%u opcode=%u rows=%llu elapsed_ms=%.3f\n",
+                    static_cast<unsigned long long>(header_->plan_id), index, opcode,
+                    static_cast<unsigned long long>(succeeded ? output->rows.size() : 0),
+                    static_cast<double>(elapsed_ns) / 1000000.0);
+        }
+        return succeeded;
+    }
+
+    bool execute_node_impl(uint32_t index, Batch *output, std::vector<Batch> &results,
+                           const std::vector<uint32_t> &consumers,
+                           const std::vector<uint32_t> &sole_consumer,
+                           std::vector<uint8_t> &precomputed)
     {
         const CsdSqlPlanNode &node = nodes_[index];
         if ((node.opcode == CSD_SQL_OP_FILTER || node.opcode == CSD_SQL_OP_PROJECT ||
@@ -276,15 +402,44 @@ private:
              node.opcode == CSD_SQL_OP_NL_JOIN) &&
             (node.left_input == CSD_SQL_INVALID_NODE || node.right_input == CSD_SQL_INVALID_NODE))
             return fail(CSD_SQL_STATUS_BAD_NODE, index);
+        if (precomputed[index]) {
+            Batch &input = mutable_input_batch(node.left_input, results);
+            output->columns = input.columns;
+            output->rows.swap(input.rows);
+            return true;
+        }
         switch (node.opcode) {
-        case CSD_SQL_OP_SCAN: return execute_scan(index, node, output);
+        case CSD_SQL_OP_SCAN: {
+            const std::vector<uint32_t> pipeline = stateless_pipeline(index, consumers,
+                                                                      sole_consumer);
+            const bool succeeded = execute_scan(index, node, output, &pipeline);
+            if (succeeded)
+                for (std::vector<uint32_t>::const_iterator stage = pipeline.begin();
+                     stage != pipeline.end(); ++stage)
+                    precomputed[*stage] = 1;
+            return succeeded;
+        }
         case CSD_SQL_OP_INDEX_SCAN:
             add_canonicalized_node();
             return execute_scan(index, node, output);
-        case CSD_SQL_OP_FILTER: return execute_filter(index, node, input_batch(node.left_input, results), output);
-        case CSD_SQL_OP_PROJECT: return execute_project(index, node, input_batch(node.left_input, results), output);
+        case CSD_SQL_OP_FILTER:
+            return execute_filter(index, node, mutable_input_batch(node.left_input, results), output,
+                                  consumers[node.left_input] == 1);
+        case CSD_SQL_OP_PROJECT:
+            if (consumers[index] == 1 && sole_consumer[index] != CSD_SQL_INVALID_NODE &&
+                (nodes_[sole_consumer[index]].opcode == CSD_SQL_OP_HASH_AGG ||
+                 nodes_[sole_consumer[index]].opcode == CSD_SQL_OP_GROUP_AGG)) {
+                const uint32_t aggregate_index = sole_consumer[index];
+                const bool succeeded = execute_aggregate(aggregate_index, nodes_[aggregate_index],
+                    input_batch(node.left_input, results), output, &node);
+                if (succeeded) precomputed[aggregate_index] = 1;
+                return succeeded;
+            }
+            return execute_project(index, node, mutable_input_batch(node.left_input, results), output,
+                                   consumers[node.left_input] == 1);
         case CSD_SQL_OP_HASH_AGG:
-        case CSD_SQL_OP_GROUP_AGG: return execute_aggregate(index, node, input_batch(node.left_input, results), output);
+        case CSD_SQL_OP_GROUP_AGG:
+            return execute_aggregate(index, node, input_batch(node.left_input, results), output);
         case CSD_SQL_OP_HASH_JOIN:
             return execute_join(index, node, input_batch(node.left_input, results), input_batch(node.right_input, results), output, false);
         case CSD_SQL_OP_MERGE_JOIN:
@@ -293,16 +448,44 @@ private:
         case CSD_SQL_OP_NL_JOIN:
             add_software_fallback_node();
             return execute_join(index, node, input_batch(node.left_input, results), input_batch(node.right_input, results), output, true);
-        case CSD_SQL_OP_SORT: return execute_sort(index, node, input_batch(node.left_input, results), output);
-        case CSD_SQL_OP_MATERIALIZE: return execute_materialize(index, node, input_batch(node.left_input, results), output);
+        case CSD_SQL_OP_SORT:
+            return execute_sort(index, node, mutable_input_batch(node.left_input, results), output,
+                                consumers[node.left_input] == 1);
+        case CSD_SQL_OP_MATERIALIZE:
+            return execute_materialize(index, node, mutable_input_batch(node.left_input, results), output,
+                                       consumers[node.left_input] == 1);
         case CSD_SQL_OP_SUBPLAN:
             add_canonicalized_node();
-            return execute_materialize(index, node, input_batch(node.left_input, results), output);
-        case CSD_SQL_OP_LIMIT: return execute_limit(index, node, input_batch(node.left_input, results), output);
+            return execute_materialize(index, node, mutable_input_batch(node.left_input, results), output,
+                                       consumers[node.left_input] == 1);
+        case CSD_SQL_OP_LIMIT:
+            return execute_limit(index, node, mutable_input_batch(node.left_input, results), output,
+                                 consumers[node.left_input] == 1);
         default: return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
         }
     }
     const Batch &input_batch(uint32_t input, const std::vector<Batch> &results) const { return results[input]; }
+    Batch &mutable_input_batch(uint32_t input, std::vector<Batch> &results) const { return results[input]; }
+    std::vector<uint32_t> stateless_pipeline(uint32_t input,
+                                             const std::vector<uint32_t> &consumers,
+                                             const std::vector<uint32_t> &sole_consumer) const
+    {
+        std::vector<uint32_t> pipeline;
+        uint32_t current = input;
+        while (consumers[current] == 1 && sole_consumer[current] != CSD_SQL_INVALID_NODE) {
+            const uint32_t next = sole_consumer[current];
+            const uint16_t opcode = nodes_[next].opcode;
+            if (opcode != CSD_SQL_OP_FILTER && opcode != CSD_SQL_OP_PROJECT) break;
+            if (opcode == CSD_SQL_OP_PROJECT && consumers[next] == 1 &&
+                sole_consumer[next] != CSD_SQL_INVALID_NODE &&
+                (nodes_[sole_consumer[next]].opcode == CSD_SQL_OP_HASH_AGG ||
+                 nodes_[sole_consumer[next]].opcode == CSD_SQL_OP_GROUP_AGG))
+                break;
+            pipeline.push_back(next);
+            current = next;
+        }
+        return pipeline;
+    }
 
 #include "csd_scan.cc"
 #include "csd_expression.cc"
@@ -399,6 +582,23 @@ private:
         std::lock_guard<std::mutex> guard(status_mutex_);
         if (checked_mul(rows, ii, &cycles) && checked_add(cycles, 64, &with_launch) && checked_add(status_.modeled_cycles, with_launch, &modeled)) status_.modeled_cycles = modeled;
         else status_.modeled_cycles = std::numeric_limits<uint64_t>::max();
+    }
+    void write_profile()
+    {
+        CsdSqlExecutionStatus snapshot;
+        {
+            std::lock_guard<std::mutex> guard(status_mutex_);
+            snapshot = status_;
+        }
+        for (uint32_t opcode = CSD_SQL_OP_SCAN; opcode < CSD_SQL_PROFILE_SLOTS; ++opcode)
+            if (snapshot.operator_calls[opcode] != 0)
+                std::fprintf(stderr,
+                    "CSD_PROFILE plan=%llu opcode=%u calls=%llu rows=%llu elapsed_ms=%.3f\n",
+                    static_cast<unsigned long long>(snapshot.plan_id), opcode,
+                    static_cast<unsigned long long>(snapshot.operator_calls[opcode]),
+                    static_cast<unsigned long long>(snapshot.operator_rows[opcode]),
+                    static_cast<double>(snapshot.operator_ns[opcode]) / 1000000.0);
+        std::fflush(stderr);
     }
     long long error_return()
     {

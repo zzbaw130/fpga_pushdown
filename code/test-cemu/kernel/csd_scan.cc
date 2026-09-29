@@ -4,7 +4,8 @@
      * page-level parallelism across different pages and tuple-level parallelism
      * inside a page without nested software thread pools.
      */
-    bool execute_scan(uint32_t index, const CsdSqlPlanNode &node, Batch *output)
+    bool execute_scan(uint32_t index, const CsdSqlPlanNode &node, Batch *output,
+                      const std::vector<uint32_t> *pipeline = NULL)
     {
         const CsdSqlScanSpec *spec = NULL;
         uint64_t descriptors_bytes = 0;
@@ -41,8 +42,29 @@
             pages_bytes > static_cast<uint64_t>(args_->mr_len[spec->input_range]) - first_byte)
             return fail(CSD_SQL_STATUS_BAD_PAGE, index);
         const unsigned char *input = static_cast<const unsigned char *>(args_->mr_addr[spec->input_range]);
-        struct DecodeTask { uint32_t page; uint16_t lane; uint16_t lanes; uint16_t item_count; };
-        std::vector<DecodeTask> tasks;
+        uint16_t output_columns = spec->output_count;
+        if (pipeline != NULL)
+            for (std::vector<uint32_t>::const_iterator stage = pipeline->begin();
+                 stage != pipeline->end(); ++stage) {
+                if (nodes_[*stage].opcode == CSD_SQL_OP_PROJECT) {
+                    const CsdSqlExpressionSpec *project_spec = NULL;
+                    const CsdSqlExpressionInstruction *project_instructions = NULL;
+                    if (!expression_program(*stage, nodes_[*stage].expression_offset,
+                                            nodes_[*stage].expression_length,
+                                            &project_spec, &project_instructions))
+                        return false;
+                    (void) project_instructions;
+                    output_columns = project_spec->output_count;
+                }
+            }
+        struct DecodeTask {
+            uint32_t first_page;
+            uint32_t end_page;
+            uint16_t lane;
+            uint16_t lanes;
+            size_t reserve_rows;
+        };
+        std::vector<uint16_t> item_counts(spec->page_count, 0);
         const uint32_t tuple_bits = std::min<uint32_t>(kTupleBindWordBits,
             std::max<uint32_t>(32, static_cast<uint32_t>(spec->attr_count) * 64));
         const uint32_t bind_lanes = std::max<uint32_t>(1, kTupleBindWordBits / tuple_bits);
@@ -52,37 +74,82 @@
             if (lower < kPageHeaderBytes || lower > CSD_SQL_PAGE_BYTES ||
                 ((lower - kPageHeaderBytes) % 4) != 0)
                 return fail(CSD_SQL_STATUS_BAD_PAGE, index);
-            const uint16_t item_count = (lower - kPageHeaderBytes) / 4;
-            const uint16_t lanes = static_cast<uint16_t>(std::min<uint32_t>(
-                std::min<uint32_t>(parallel_workers_, bind_lanes), std::max<uint16_t>(1, item_count)));
-            for (uint16_t lane = 0; lane < lanes; ++lane) {
-                DecodeTask task = {page_number, lane, lanes, item_count};
-                tasks.push_back(task);
+            item_counts[page_number] = (lower - kPageHeaderBytes) / 4;
+        }
+        std::vector<DecodeTask> tasks;
+        if (spec->page_count > 0) {
+            const uint16_t lanes = static_cast<uint16_t>(std::max<uint32_t>(1,
+                std::min<uint32_t>(parallel_workers_, bind_lanes)));
+            const uint32_t page_tiles = std::min<uint32_t>(spec->page_count,
+                std::max<uint32_t>(1, parallel_workers_ * 2));
+            tasks.reserve(static_cast<size_t>(page_tiles) * lanes);
+            for (uint32_t tile = 0; tile < page_tiles; ++tile) {
+                const uint32_t first_page = spec->page_count * tile / page_tiles;
+                const uint32_t end_page = spec->page_count * (tile + 1) / page_tiles;
+                for (uint16_t lane = 0; lane < lanes; ++lane) {
+                    size_t reserve_rows = 0;
+                    for (uint32_t page_number = first_page; page_number < end_page; ++page_number) {
+                        const uint16_t item_count = item_counts[page_number];
+                        if (item_count > lane)
+                            reserve_rows += (item_count - lane + lanes - 1) / lanes;
+                    }
+                    DecodeTask task = {first_page, end_page, lane, lanes, reserve_rows};
+                    tasks.push_back(task);
+                }
             }
         }
         std::vector<Batch> decoded(tasks.size());
         std::vector<uint8_t> decoded_ok(tasks.size(), 0);
+        std::vector<uint64_t> scanned_rows(tasks.size(), 0);
         run_parallel(tasks.size(), [&](size_t task_index) {
             const DecodeTask &task = tasks[task_index];
-            const unsigned char *page = input + first_byte + static_cast<uint64_t>(task.page) * CSD_SQL_PAGE_BYTES;
-            decoded_ok[task_index] = scan_page_lane(index, *spec, columns, page, task.item_count,
-                                                    task.lane, task.lanes, &decoded[task_index]) ? 1 : 0;
+            decoded[task_index].columns = output_columns;
+            decoded[task_index].rows.reserve(task.reserve_rows);
+            for (uint32_t page_number = task.first_page; page_number < task.end_page; ++page_number) {
+                const unsigned char *page = input + first_byte +
+                    static_cast<uint64_t>(page_number) * CSD_SQL_PAGE_BYTES;
+                if (!scan_page_lane(index, *spec, columns, page, item_counts[page_number],
+                                    task.lane, task.lanes, output_columns, pipeline,
+                                    &scanned_rows[task_index], &decoded[task_index]))
+                    return;
+            }
+            decoded_ok[task_index] = 1;
         });
-        output->columns = spec->output_count;
+        output->columns = output_columns;
+        size_t output_rows = 0;
+        uint64_t input_rows = 0;
+        for (size_t task_index = 0; task_index < tasks.size(); ++task_index)
+        {
+            output_rows += decoded[task_index].rows.size();
+            input_rows += scanned_rows[task_index];
+        }
+        output->rows.reserve(output_rows);
         for (size_t task_index = 0; task_index < tasks.size(); ++task_index) {
             if (!decoded_ok[task_index]) return false;
-            output->rows.insert(output->rows.end(), decoded[task_index].rows.begin(), decoded[task_index].rows.end());
+            output->rows.insert(output->rows.end(),
+                std::make_move_iterator(decoded[task_index].rows.begin()),
+                std::make_move_iterator(decoded[task_index].rows.end()));
         }
-        add_input_rows(output->rows.size());
-        add_cycles(static_cast<uint64_t>(spec->page_count) * 64 + output->rows.size(), node);
+        add_input_rows(input_rows);
+        add_cycles(static_cast<uint64_t>(spec->page_count) * 64 + input_rows, node);
+        if (pipeline != NULL)
+            for (std::vector<uint32_t>::const_iterator stage = pipeline->begin();
+                 stage != pipeline->end(); ++stage)
+                add_cycles(input_rows, nodes_[*stage]);
         return true;
     }
 
     bool scan_page_lane(uint32_t index, const CsdSqlScanSpec &spec, const CsdSqlColumnSpec *columns,
-                        const unsigned char *page, uint16_t item_count, uint16_t lane, uint16_t lanes, Batch *output)
+                        const unsigned char *page, uint16_t item_count, uint16_t lane, uint16_t lanes,
+                        uint16_t output_columns, const std::vector<uint32_t> *pipeline,
+                        uint64_t *scanned_rows, Batch *output)
     {
-        output->columns = spec.output_count;
+        output->columns = output_columns;
+        output->rows.reserve((item_count + lanes - 1 - lane) / lanes);
         const uint16_t lower = read_u16(page + 12);
+        Row row;
+        row.reserve(spec.output_count);
+        std::vector<Value> stage_values;
         for (uint16_t item = lane; item < item_count; item = static_cast<uint16_t>(item + lanes)) {
             const uint32_t item_id = read_u32(page + kPageHeaderBytes + item * 4);
             const uint16_t offset = item_id & 0x7fff;
@@ -96,9 +163,28 @@
             if (offset < lower || length < kHeapTupleHeaderBytes || offset > CSD_SQL_PAGE_BYTES ||
                 length > CSD_SQL_PAGE_BYTES - offset)
                 return fail(CSD_SQL_STATUS_BAD_PAGE, index);
-            Row row;
             if (!decode_tuple(index, columns, spec.attr_count, spec.output_count, page + offset, length, &row))
                 return false;
+            ++*scanned_rows;
+            bool selected = true;
+            if (pipeline != NULL)
+                for (std::vector<uint32_t>::const_iterator stage = pipeline->begin();
+                     stage != pipeline->end(); ++stage) {
+                    const CsdSqlPlanNode &stage_node = nodes_[*stage];
+                    if (!evaluate_expression(*stage, stage_node.expression_offset,
+                                             stage_node.expression_length, row, NULL,
+                                             &stage_values))
+                        return false;
+                    if (stage_node.opcode == CSD_SQL_OP_FILTER) {
+                        if (stage_values.size() != 1 || stage_values[0].type != CSD_SQL_TYPE_BOOL)
+                            return fail(CSD_SQL_STATUS_BAD_EXPRESSION, *stage);
+                        if (stage_values[0].is_null || stage_values[0].integer == 0) {
+                            selected = false;
+                            break;
+                        }
+                    } else row.swap(stage_values);
+                }
+            if (!selected) continue;
             output->rows.push_back(std::move(row));
         }
         return true;
@@ -118,6 +204,7 @@
             return fail(CSD_SQL_STATUS_BAD_PAGE, index);
         for (uint16_t attribute = 0; attribute < attr_count; ++attribute) {
             const CsdSqlColumnSpec &column = columns[attribute];
+            const bool materialize = (column.flags & CSD_SQL_COLUMN_OUTPUT) != 0;
             const bool is_null = has_nulls &&
                 (tuple[kHeapTupleHeaderBytes + attribute / 8] & (1U << (attribute % 8))) == 0;
             Value value;
@@ -133,33 +220,44 @@
 					cursor = align_up(cursor, column.alignment);
                 if (cursor >= tuple_length) return fail(CSD_SQL_STATUS_BAD_PAGE, index);
                 uint64_t consumed = 0;
-                if (!decode_datum(index, column, tuple + cursor, tuple_length - cursor, &value, &consumed))
+                if (!decode_datum(index, column, tuple + cursor, tuple_length - cursor,
+                                  materialize, &value, &consumed))
                     return false;
                 if (consumed > tuple_length - cursor)
                     return fail(CSD_SQL_STATUS_BAD_PAGE, index);
                 cursor += consumed;
-				if ((column.flags & CSD_SQL_COLUMN_TRIM_SPACE) &&
+                if (materialize && (column.flags & CSD_SQL_COLUMN_TRIM_SPACE) &&
 					value.type == CSD_SQL_TYPE_BYTES)
 					while (!value.bytes.empty() && value.bytes[value.bytes.size() - 1] == ' ')
 						value.bytes.resize(value.bytes.size() - 1);
             }
-            if (column.flags & CSD_SQL_COLUMN_OUTPUT) (*row)[column.output_column] = value;
+            if (materialize) (*row)[column.output_column] = std::move(value);
         }
         return true;
     }
 
     bool decode_datum(uint32_t index, const CsdSqlColumnSpec &column, const unsigned char *source,
-                      uint64_t available, Value *value, uint64_t *consumed)
+                      uint64_t available, bool materialize, Value *value, uint64_t *consumed)
     {
         if (column.attlen > 0) {
             if (available < static_cast<uint64_t>(column.attlen)) return fail(CSD_SQL_STATUS_BAD_PAGE, index);
             *consumed = static_cast<uint64_t>(column.attlen);
+            if ((column.datum_type == CSD_SQL_TYPE_INT16 && column.attlen != 2) ||
+                ((column.datum_type == CSD_SQL_TYPE_INT32 || column.datum_type == CSD_SQL_TYPE_DATE) &&
+                 column.attlen != 4) ||
+                (column.datum_type == CSD_SQL_TYPE_INT64 && column.attlen != 8) ||
+                (column.datum_type == CSD_SQL_TYPE_BOOL && column.attlen != 1) ||
+                (column.datum_type != CSD_SQL_TYPE_INT16 && column.datum_type != CSD_SQL_TYPE_INT32 &&
+                 column.datum_type != CSD_SQL_TYPE_DATE && column.datum_type != CSD_SQL_TYPE_INT64 &&
+                 column.datum_type != CSD_SQL_TYPE_BOOL && column.datum_type != CSD_SQL_TYPE_BYTES))
+                return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+            if (!materialize) return true;
             switch (column.datum_type) {
-            case CSD_SQL_TYPE_INT16: if (column.attlen != 2) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index); value->integer = read_i16(source); return true;
+            case CSD_SQL_TYPE_INT16: value->integer = read_i16(source); return true;
             case CSD_SQL_TYPE_INT32:
-            case CSD_SQL_TYPE_DATE: if (column.attlen != 4) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index); value->integer = read_i32(source); return true;
-            case CSD_SQL_TYPE_INT64: if (column.attlen != 8) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index); value->integer = read_i64(source); return true;
-            case CSD_SQL_TYPE_BOOL: if (column.attlen != 1) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index); value->integer = source[0] == 0 ? 0 : 1; return true;
+            case CSD_SQL_TYPE_DATE: value->integer = read_i32(source); return true;
+            case CSD_SQL_TYPE_INT64: value->integer = read_i64(source); return true;
+            case CSD_SQL_TYPE_BOOL: value->integer = source[0] == 0 ? 0 : 1; return true;
             case CSD_SQL_TYPE_BYTES: value->bytes.assign(reinterpret_cast<const char *>(source), column.attlen); return true;
 			default: return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
 				(static_cast<uint32_t>(column.attnum) << 16) | 1);
@@ -182,6 +280,9 @@
         }
         if (length < header_bytes || length > available) return fail(CSD_SQL_STATUS_BAD_PAGE, index);
         *consumed = length;
+        if (!materialize && (column.datum_type == CSD_SQL_TYPE_BYTES ||
+                             column.datum_type == CSD_SQL_TYPE_NUMERIC))
+            return true;
         if (column.datum_type == CSD_SQL_TYPE_BYTES) {
             value->bytes.assign(reinterpret_cast<const char *>(source + header_bytes), length - header_bytes);
             return true;

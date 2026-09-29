@@ -20,5 +20,6 @@ extern int csd_spill_mb;
 extern int csd_parallel_workers;
 extern int csd_program_runtime;
 extern int csd_device_work_mem_mb;
+extern bool csd_profile;
 
 #endif

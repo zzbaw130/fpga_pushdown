@@ -17,6 +17,7 @@
 #define CSD_SQL_INVALID_RANGE    UINT32_C(0xffffffff)
 #define CSD_SQL_NO_COLUMN        UINT16_C(0xffff)
 #define CSD_SQL_PAGE_BYTES       8192U
+#define CSD_SQL_PROFILE_SLOTS    14U
 
 enum CsdSqlOpcode {
     CSD_SQL_OP_SCAN = 1,
@@ -53,6 +54,8 @@ enum CsdSqlPlanFlags {
      * with the standard NVMe metadata fields.
      */
     CSD_SQL_PLAN_STAGED_RANGE = UINT32_C(1) << 2,
+    /* Emit functional-model operator timing to the CEMU process log. */
+    CSD_SQL_PLAN_PROFILE = UINT32_C(1) << 3,
 };
 
 enum CsdSqlNodeFlags {
@@ -327,6 +330,10 @@ struct CsdSqlExecutionStatus {
     uint64_t modeled_cycles;
     uint32_t canonicalized_nodes;
     uint32_t software_fallback_nodes;
+    /* Functional-model wall time and cardinality, indexed by CsdSqlOpcode. */
+    uint64_t operator_calls[CSD_SQL_PROFILE_SLOTS];
+    uint64_t operator_rows[CSD_SQL_PROFILE_SLOTS];
+    uint64_t operator_ns[CSD_SQL_PROFILE_SLOTS];
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

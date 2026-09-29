@@ -1,0 +1,124 @@
+#!/usr/bin/expect -f
+# Host-side benchmark driver.  CEMU freezes the guest clock during Program
+# Execute, so elapsed time must be measured by this process outside the VM.
+
+proc env_or {name fallback} {
+    global env
+    if {[info exists env($name)] && $env($name) ne ""} {
+        return $env($name)
+    }
+    return $fallback
+}
+
+set timeout 3600
+set ssh_host [env_or CEMU_SSH_HOST 127.0.0.1]
+set ssh_port [env_or CEMU_SSH_PORT 2223]
+set ssh_user [env_or CEMU_SSH_USER root]
+set ssh_password [env_or CEMU_SSH_PASSWORD root]
+set pgdata [env_or CSD_PGDATA /mnt/nvme0/pgdata/tpch_s1]
+set pg_os_user [env_or CSD_PG_OS_USER csdpg]
+set psql [env_or CSD_PSQL /opt/pgsql12/bin/psql]
+set pg_ctl [env_or CSD_PG_CTL /opt/pgsql12/bin/pg_ctl]
+set socket_dir [env_or CSD_SOCKET_DIR /tmp/csdpg_tpch]
+set port [env_or CSD_PORT 57432]
+set database [env_or CSD_DATABASE tpch_s1]
+set database_user [env_or CSD_DATABASE_USER dengyao]
+set query_dir [env_or CSD_QUERY_DIR /mnt/cemu/scripts/gen_data/queries]
+set shared_library [env_or CSD_SHARED_LIBRARY /workspace/code/CEMU/tests/cemu/build/csd_sql.so]
+set workers [env_or CSD_PARALLEL_WORKERS 32]
+set output_path [env_or CSD_BENCH_OUTPUT /tmp/csd_tpch_cold.csv]
+set log_path "${output_path}.log"
+
+set output [open $output_path "w"]
+puts $output "query,mode,rc,elapsed_ms,match"
+flush $output
+log_file -noappend $log_path
+
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/csd-known-hosts \
+    -p $ssh_port $ssh_user@$ssh_host
+expect {
+    "*assword:*" {
+        send "$ssh_password\r"
+        exp_continue
+    }
+    "*# " {}
+    timeout { exit 124 }
+}
+
+proc restart_postgres {pg_os_user pg_ctl pgdata} {
+    send "runuser -u $pg_os_user -- $pg_ctl -D $pgdata restart -m fast > /tmp/csd-bench-restart.log 2>&1; echo __RESTART__:\$?\r"
+    expect {
+        -re {__RESTART__:([0-9]+)} {
+            if {$expect_out(1,string) != 0} {
+                puts stderr "guest PostgreSQL restart failed"
+                exit $expect_out(1,string)
+            }
+        }
+        timeout { exit 124 }
+    }
+    expect "*# "
+}
+
+set failures 0
+foreach query {1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22} {
+    if {$query == 15} {
+        send "$psql -X -q -h $socket_dir -p $port -U $database_user -d $database -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1\r"
+        expect "*# "
+    }
+
+    restart_postgres $pg_os_user $pg_ctl $pgdata
+    set csd_setup "LOAD 'csd_pg'; SET csd.shared_library='$shared_library'; SET csd.exe_path='csd'; SET csd.parallel_workers=$workers; SET csd.profile=off; SET csd.program_runtime=0;"
+    set csd_started [clock milliseconds]
+    send "sync; echo 3 > /proc/sys/vm/drop_caches; $psql -X -q -v ON_ERROR_STOP=1 -h $socket_dir -p $port -U $database_user -d $database -c \"$csd_setup\" -f $query_dir/$query.sql > /tmp/csd-bench-q$query-csd.raw 2>&1; echo __CSD__:\$?\r"
+    expect {
+        -re {__CSD__:([0-9]+)} {
+            set csd_rc $expect_out(1,string)
+            set csd_elapsed [expr {[clock milliseconds] - $csd_started}]
+        }
+        timeout { exit 124 }
+    }
+    expect "*# "
+
+    if {$query == 15} {
+        send "$psql -X -q -h $socket_dir -p $port -U $database_user -d $database -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1\r"
+        expect "*# "
+    }
+
+    restart_postgres $pg_os_user $pg_ctl $pgdata
+    set host_setup "LOAD 'csd_pg'; SET csd.exe_path='host';"
+    set host_started [clock milliseconds]
+    send "sync; echo 3 > /proc/sys/vm/drop_caches; $psql -X -q -v ON_ERROR_STOP=1 -h $socket_dir -p $port -U $database_user -d $database -c \"$host_setup\" -f $query_dir/$query.sql > /tmp/csd-bench-q$query-host.raw 2>&1; echo __HOST__:\$?\r"
+    expect {
+        -re {__HOST__:([0-9]+)} {
+            set host_rc $expect_out(1,string)
+            set host_elapsed [expr {[clock milliseconds] - $host_started}]
+        }
+        timeout { exit 124 }
+    }
+    expect "*# "
+
+    if {$query == 15} {
+        send "$psql -X -q -h $socket_dir -p $port -U $database_user -d $database -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1\r"
+        expect "*# "
+    }
+
+    send "sed -e '/^SET\$/d' -e '/^Timing is on\.\$/d' -e '/^Time:/d' -e '/^CREATE VIEW\$/d' -e '/^DROP VIEW\$/d' -e '/^\$/d' /tmp/csd-bench-q$query-csd.raw > /tmp/csd-bench-q$query-csd.norm; sed -e '/^SET\$/d' -e '/^Timing is on\.\$/d' -e '/^Time:/d' -e '/^CREATE VIEW\$/d' -e '/^DROP VIEW\$/d' -e '/^\$/d' /tmp/csd-bench-q$query-host.raw > /tmp/csd-bench-q$query-host.norm; cmp -s /tmp/csd-bench-q$query-csd.norm /tmp/csd-bench-q$query-host.norm; echo __MATCH__:\$?\r"
+    expect {
+        -re {__MATCH__:([0-9]+)} { set match $expect_out(1,string) }
+        timeout { exit 124 }
+    }
+    expect "*# "
+
+    puts $output "$query,csd,$csd_rc,$csd_elapsed,$match"
+    puts $output "$query,host,$host_rc,$host_elapsed,$match"
+    flush $output
+    puts "BENCH Q$query CSD=${csd_elapsed}ms HOST=${host_elapsed}ms MATCH=$match"
+    if {$csd_rc != 0 || $host_rc != 0 || $match != 0} {
+        incr failures
+    }
+}
+
+send "exit\r"
+expect eof
+close $output
+exit [expr {$failures == 0 ? 0 : 1}]

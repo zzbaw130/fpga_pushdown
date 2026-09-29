@@ -20,7 +20,8 @@ typedef struct CsdExprSchema
 } CsdExprSchema;
 
 extern void csd_expr_schema_from_scan(CsdExprSchema *schema, Index scan_rti,
-									  TupleDesc descriptor);
+									  TupleDesc descriptor,
+									  const Bitmapset *required_attrs);
 extern void csd_expr_schema_from_expressions(CsdExprSchema *schema,
 										 List *expressions);
 extern int csd_expr_schema_lookup(const CsdExprSchema *schema, Node *expression);
@@ -31,7 +32,7 @@ extern void csd_append_expression_program(StringInfo target, List *expressions,
 										  uint32 *offset, uint32 *length,
 										  uint32 *parameter_count);
 extern void csd_append_scan_expression(StringInfo target, List *clauses,
-									   Index scan_rti, TupleDesc descriptor,
+									   const CsdExprSchema *scan_schema,
 									   uint32 *offset, uint32 *length,
 									   uint32 *parameter_count);
 extern List *csd_scan_lowerable_clauses(List *clauses, uint32 *pending_count);

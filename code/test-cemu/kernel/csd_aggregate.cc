@@ -38,12 +38,23 @@
 	}
 
     /* Blocking banked hash aggregate with multi-key and DISTINCT state. */
-    bool execute_aggregate(uint32_t index, const CsdSqlPlanNode &node, const Batch &input, Batch *output)
+    bool execute_aggregate(uint32_t index, const CsdSqlPlanNode &node, const Batch &input,
+                           Batch *output, const CsdSqlPlanNode *project_node = NULL)
     {
         const CsdSqlAggregateSpec *spec = NULL;
         if (!expression_as(node, sizeof(CsdSqlAggregateSpec), &spec) ||
             (spec->group_count == 0 && spec->aggregate_count == 0))
             return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+        const CsdSqlExpressionSpec *project_spec = NULL;
+        const CsdSqlExpressionInstruction *project_instructions = NULL;
+        if (project_node != NULL &&
+            !expression_program(project_node->node_id, project_node->expression_offset,
+                                project_node->expression_length, &project_spec,
+                                &project_instructions))
+            return false;
+        (void) project_instructions;
+        const uint16_t aggregate_input_columns = project_spec == NULL ? input.columns :
+                                                  project_spec->output_count;
         uint64_t group_bytes = 0, aggregate_bytes = 0, descriptor_bytes = 0;
         if (!checked_mul(spec->group_count, sizeof(uint16_t), &group_bytes) ||
             !checked_mul(spec->aggregate_count, sizeof(CsdSqlAggregateColumn), &aggregate_bytes) ||
@@ -58,15 +69,18 @@
         const CsdSqlAggregateColumn *aggregates = reinterpret_cast<const CsdSqlAggregateColumn *>(
             group_bytes_begin + group_bytes);
         for (uint16_t group = 0; group < spec->group_count; ++group)
-            if (group_columns[group] >= input.columns) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+            if (group_columns[group] >= aggregate_input_columns)
+                return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
         for (uint16_t aggregate_index = 0; aggregate_index < spec->aggregate_count; ++aggregate_index) {
             const CsdSqlAggregateColumn &aggregate = aggregates[aggregate_index];
-            if ((aggregate.input_column != CSD_SQL_NO_COLUMN && aggregate.input_column >= input.columns) ||
+            if ((aggregate.input_column != CSD_SQL_NO_COLUMN &&
+                 aggregate.input_column >= aggregate_input_columns) ||
                 !is_supported_type(aggregate.datum_type) || aggregate.operation < CSD_SQL_AGG_COUNT ||
                 aggregate.operation > CSD_SQL_AGG_AVG || aggregate.output_scale < -1 || aggregate.output_scale > 18)
                 return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
         }
         struct AggregateState {
+            std::string key;
             Row groups;
             std::vector<int64_t> count;
             std::vector<__int128> sum;
@@ -76,66 +90,145 @@
             std::vector<bool> has_value;
             std::vector<std::unordered_set<std::string> > distinct;
         };
+        bool has_distinct = false;
+        for (uint16_t aggregate_index = 0; aggregate_index < spec->aggregate_count; ++aggregate_index)
+            has_distinct = has_distinct || (aggregates[aggregate_index].flags & CSD_SQL_AGG_DISTINCT) != 0;
+        const size_t tiles = has_distinct ? 1 :
+            std::min<size_t>(parallel_workers_, std::max<size_t>(1, input.rows.size()));
+        std::vector<std::unordered_map<std::string, size_t> > local_maps(tiles);
+        std::vector<std::vector<AggregateState> > local_states(tiles);
+        std::vector<uint8_t> local_ok(tiles, 0);
+        run_parallel(tiles, [&](size_t tile) {
+            const size_t begin = input.rows.size() * tile / tiles;
+            const size_t end = input.rows.size() * (tile + 1) / tiles;
+            std::unordered_map<std::string, size_t> &group_map = local_maps[tile];
+            std::vector<AggregateState> &states = local_states[tile];
+            group_map.reserve(std::min<size_t>(end - begin, 65536));
+            Row projected_row;
+            if (project_spec != NULL) projected_row.reserve(project_spec->output_count);
+            for (size_t row_index = begin; row_index < end; ++row_index) {
+                const Row *row_pointer = &input.rows[row_index];
+                if (project_spec != NULL) {
+                    if (!evaluate_expression(project_node->node_id, project_node->expression_offset,
+                                             project_node->expression_length, input.rows[row_index],
+                                             NULL, &projected_row)) return;
+                    row_pointer = &projected_row;
+                }
+                const Row &row = *row_pointer;
+                const std::string key = spec->group_count == 0 ? std::string("global") :
+                                        group_key(row, group_columns.data(), spec->group_count);
+                size_t state_index = 0;
+                std::unordered_map<std::string, size_t>::iterator found = group_map.find(key);
+                if (found == group_map.end()) {
+                    state_index = states.size();
+                    group_map[key] = state_index;
+                    AggregateState state;
+                    state.key = key;
+                    for (uint16_t group = 0; group < spec->group_count; ++group)
+                        state.groups.push_back(row[group_columns[group]]);
+                    state.count.assign(spec->aggregate_count, 0);
+                    state.sum.assign(spec->aggregate_count, 0);
+                    state.scale.assign(spec->aggregate_count, -1);
+                    state.minimum.assign(spec->aggregate_count, Value());
+                    state.maximum.assign(spec->aggregate_count, Value());
+                    state.has_value.assign(spec->aggregate_count, false);
+                    state.distinct.resize(spec->aggregate_count);
+                    states.push_back(std::move(state));
+                } else state_index = found->second;
+                AggregateState &state = states[state_index];
+                for (uint16_t aggregate_index = 0; aggregate_index < spec->aggregate_count; ++aggregate_index) {
+                    const CsdSqlAggregateColumn &aggregate = aggregates[aggregate_index];
+                    const Value *value = aggregate.input_column == CSD_SQL_NO_COLUMN ? NULL :
+                                         &row[aggregate.input_column];
+                    const bool usable = value == NULL || !value->is_null;
+                    if (!usable) continue;
+                    if (aggregate.flags & CSD_SQL_AGG_DISTINCT) {
+                        if (value == NULL) { fail(CSD_SQL_STATUS_BAD_EXPRESSION, index); return; }
+                        if (!state.distinct[aggregate_index].insert(value_key(*value)).second) continue;
+                    }
+                    if (aggregate.operation == CSD_SQL_AGG_COUNT) {
+                        ++state.count[aggregate_index];
+                        state.has_value[aggregate_index] = true;
+                        continue;
+                    }
+                    if (value == NULL || value->type == CSD_SQL_TYPE_BYTES) {
+                        fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+                        return;
+                    }
+                    ++state.count[aggregate_index];
+                    if (aggregate.operation == CSD_SQL_AGG_SUM || aggregate.operation == CSD_SQL_AGG_AVG) {
+                        const int16_t value_scale = value->type == CSD_SQL_TYPE_NUMERIC ? value->numeric_scale : 0;
+                        int16_t target_scale = aggregate.output_scale;
+                        if (target_scale < 0) {
+                            target_scale = std::max<int16_t>(state.scale[aggregate_index], value_scale);
+                            if (state.scale[aggregate_index] >= 0 && target_scale > state.scale[aggregate_index] &&
+                                !multiply_power10(&state.sum[aggregate_index],
+                                                  target_scale - state.scale[aggregate_index])) {
+                                fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+                                return;
+                            }
+                        }
+                        __int128 scaled = 0;
+                        if (!scaled_integer(*value, target_scale, &scaled)) {
+                            fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+                            return;
+                        }
+                        state.scale[aggregate_index] = target_scale;
+                        state.sum[aggregate_index] += scaled;
+                    }
+                    if (!state.has_value[aggregate_index] ||
+                        compare_value(*value, state.minimum[aggregate_index]) < 0)
+                        state.minimum[aggregate_index] = *value;
+                    if (!state.has_value[aggregate_index] ||
+                        compare_value(*value, state.maximum[aggregate_index]) > 0)
+                        state.maximum[aggregate_index] = *value;
+                    state.has_value[aggregate_index] = true;
+                }
+            }
+            local_ok[tile] = 1;
+        });
+        for (size_t tile = 0; tile < tiles; ++tile)
+            if (!local_ok[tile]) return false;
         std::unordered_map<std::string, size_t> group_map;
         std::vector<AggregateState> states;
-        for (std::vector<Row>::const_iterator row = input.rows.begin(); row != input.rows.end(); ++row) {
-            const std::string key = spec->group_count == 0 ? std::string("global") :
-                                    group_key(*row, group_columns.data(), spec->group_count);
-            size_t state_index = 0;
-            std::unordered_map<std::string, size_t>::iterator found = group_map.find(key);
-            if (found == group_map.end()) {
-                state_index = states.size();
-                group_map[key] = state_index;
-                AggregateState state;
-                for (uint16_t group = 0; group < spec->group_count; ++group)
-                    state.groups.push_back((*row)[group_columns[group]]);
-                state.count.assign(spec->aggregate_count, 0);
-                state.sum.assign(spec->aggregate_count, 0);
-				state.scale.assign(spec->aggregate_count, -1);
-                state.minimum.assign(spec->aggregate_count, Value());
-                state.maximum.assign(spec->aggregate_count, Value());
-                state.has_value.assign(spec->aggregate_count, false);
-                state.distinct.resize(spec->aggregate_count);
-                states.push_back(state);
-            } else state_index = found->second;
-            AggregateState &state = states[state_index];
-            for (uint16_t aggregate_index = 0; aggregate_index < spec->aggregate_count; ++aggregate_index) {
-                const CsdSqlAggregateColumn &aggregate = aggregates[aggregate_index];
-                const Value *value = aggregate.input_column == CSD_SQL_NO_COLUMN ? NULL : &(*row)[aggregate.input_column];
-                const bool usable = value == NULL || !value->is_null;
-                if (!usable) continue;
-                if (aggregate.flags & CSD_SQL_AGG_DISTINCT) {
-                    if (value == NULL) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-                    if (!state.distinct[aggregate_index].insert(value_key(*value)).second) continue;
-                }
-                if (aggregate.operation == CSD_SQL_AGG_COUNT) {
-                    ++state.count[aggregate_index];
-                    state.has_value[aggregate_index] = true;
+        for (size_t tile = 0; tile < tiles; ++tile) {
+            for (typename std::vector<AggregateState>::iterator source = local_states[tile].begin();
+                 source != local_states[tile].end(); ++source) {
+                std::unordered_map<std::string, size_t>::iterator found = group_map.find(source->key);
+                if (found == group_map.end()) {
+                    group_map[source->key] = states.size();
+                    states.push_back(std::move(*source));
                     continue;
                 }
-                if (value == NULL || value->type == CSD_SQL_TYPE_BYTES)
-                    return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
-                ++state.count[aggregate_index];
-				if (aggregate.operation == CSD_SQL_AGG_SUM || aggregate.operation == CSD_SQL_AGG_AVG) {
-					const int16_t value_scale = value->type == CSD_SQL_TYPE_NUMERIC ? value->numeric_scale : 0;
-					int16_t target_scale = aggregate.output_scale;
-					if (target_scale < 0) {
-						target_scale = std::max<int16_t>(state.scale[aggregate_index], value_scale);
-						if (state.scale[aggregate_index] >= 0 && target_scale > state.scale[aggregate_index] &&
-							!multiply_power10(&state.sum[aggregate_index], target_scale - state.scale[aggregate_index]))
-							return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
-					}
-					__int128 scaled = 0;
-					if (!scaled_integer(*value, target_scale, &scaled))
-						return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-					state.scale[aggregate_index] = target_scale;
-					state.sum[aggregate_index] += scaled;
-				}
-                if (!state.has_value[aggregate_index] || compare_value(*value, state.minimum[aggregate_index]) < 0)
-                    state.minimum[aggregate_index] = *value;
-                if (!state.has_value[aggregate_index] || compare_value(*value, state.maximum[aggregate_index]) > 0)
-                    state.maximum[aggregate_index] = *value;
-                state.has_value[aggregate_index] = true;
+                AggregateState &target = states[found->second];
+                for (uint16_t aggregate_index = 0; aggregate_index < spec->aggregate_count; ++aggregate_index) {
+                    const CsdSqlAggregateColumn &aggregate = aggregates[aggregate_index];
+                    target.count[aggregate_index] += source->count[aggregate_index];
+                    if (aggregate.operation == CSD_SQL_AGG_SUM || aggregate.operation == CSD_SQL_AGG_AVG) {
+                        const int16_t target_scale = std::max(target.scale[aggregate_index],
+                                                              source->scale[aggregate_index]);
+                        if (target.scale[aggregate_index] >= 0 && target.scale[aggregate_index] < target_scale &&
+                            !multiply_power10(&target.sum[aggregate_index],
+                                              target_scale - target.scale[aggregate_index]))
+                            return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+                        if (source->scale[aggregate_index] >= 0 && source->scale[aggregate_index] < target_scale &&
+                            !multiply_power10(&source->sum[aggregate_index],
+                                              target_scale - source->scale[aggregate_index]))
+                            return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+                        target.scale[aggregate_index] = target_scale;
+                        target.sum[aggregate_index] += source->sum[aggregate_index];
+                    }
+                    if (source->has_value[aggregate_index] &&
+                        (!target.has_value[aggregate_index] ||
+                         compare_value(source->minimum[aggregate_index], target.minimum[aggregate_index]) < 0))
+                        target.minimum[aggregate_index] = source->minimum[aggregate_index];
+                    if (source->has_value[aggregate_index] &&
+                        (!target.has_value[aggregate_index] ||
+                         compare_value(source->maximum[aggregate_index], target.maximum[aggregate_index]) > 0))
+                        target.maximum[aggregate_index] = source->maximum[aggregate_index];
+                    target.has_value[aggregate_index] = target.has_value[aggregate_index] ||
+                                                        source->has_value[aggregate_index];
+                }
             }
         }
         if (spec->group_count == 0 && states.empty()) {
@@ -216,11 +309,12 @@
                     break;
                 default: return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
                 }
-                result.push_back(value);
+                result.push_back(std::move(value));
             }
             output->rows.push_back(std::move(result));
         }
         if (!spill_if_needed(index, node, *output)) return false;
+        if (project_node != NULL) add_cycles(input.rows.size(), *project_node);
         add_cycles(input.rows.size() * 2 + output->rows.size(), node);
         return true;
     }

@@ -648,8 +648,9 @@ csd_compile_expression(CsdExpressionBuilder *builder, Node *node)
 }
 
 void
-csd_append_scan_expression(StringInfo target, List *clauses, Index scan_rti,
-						   TupleDesc descriptor, uint32 *offset, uint32 *length,
+csd_append_scan_expression(StringInfo target, List *clauses,
+						   const CsdExprSchema *scan_schema,
+						   uint32 *offset, uint32 *length,
 						   uint32 *parameter_count)
 {
 	CsdExpressionBuilder builder;
@@ -659,12 +660,10 @@ csd_append_scan_expression(StringInfo target, List *clauses, Index scan_rti,
 	uint32 instruction_offset;
 	uint32 constants_offset;
 	uint32 index;
-	CsdExprSchema scan_schema;
 
 	MemSet(&builder, 0, sizeof(builder));
 	builder.target = target;
-	csd_expr_schema_from_scan(&scan_schema, scan_rti, descriptor);
-	builder.input_schema = &scan_schema;
+	builder.input_schema = scan_schema;
 	initStringInfo(&builder.constants);
 	foreach(cell, clauses)
 	{
@@ -705,7 +704,6 @@ csd_append_scan_expression(StringInfo target, List *clauses, Index scan_rti,
 		*parameter_count += builder.parameter_count;
 	pfree(builder.instructions);
 	pfree(builder.constants.data);
-	csd_expr_schema_release(&scan_schema);
 }
 
 void
@@ -768,14 +766,17 @@ csd_append_expression_program(StringInfo target, List *expressions,
 
 void
 csd_expr_schema_from_scan(CsdExprSchema *schema, Index scan_rti,
-						  TupleDesc descriptor)
+						  TupleDesc descriptor,
+						  const Bitmapset *required_attrs)
 {
 	uint16 count = 0;
 	int attribute;
 
 	MemSet(schema, 0, sizeof(*schema));
 	for (attribute = 0; attribute < descriptor->natts; ++attribute)
-		if (!TupleDescAttr(descriptor, attribute)->attisdropped)
+		if (!TupleDescAttr(descriptor, attribute)->attisdropped &&
+			(required_attrs == NULL || bms_is_member(0, required_attrs) ||
+			 bms_is_member(attribute + 1, required_attrs)))
 			++count;
 	schema->count = count;
 	schema->columns = palloc0(count * sizeof(*schema->columns));
@@ -784,7 +785,9 @@ csd_expr_schema_from_scan(CsdExprSchema *schema, Index scan_rti,
 	{
 		Form_pg_attribute pg_attribute = TupleDescAttr(descriptor, attribute);
 
-		if (pg_attribute->attisdropped)
+		if (pg_attribute->attisdropped ||
+			(required_attrs != NULL && !bms_is_member(0, required_attrs) &&
+			 !bms_is_member(attribute + 1, required_attrs)))
 			continue;
 		schema->columns[count].expression = (Node *) makeVar(scan_rti,
 			attribute + 1, pg_attribute->atttypid, pg_attribute->atttypmod,
