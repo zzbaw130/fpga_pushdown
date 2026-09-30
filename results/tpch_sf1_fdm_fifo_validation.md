@@ -52,6 +52,9 @@ remaining work observable: the next memory-bounding milestone is partitioned
 Flash replay for Batch, Join/Aggregate, and Sort state.
 
 The expression scratch stack and worker-lane budget no longer use C++
-`thread_local` storage. A query-complete kernel was verified absent from the
-CEMU process maps, so rebuilding and loading the same `.so` in later development
-does not retain a stale ABI through a long-lived CEMU worker thread.
+`thread_local` storage. This removes query state from CEMU's long-lived worker
+TLS, but it does not make the current CEMU loader fully hot-reloadable: the
+unload control command was observed while the `.so` mapping remained in the
+CEMU process. A fresh CEMU start successfully loaded the default ABI-v7 path;
+later in-place kernel rebuilds must restart CEMU or select a new versioned
+`csd.shared_library` pathname to avoid executing a stale image.

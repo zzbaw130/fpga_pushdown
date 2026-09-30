@@ -109,7 +109,7 @@ threads are FPGA hardware.
 | --- | --- | --- |
 | Page | `SCAN` turns every input page into decode tasks | Different page tasks are scheduled over the shared worker budget. |
 | Tuple | Each page is split into dynamic tuple lanes. Lane count is derived from its physical attribute count under a 1024-bit binding word, then capped by `parallel_workers`. | A task is `(page, tuple-lane)`; its local output is merged after workers join. |
-| Task | The plan DAG executes all currently-ready, independent nodes together (for example the two scans below a hash join). | A query-owned POSIX thread key carries each task's lane budget into child operators, so the total simulated cores never exceed the configured budget without pinning a loaded CSD `.so` through C++ TLS. |
+| Task | The plan DAG executes all currently-ready, independent nodes together (for example the two scans below a hash join). | A query-owned POSIX thread key carries each task's lane budget into child operators, so the total simulated cores never exceed the configured budget and worker state does not depend on C++ TLS. |
 
 `FILTER` and `PROJECT` also partition a batch into contiguous tuple tiles.
 `HASH_JOIN`, hash/group aggregate and external-style sort remain blocking operators:
@@ -122,6 +122,12 @@ per-batch streaming pipeline shown in Trinity. That
 requires a bounded batch-queue protocol between compatible operators and is
 kept as a distinct next step rather than being conflated with thread-level
 parallelism.
+
+CEMU currently retains a shared-library mapping after its unload control
+command even when the CSD kernel itself has no TLS segment. Normal repeated
+queries safely reuse the loaded implementation, but an in-place rebuild of the
+same `.so` pathname can continue executing the old image. Restart CEMU or use a
+new versioned `csd.shared_library` pathname after rebuilding the kernel.
 
 ## Spill-to-flash
 
