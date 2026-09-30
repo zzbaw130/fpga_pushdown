@@ -17,10 +17,12 @@
             selected[tile].columns = input.columns;
             selected[tile].rows.reserve(end - begin);
             std::vector<Value> values;
+            std::vector<EvalValue> expression_stack;
             values.reserve(spec->output_count);
             for (size_t row_index = begin; row_index < end; ++row_index) {
                 if (!evaluate_expression(index, node.expression_offset, node.expression_length,
-                                         input.rows[row_index], NULL, &values)) return;
+                                         input.rows[row_index], NULL, &values,
+                                         &expression_stack)) return;
                 if (values[0].type != CSD_SQL_TYPE_BOOL) return;
                 if (!values[0].is_null && values[0].integer != 0) {
                     if (consume_input) selected[tile].rows.push_back(std::move(input.rows[row_index]));

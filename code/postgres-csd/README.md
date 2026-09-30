@@ -22,13 +22,13 @@ SET csd.exe_path = 'csd';
 EXPLAIN SELECT ...;
 ```
 
-The executor serializes a selected path into a structurally validated ABI-v6
+The executor serializes a selected path into a structurally validated ABI-v7
 header/node table;
 every scan contains the real heap page count and physical PostgreSQL column
 layout. Filters, projections, join residuals, HAVING, and final arithmetic are
 compiled to bounded postfix bytecode, including fixed-point/date constants,
 `LIKE`, scalar-array `IN`, boolean/null logic, `CASE`, and substring. Join,
-aggregate, and sort keys are bound to input schemas and emitted as real ABI-v6
+aggregate, and sort keys are bound to input schemas and emitted as real ABI-v7
 descriptor arrays; complex aggregate arguments use a streaming pre-projection
 and subquery outputs use positional projection. `PARAM_EXEC` inputs are marked
 as relocations. They are patched lazily on the first `ExecCustomScan` call,
@@ -43,17 +43,25 @@ uses FIEMAP to append the heap files' physical NVM extents to the plan. Each
 logical scan gets a fixed reusable FDMFS window (`csd.chunk_mb`, 32 MiB by
 default); while Program Execute is active, CEMU refills that window directly
 from the NVM backend, decodes it, and reuses it for the next chunk. No relation
-is copied wholesale into FDM. Output, a bounded spill staging window, plan,
-status, and scan windows are checked against `csd.fdm_capacity_mb` (4 GiB by
-default) before MRS creation. Oversized blocking state is serialized through
-the staging window (`csd.spill_stage_mb`, 32 MiB) into query-local physical
-NVMe extents (`csd.spill_mb`, 4 GiB); those extents do not consume FDM capacity
-and are unlinked after execution. The executor submits the original
+is copied wholesale into FDM. Decoded scan windows are serialized through two
+alternating FDMFS tuple FIFOs (`csd.fifo_mb`, 32 MiB each by default), splitting
+a window into multiple FIFO batches when necessary. Output, both FIFOs, a
+bounded spill staging window, plan, status, and scan windows are checked against
+`csd.fdm_capacity_mb` (4 GiB by default) before MRS creation. Oversized blocking
+state is serialized through the staging window (`csd.spill_stage_mb`, 32 MiB)
+into query-local physical NVMe extents (`csd.spill_mb`, 4 GiB); those extents do
+not consume FDM capacity and are unlinked after execution. The executor submits the original
 `NVME_IOCTL_IO_CMD`, reads the
 status/result ranges, and returns PostgreSQL virtual tuples without a silent
 host fallback. Numeric
 results preserve PostgreSQL dynamic scales for AVG and division, subject to
 the fixed-point int64 range.
+
+The ABI-v7 FIFO is a real, capacity-accounted FDM transport boundary. The
+current functional executor still materializes the FIFO output in a C++
+`Batch` before a downstream blocking operator. Consequently, the FDM transport
+is bounded, but end-to-end Join/Aggregate/Sort memory becomes hard-bounded only
+after their partition/replay state is moved behind the same boundary.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

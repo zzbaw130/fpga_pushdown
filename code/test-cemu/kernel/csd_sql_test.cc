@@ -180,7 +180,7 @@ void test_chunked_nvm_scan()
     scan.output_count = 2;
     scan.flags = CSD_SQL_SCAN_FROZEN_PAGES;
     scan.relation_oid = 42;
-    scan.chunk_bytes = CSD_SQL_PAGE_BYTES;
+    scan.chunk_bytes = 2 * CSD_SQL_PAGE_BYTES;
     scan.relation_bytes = 2 * CSD_SQL_PAGE_BYTES;
     scan.extent_count = 2;
     node.expression_offset = append(&plan, scan);
@@ -219,27 +219,38 @@ void test_chunked_nvm_scan()
     header.plan_bytes = plan.size();
     header.root_node = 0;
     header.flags = CSD_SQL_PLAN_STATUS_LAST_RANGE | CSD_SQL_PLAN_FROZEN_SNAPSHOT |
-                   CSD_SQL_PLAN_STAGED_RANGE | CSD_SQL_PLAN_CHUNKED_SCAN;
-    header.output_range = 1;
+                   CSD_SQL_PLAN_STAGED_RANGE | CSD_SQL_PLAN_CHUNKED_SCAN |
+                   CSD_SQL_PLAN_FDM_FIFO;
+    header.fifo_range_a = 1;
+    header.fifo_range_b = 2;
+    /* One two-column row fits, but both rows do not: exercise FIFO splitting. */
+    header.fifo_bytes = 96;
+    header.fdm_reserved_bytes = 2 * CSD_SQL_PAGE_BYTES + 2 * header.fifo_bytes + 4096;
+    header.output_range = 3;
     header.spill_range = CSD_SQL_INVALID_RANGE;
     header.parallel_workers = 4;
     overwrite(&plan, 0, header);
     overwrite(&plan, sizeof(header), node);
 
-    std::vector<unsigned char> work(CSD_SQL_PAGE_BYTES, 0);
+    std::vector<unsigned char> work(2 * CSD_SQL_PAGE_BYTES, 0);
+    std::vector<unsigned char> fifo_a(header.fifo_bytes, 0);
+    std::vector<unsigned char> fifo_b(header.fifo_bytes, 0);
     std::vector<unsigned char> output(4096, 0);
     std::vector<unsigned char> status(sizeof(CsdSqlExecutionStatus), 0);
-    void *ranges[] = {work.data(), output.data(), plan.data(), status.data()};
+    void *ranges[] = {work.data(), fifo_a.data(), fifo_b.data(), output.data(),
+                      plan.data(), status.data()};
     long long lengths[] = {static_cast<long long>(work.size()),
+                           static_cast<long long>(fifo_a.size()),
+                           static_cast<long long>(fifo_b.size()),
                            static_cast<long long>(output.size()),
                            static_cast<long long>(plan.size()),
                            static_cast<long long>(status.size())};
     cemu_args args = {};
-    args.numr = 4;
+    args.numr = 6;
     args.mr_addr = ranges;
     args.mr_len = lengths;
     args.cparam1 = plan.size();
-    args.cparam2 = 2;
+    args.cparam2 = 4;
     args.service_context = &nvm;
     args.nvm_read = fake_nvm_read;
     assert(csd_sql(&args) == 2);
@@ -255,7 +266,11 @@ void test_chunked_nvm_scan()
     assert(cells[2].integer == 2 && cells[3].integer == 20);
     assert(nvm.reads == 2);
     assert(execution->flash_read_bytes == 2 * CSD_SQL_PAGE_BYTES);
-    assert(execution->input_chunks == 2);
+    assert(execution->input_chunks == 1);
+    assert(execution->fifo_batches == 2);
+    assert(execution->fifo_write_bytes > 0);
+    assert(execution->fifo_write_bytes == execution->fifo_read_bytes);
+    assert(execution->fdm_reserved_bytes == header.fdm_reserved_bytes);
 }
 
 void test_heap_pipeline_with_spill()

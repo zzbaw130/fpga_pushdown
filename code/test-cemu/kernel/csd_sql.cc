@@ -8,6 +8,7 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -26,12 +27,9 @@ const uint16_t kPageHeaderBytes = 24;
 const uint16_t kHeapTupleHeaderBytes = 23;
 const uint16_t kResultNull = 1;
 const uint32_t kSpillMagic = UINT32_C(0x4353504c); /* CSPL */
+const uint32_t kFifoMagic = UINT32_C(0x43464946); /* CFIF */
 const uint32_t kMaxParallelWorkers = 32;
 const uint32_t kTupleBindWordBits = 1024;
-/* A nested stage consumes the caller's CSD core rather than creating more cores. */
-static thread_local bool g_csd_worker_active = false;
-/* A task-level scheduler assigns a bounded share of FPGA-style lanes. */
-static thread_local uint32_t g_csd_worker_budget = 0;
 
 struct Value {
     bool is_null;
@@ -55,6 +53,17 @@ struct SpillRecordHeader {
     uint16_t column_count;
     uint16_t reserved16;
     uint64_t cell_count;
+    uint64_t bytes_length;
+} __attribute__((packed));
+struct FifoBatchHeader {
+    uint32_t magic;
+    uint32_t generation;
+    uint32_t row_count;
+    uint16_t column_count;
+    uint16_t reserved16;
+    uint64_t total_bytes;
+    uint64_t cells_offset;
+    uint64_t bytes_offset;
     uint64_t bytes_length;
 } __attribute__((packed));
 
@@ -128,12 +137,18 @@ public:
     explicit Engine(struct cemu_args *args)
         : args_(args), plan_data_(NULL), plan_length_(0), plan_from_range_(false), header_(NULL),
           nodes_(NULL), plan_bytes_(0), work_mem_bytes_(0), parallel_workers_(1), spill_offset_(0),
-          spill_run_id_(0), failed_(false)
+          spill_run_id_(0), fifo_generation_(0), worker_budget_key_valid_(false), failed_(false)
     {
+        worker_budget_key_valid_ = pthread_key_create(&worker_budget_key_, NULL) == 0;
         std::memset(&status_, 0, sizeof(status_));
         status_.magic = CSD_SQL_PLAN_MAGIC;
         status_.version = CSD_SQL_PLAN_VERSION;
         status_.failed_node = CSD_SQL_INVALID_NODE;
+    }
+
+    ~Engine()
+    {
+        if (worker_budget_key_valid_) pthread_key_delete(worker_budget_key_);
     }
 
     long long run()
@@ -192,20 +207,30 @@ public:
 private:
     bool validate_plan()
     {
-        if (!select_plan_source() || plan_length_ < sizeof(CsdSqlPlanHeader))
-            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE);
+        if (!select_plan_source())
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x101);
+        if (plan_length_ < sizeof(CsdSqlPlanHeader))
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x102);
         header_ = static_cast<const CsdSqlPlanHeader *>(plan_data_);
         status_.plan_id = header_->plan_id;
-        if (header_->magic != CSD_SQL_PLAN_MAGIC || header_->version != CSD_SQL_PLAN_VERSION ||
-            header_->header_bytes != sizeof(CsdSqlPlanHeader) || header_->node_bytes != sizeof(CsdSqlPlanNode) ||
-            header_->node_count == 0 || header_->root_node >= header_->node_count ||
-            header_->plan_bytes > plan_length_ ||
-            (plan_from_range_ && !(header_->flags & CSD_SQL_PLAN_STAGED_RANGE)))
-            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE);
+        if (header_->magic != CSD_SQL_PLAN_MAGIC)
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x103);
+        if (header_->version != CSD_SQL_PLAN_VERSION)
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x104);
+        if (header_->header_bytes != sizeof(CsdSqlPlanHeader))
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x105);
+        if (header_->node_bytes != sizeof(CsdSqlPlanNode))
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x106);
+        if (header_->node_count == 0 || header_->root_node >= header_->node_count)
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x107);
+        if (header_->plan_bytes > plan_length_)
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x108);
+        if (plan_from_range_ && !(header_->flags & CSD_SQL_PLAN_STAGED_RANGE))
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x109);
         uint64_t node_bytes = 0, node_end = 0;
         if (!checked_mul(header_->node_count, sizeof(CsdSqlPlanNode), &node_bytes) ||
             !checked_add(header_->header_bytes, node_bytes, &node_end) || header_->plan_bytes < node_end)
-            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE);
+            return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x10a);
         if (header_->output_range == CSD_SQL_INVALID_RANGE || args_->mr_addr == NULL || args_->mr_len == NULL ||
             header_->output_range >= static_cast<uint32_t>(args_->numr))
             return fail(CSD_SQL_STATUS_NO_INPUT_RANGE, CSD_SQL_INVALID_NODE);
@@ -215,6 +240,23 @@ private:
         work_mem_bytes_ = header_->work_mem_bytes == 0 ? UINT64_C(1) << 20 : header_->work_mem_bytes;
         parallel_workers_ = header_->parallel_workers == 0 ? 1 :
             std::min<uint32_t>(header_->parallel_workers, kMaxParallelWorkers);
+        if (!worker_budget_key_valid_) parallel_workers_ = 1;
+        status_.fdm_reserved_bytes = header_->fdm_reserved_bytes;
+        if (header_->flags & CSD_SQL_PLAN_FDM_FIFO) {
+            if (header_->fifo_range_a == CSD_SQL_INVALID_RANGE ||
+                header_->fifo_range_b == CSD_SQL_INVALID_RANGE ||
+                header_->fifo_range_a >= static_cast<uint32_t>(args_->numr) ||
+                header_->fifo_range_b >= static_cast<uint32_t>(args_->numr) ||
+                header_->fifo_range_a == header_->fifo_range_b ||
+                header_->fifo_bytes < sizeof(FifoBatchHeader) ||
+                args_->mr_addr[header_->fifo_range_a] == NULL ||
+                args_->mr_addr[header_->fifo_range_b] == NULL ||
+                args_->mr_len[header_->fifo_range_a] < 0 ||
+                args_->mr_len[header_->fifo_range_b] < 0 ||
+                header_->fifo_bytes > static_cast<uint64_t>(args_->mr_len[header_->fifo_range_a]) ||
+                header_->fifo_bytes > static_cast<uint64_t>(args_->mr_len[header_->fifo_range_b]))
+                return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, CSD_SQL_INVALID_NODE, 0x301);
+        }
         nodes_ = reinterpret_cast<const CsdSqlPlanNode *>(static_cast<const char *>(plan_data_) + header_->header_bytes);
         for (uint32_t index = 0; index < header_->node_count; ++index) {
             const CsdSqlPlanNode &node = nodes_[index];
@@ -281,10 +323,9 @@ private:
     template <typename Function>
     void run_parallel(size_t task_count, Function function)
     {
-        const size_t lane_budget = g_csd_worker_budget == 0 ? parallel_workers_ :
-                                   g_csd_worker_budget;
+        const size_t lane_budget = worker_budget();
         const size_t workers = std::min<size_t>(lane_budget, task_count);
-        if (workers <= 1 || g_csd_worker_active) {
+        if (workers <= 1) {
             for (size_t task = 0; task < task_count; ++task) function(task);
             return;
         }
@@ -292,15 +333,13 @@ private:
         std::vector<std::thread> threads;
         for (size_t worker = 0; worker < workers; ++worker)
             threads.push_back(std::thread([&]() {
-                g_csd_worker_active = true;
-                g_csd_worker_budget = 1;
+                set_worker_budget(1);
                 for (;;) {
                     const size_t task = next_task.fetch_add(1);
                     if (task >= task_count) break;
                     function(task);
                 }
-                g_csd_worker_budget = 0;
-                g_csd_worker_active = false;
+                clear_worker_budget();
             }));
         for (std::vector<std::thread>::iterator thread = threads.begin(); thread != threads.end(); ++thread)
             thread->join();
@@ -350,13 +389,33 @@ private:
         threads.reserve(ready.size());
         for (size_t slot = 0; slot < ready.size(); ++slot)
             threads.push_back(std::thread([&, slot]() {
-                g_csd_worker_budget = budgets[slot];
+                set_worker_budget(budgets[slot]);
                 function(slot);
-                g_csd_worker_budget = 0;
+                clear_worker_budget();
             }));
         for (std::vector<std::thread>::iterator thread = threads.begin();
              thread != threads.end(); ++thread)
             thread->join();
+    }
+
+    size_t worker_budget() const
+    {
+        if (!worker_budget_key_valid_) return 1;
+        const uintptr_t encoded = reinterpret_cast<uintptr_t>(
+            pthread_getspecific(worker_budget_key_));
+        return encoded == 0 ? parallel_workers_ : encoded - 1;
+    }
+
+    void set_worker_budget(uint32_t budget)
+    {
+        if (worker_budget_key_valid_)
+            pthread_setspecific(worker_budget_key_, reinterpret_cast<void *>(
+                static_cast<uintptr_t>(budget) + 1));
+    }
+
+    void clear_worker_budget()
+    {
+        if (worker_budget_key_valid_) pthread_setspecific(worker_budget_key_, NULL);
     }
 
     bool execute_node(uint32_t index, Batch *output, std::vector<Batch> &results,
@@ -487,6 +546,7 @@ private:
         return pipeline;
     }
 
+#include "csd_fifo.cc"
 #include "csd_scan.cc"
 #include "csd_expression.cc"
 #include "csd_filter.cc"
@@ -618,10 +678,14 @@ private:
     uint32_t parallel_workers_;
     uint64_t spill_offset_;
     uint32_t spill_run_id_;
+    uint32_t fifo_generation_;
+    pthread_key_t worker_budget_key_;
+    bool worker_budget_key_valid_;
     CsdSqlExecutionStatus status_;
     bool failed_;
     std::mutex status_mutex_;
     std::mutex spill_mutex_;
+    std::mutex fifo_mutex_;
 };
 
 } // namespace

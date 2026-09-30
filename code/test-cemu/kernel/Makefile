@@ -1,6 +1,6 @@
 BUILD_DIR := ../build
 CSD_SOURCES = csd_sql.cc
-CSD_OPERATOR_FILES = csd_scan.cc csd_expression.cc csd_filter.cc csd_project.cc csd_aggregate.cc \
+CSD_OPERATOR_FILES = csd_fifo.cc csd_scan.cc csd_expression.cc csd_filter.cc csd_project.cc csd_aggregate.cc \
 	csd_join.cc csd_sort.cc csd_control.cc
 TARGETS = $(BUILD_DIR)/csd_sql.so $(BUILD_DIR)/csd_sql_test
 

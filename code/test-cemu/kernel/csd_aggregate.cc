@@ -105,13 +105,14 @@
             std::vector<AggregateState> &states = local_states[tile];
             group_map.reserve(std::min<size_t>(end - begin, 65536));
             Row projected_row;
+            std::vector<EvalValue> expression_stack;
             if (project_spec != NULL) projected_row.reserve(project_spec->output_count);
             for (size_t row_index = begin; row_index < end; ++row_index) {
                 const Row *row_pointer = &input.rows[row_index];
                 if (project_spec != NULL) {
                     if (!evaluate_expression(project_node->node_id, project_node->expression_offset,
                                              project_node->expression_length, input.rows[row_index],
-                                             NULL, &projected_row)) return;
+                                             NULL, &projected_row, &expression_stack)) return;
                     row_pointer = &projected_row;
                 }
                 const Row &row = *row_pointer;

@@ -341,7 +341,7 @@ csd_wire_opcode(const char *name)
 		return CSD_SQL_OP_MATERIALIZE;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("CSD metadata operator %s has no ABI v6 opcode", name)));
+				 errmsg("CSD metadata operator %s has no ABI v7 opcode", name)));
 	pg_unreachable();
 }
 
@@ -1091,7 +1091,7 @@ csd_wire_validate(const StringInfoData *bytes)
 invalid:
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("generated CSD ABI v6 wire plan failed structural validation")));
+				 errmsg("generated CSD ABI v7 wire plan failed structural validation")));
 }
 
 bytea *

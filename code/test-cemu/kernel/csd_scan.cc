@@ -87,9 +87,18 @@
                                              static_cast<uint64_t>(window_pages) * CSD_SQL_PAGE_BYTES,
                                              input))
                 return false;
+            Batch window_output;
+            window_output.columns = output_columns;
             if (!decode_scan_window(index, *spec, columns, window, window_pages,
-                                    output_columns, pipeline, &input_rows, output))
+                                    output_columns, pipeline, &input_rows, &window_output))
                 return false;
+            if (header_->flags & CSD_SQL_PLAN_FDM_FIFO) {
+                if (!fifo_forward_batch(index, window_output, output)) return false;
+            } else {
+                output->rows.insert(output->rows.end(),
+                    std::make_move_iterator(window_output.rows.begin()),
+                    std::make_move_iterator(window_output.rows.end()));
+            }
             page_offset += window_pages;
         }
         add_input_rows(input_rows);
@@ -234,6 +243,7 @@
         Row row;
         row.reserve(spec.output_count);
         std::vector<Value> stage_values;
+        std::vector<EvalValue> expression_stack;
         for (uint16_t item = lane; item < item_count; item = static_cast<uint16_t>(item + lanes)) {
             const uint32_t item_id = read_u32(page + kPageHeaderBytes + item * 4);
             const uint16_t offset = item_id & 0x7fff;
@@ -257,7 +267,7 @@
                     const CsdSqlPlanNode &stage_node = nodes_[*stage];
                     if (!evaluate_expression(*stage, stage_node.expression_offset,
                                              stage_node.expression_length, row, NULL,
-                                             &stage_values))
+                                             &stage_values, &expression_stack))
                         return false;
                     if (stage_node.opcode == CSD_SQL_OP_FILTER) {
                         if (stage_values.size() != 1 || stage_values[0].type != CSD_SQL_TYPE_BOOL)

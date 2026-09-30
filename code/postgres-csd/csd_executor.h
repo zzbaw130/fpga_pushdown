@@ -19,6 +19,7 @@ extern int csd_output_mb;
 extern int csd_spill_mb;
 extern int csd_spill_stage_mb;
 extern int csd_chunk_mb;
+extern int csd_fifo_mb;
 extern int csd_fdm_capacity_mb;
 extern int csd_nvm_nsid;
 extern int csd_parallel_workers;

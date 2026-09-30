@@ -37,6 +37,7 @@
             const size_t end = input.rows.size() * (tile + 1) / tiles;
             projected[tile].columns = spec->output_count;
             projected[tile].rows.reserve(end - begin);
+            std::vector<EvalValue> expression_stack;
             for (size_t row_index = begin; row_index < end; ++row_index) {
                 Row values;
                 if (!direct_columns.empty()) {
@@ -47,7 +48,8 @@
                         else values.push_back(input.rows[row_index][*column]);
                     }
                 } else if (!evaluate_expression(index, node.expression_offset, node.expression_length,
-                                                input.rows[row_index], NULL, &values)) return;
+                                                input.rows[row_index], NULL, &values,
+                                                &expression_stack)) return;
                 projected[tile].rows.push_back(std::move(values));
             }
             projected_ok[tile] = 1;

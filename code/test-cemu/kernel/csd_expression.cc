@@ -279,12 +279,14 @@
     }
 
     bool evaluate_expression(uint32_t index, uint32_t offset, uint32_t length,
-                             const Row &row, const Row *aux_row, std::vector<Value> *outputs)
+                             const Row &row, const Row *aux_row, std::vector<Value> *outputs,
+                             std::vector<EvalValue> *scratch)
     {
         const CsdSqlExpressionSpec *spec = NULL;
         const CsdSqlExpressionInstruction *instructions = NULL;
         if (!expression_program(index, offset, length, &spec, &instructions)) return false;
-        static thread_local std::vector<EvalValue> stack;
+        if (scratch == NULL) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+        std::vector<EvalValue> &stack = *scratch;
         stack.clear();
         stack.reserve(spec->max_stack);
         outputs->clear();

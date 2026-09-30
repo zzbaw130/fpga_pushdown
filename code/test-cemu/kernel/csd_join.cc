@@ -53,11 +53,13 @@
         return true;
     }
 
-    bool join_residual_matches(uint32_t index, const CsdSqlJoinSpec &spec, const Row &joined, bool *matches)
+    bool join_residual_matches(uint32_t index, const CsdSqlJoinSpec &spec, const Row &joined,
+                               bool *matches, std::vector<EvalValue> *expression_stack)
     {
         if (spec.residual_length == 0) { *matches = true; return true; }
         std::vector<Value> values;
-        if (!evaluate_expression(index, spec.residual_offset, spec.residual_length, joined, NULL, &values) ||
+        if (!evaluate_expression(index, spec.residual_offset, spec.residual_length, joined, NULL,
+                                 &values, expression_stack) ||
             values.size() != 1 || values[0].type != CSD_SQL_TYPE_BOOL)
             return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
         *matches = !values[0].is_null && values[0].integer != 0;
@@ -117,6 +119,7 @@
             joined[tile].columns = output->columns;
             joined[tile].rows.reserve(end - begin);
             std::vector<size_t> nested_candidates;
+            std::vector<EvalValue> expression_stack;
             if (nested_loop) {
                 nested_candidates.reserve(right.rows.size());
                 for (size_t candidate = 0; candidate < right.rows.size(); ++candidate)
@@ -158,7 +161,8 @@
                     Row joined_row = left_row;
                     joined_row.insert(joined_row.end(), right.rows[*candidate].begin(), right.rows[*candidate].end());
                     bool residual_match = false;
-                    if (!join_residual_matches(index, *spec, joined_row, &residual_match)) return;
+                    if (!join_residual_matches(index, *spec, joined_row, &residual_match,
+                                               &expression_stack)) return;
                     if (!residual_match) continue;
                     matched = true;
                     if (spec->join_kind == CSD_SQL_JOIN_SEMI) {

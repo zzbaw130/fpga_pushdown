@@ -117,6 +117,7 @@ int csd_output_mb = 64;
 int csd_spill_mb = 4096;
 int csd_spill_stage_mb = 32;
 int csd_chunk_mb = 32;
+int csd_fifo_mb = 32;
 int csd_fdm_capacity_mb = 4096;
 int csd_nvm_nsid = 1;
 int csd_parallel_workers = 32;
@@ -823,7 +824,9 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 	CsdSqlPlanHeader *header = (CsdSqlPlanHeader *) plan;
 	CsdTransport transport;
 	uint32 relation_count = list_length(relations);
-	uint32 output_range = relation_count;
+	uint32 fifo_range_a = relation_count;
+	uint32 fifo_range_b = fifo_range_a + 1;
+	uint32 output_range = fifo_range_b + 1;
 	uint32 spill_range = output_range + 1;
 	uint32 plan_range = spill_range + 1;
 	uint32 status_range = plan_range + 1;
@@ -831,6 +834,7 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 	uint64 spill_bytes = (uint64) csd_spill_mb * 1024 * 1024;
 	uint64 spill_stage_bytes = (uint64) csd_spill_stage_mb * 1024 * 1024;
 	uint64 chunk_bytes = (uint64) csd_chunk_mb * 1024 * 1024;
+	uint64 fifo_bytes = (uint64) csd_fifo_mb * 1024 * 1024;
 	uint64 fdm_capacity_bytes = (uint64) csd_fdm_capacity_mb * 1024 * 1024;
 	uint64 reserved_fdm_bytes = 0;
 	char *lock_path = pstrdup("/tmp/csd_executor.lock");
@@ -888,6 +892,8 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 			transport.range_fds[index] = -1;
 		for (index = 0; index < relation_count; ++index)
 			csd_account_fdm_range(&reserved_fdm_bytes, chunk_bytes);
+		csd_account_fdm_range(&reserved_fdm_bytes, fifo_bytes);
+		csd_account_fdm_range(&reserved_fdm_bytes, fifo_bytes);
 		csd_account_fdm_range(&reserved_fdm_bytes, output_bytes);
 		csd_account_fdm_range(&reserved_fdm_bytes, spill_stage_bytes);
 		csd_account_fdm_range(&reserved_fdm_bytes, plan_length);
@@ -898,7 +904,7 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 					 errmsg("CSD query requires %llu bytes of FDM but csd.fdm_capacity_mb allows %llu bytes",
 							(unsigned long long) reserved_fdm_bytes,
 							(unsigned long long) fdm_capacity_bytes),
-					 errhint("Reduce csd.chunk_mb, csd.output_mb, or csd.spill_stage_mb.")));
+					 errhint("Reduce csd.chunk_mb, csd.fifo_mb, csd.output_mb, or csd.spill_stage_mb.")));
 		/* Each logical scan owns one reusable bounded work window.  Relation
 		 * bytes arrive from NVM extents inside Program Execute, so no heap is
 		 * copied wholesale into FDMFS here. */
@@ -907,6 +913,12 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 			transport.range_sizes[index] = chunk_bytes;
 			transport.range_fds[index] = csd_create_range(index, chunk_bytes);
 		}
+		transport.range_sizes[fifo_range_a] = fifo_bytes;
+		transport.range_fds[fifo_range_a] = csd_create_range(fifo_range_a,
+			fifo_bytes);
+		transport.range_sizes[fifo_range_b] = fifo_bytes;
+		transport.range_fds[fifo_range_b] = csd_create_range(fifo_range_b,
+			fifo_bytes);
 		transport.range_sizes[output_range] = output_bytes;
 		transport.range_fds[output_range] = csd_create_range(output_range, output_bytes);
 		transport.range_fds[spill_range] = csd_create_range(spill_range,
@@ -920,6 +932,11 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 
 		header->output_range = output_range;
 		header->spill_range = spill_range;
+		header->fifo_range_a = fifo_range_a;
+		header->fifo_range_b = fifo_range_b;
+		header->fifo_bytes = fifo_bytes;
+		header->fdm_reserved_bytes = reserved_fdm_bytes;
+		header->flags |= CSD_SQL_PLAN_FDM_FIFO;
 		if (csd_profile)
 		{
 			header->flags |= CSD_SQL_PLAN_PROFILE;
@@ -1011,14 +1028,18 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 			uint32 opcode;
 
 			ereport(NOTICE,
-					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f flash_read_bytes=%llu flash_write_bytes=%llu input_chunks=%llu spill_write_bytes=%llu spill_read_bytes=%llu",
+					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f flash_read_bytes=%llu flash_write_bytes=%llu input_chunks=%llu spill_write_bytes=%llu spill_read_bytes=%llu fifo_batches=%llu fifo_write_bytes=%llu fifo_read_bytes=%llu fdm_reserved_bytes=%llu",
 							(unsigned long long) status.operator_calls[CSD_SQL_OP_SCAN],
 							(double) status.operator_ns[CSD_SQL_OP_SCAN] / 1000000.0,
 							(unsigned long long) status.flash_read_bytes,
 							(unsigned long long) status.flash_write_bytes,
 							(unsigned long long) status.input_chunks,
 							(unsigned long long) status.spill_write_bytes,
-							(unsigned long long) status.spill_read_bytes)));
+							(unsigned long long) status.spill_read_bytes,
+							(unsigned long long) status.fifo_batches,
+							(unsigned long long) status.fifo_write_bytes,
+							(unsigned long long) status.fifo_read_bytes,
+							(unsigned long long) status.fdm_reserved_bytes)));
 
 			for (opcode = CSD_SQL_OP_SCAN; opcode < CSD_SQL_PROFILE_SLOTS; ++opcode)
 				if (status.operator_calls[opcode] != 0)

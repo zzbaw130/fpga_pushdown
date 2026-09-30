@@ -28,8 +28,8 @@ operators (`HASH_AGG`, `HASH_JOIN`, `SORT`, and `MATERIALIZE`) and keeps all
 other compatible operators in one streaming pipeline.  Thus a planner and a
 scheduler can use one interface even though the implementations differ.
 
-ABI v6 implements bounded, extent-driven raw-heap `SCAN`, NVMe-backed spill
-staging, expression
+ABI v7 implements bounded, extent-driven raw-heap `SCAN`, alternating FDM tuple
+FIFOs, NVMe-backed spill staging, expression
 `FILTER`/`PROJECT`, multi-key
 hash/group aggregate, inner/left/semi/anti joins with residual predicates,
 multi-key external-style `SORT`/top-N, `MATERIALIZE`, `LIMIT`, and subplan DAG
@@ -57,8 +57,11 @@ zero fail the plan rather than wrapping silently.
 and performs the
 page-header, line-pointer, tuple-header, NULL bitmap, fixed-width datum,
 varlena and restricted `numeric` decoding inside CEMU. It emits an internal
-column batch, never a guest pointer. The input window is bounded; the emitted
-batch is not yet hard-bounded until the FIFO/spill replay milestone. The visibility contract is
+column batch, never a guest pointer. Each decoded scan window crosses one of two
+alternating, fixed-capacity FDM tuple FIFOs; an oversized window is split into
+multiple FIFO batches. The current executor then appends decoded FIFO output to
+the downstream C++ `Batch`, so this transport boundary is bounded but the full
+operator pipeline is not yet hard-bounded. The visibility contract is
 intentionally strict: only planner-proven frozen/all-visible pages may use
 this path.  External/TOASTed or compressed varlena values and unsupported
 numeric encodings fail visibly rather than returning a partial answer.
@@ -68,9 +71,10 @@ and appends them to the plan. During one Program Execute, the CEMU service
 callback copies the next logical chunk directly from namespace 1 into the
 scan's FDM range. The default window is 32 MiB and is reused until the relation
 is exhausted, so a relation larger than FDM never has to be resident in full.
-The configured FDM namespace is 4 GiB; query-local scan windows, result, a
-bounded spill staging window, plan, and status reservations are
-capacity-checked before execution. `csd.spill_mb` reserves query-local ext4
+The configured FDM namespace is 4 GiB; query-local scan windows, two tuple FIFOs
+(`csd.fifo_mb`, 32 MiB each by default), result, a bounded spill staging window,
+plan, and status reservations are capacity-checked before execution.
+`csd.spill_mb` reserves query-local ext4
 blocks on the PGDATA NVMe namespace (4 GiB by default), while
 `csd.spill_stage_mb` controls only the reusable FDM transfer window (32 MiB by
 default). Flash spill capacity is therefore not charged to the FDM budget.
@@ -105,13 +109,14 @@ threads are FPGA hardware.
 | --- | --- | --- |
 | Page | `SCAN` turns every input page into decode tasks | Different page tasks are scheduled over the shared worker budget. |
 | Tuple | Each page is split into dynamic tuple lanes. Lane count is derived from its physical attribute count under a 1024-bit binding word, then capped by `parallel_workers`. | A task is `(page, tuple-lane)`; its local output is merged after workers join. |
-| Task | The plan DAG executes all currently-ready, independent nodes together (for example the two scans below a hash join). | A thread-local reentry guard prevents a child operator from recursively creating another worker pool, so the total simulated cores never exceed the configured budget. |
+| Task | The plan DAG executes all currently-ready, independent nodes together (for example the two scans below a hash join). | A query-owned POSIX thread key carries each task's lane budget into child operators, so the total simulated cores never exceed the configured budget without pinning a loaded CSD `.so` through C++ TLS. |
 
 `FILTER` and `PROJECT` also partition a batch into contiguous tuple tiles.
 `HASH_JOIN`, hash/group aggregate and external-style sort remain blocking operators:
 they use their own operator file and the shared Flash spill allocator is
-serialized. Scan input is now chunked and reusable, but each scan still
-accumulates its emitted `Batch` before a blocking consumer. The current task
+serialized. Scan input is now chunked and reusable and its decoded windows
+cross the FDM FIFOs, but each scan still accumulates the FIFO output `Batch`
+before a blocking consumer. The current task
 layer is DAG-level concurrency, not yet the full FIFO/double-buffer,
 per-batch streaming pipeline shown in Trinity. That
 requires a bounded batch-queue protocol between compatible operators and is
@@ -210,7 +215,7 @@ orchestration, while host scan/join/aggregate/sort nodes are rejected by the
 planner test.
 
 `PlanCustomPath` emits a packed,
-structurally self-validated ABI-v6 plan with postorder node IDs, dependencies,
+structurally self-validated ABI-v7 plan with postorder node IDs, dependencies,
 blocking/spill flags, estimates, work-mem budget, logical MRS slots, real heap
 page counts, and one physical column descriptor per PostgreSQL attribute.
 The scan descriptor intentionally does not assert the frozen-page flag: that
@@ -225,7 +230,7 @@ explicit fixed-point scale inferred from their columns, constants, and
 arithmetic operators rather than silently collapsing to integer scale.
 
 Join keys, aggregate group/argument descriptors, aggregate `DISTINCT`, sort
-keys/direction/null ordering, and limits are now serialized as real ABI-v6
+keys/direction/null ordering, and limits are now serialized as real ABI-v7
 payloads. Complex aggregate inputs are projected before the FPGA-style
 aggregate core; HAVING and final expressions form later streaming stages.
 PostgreSQL columns removed from a physical Group Key through functional

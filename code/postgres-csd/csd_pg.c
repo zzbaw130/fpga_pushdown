@@ -152,6 +152,9 @@ _PG_init(void)
 	DefineCustomIntVariable("csd.chunk_mb", "Per-scan reusable FDM input-buffer size.", NULL,
 						&csd_chunk_mb, 32, 1, 1024, PGC_USERSET, 0,
 						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.fifo_mb", "Size of each alternating FDM tuple FIFO.", NULL,
+						&csd_fifo_mb, 32, 1, 1024, PGC_USERSET, 0,
+						NULL, NULL, NULL);
 	DefineCustomIntVariable("csd.fdm_capacity_mb", "Configured CEMU FDM capacity.", NULL,
 						&csd_fdm_capacity_mb, 4096, 64, INT_MAX, PGC_USERSET, 0,
 						NULL, NULL, NULL);
@@ -310,7 +313,7 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	ExplainPropertyInteger("CSD SubPlan Rewrites", NULL,
 						   intVal(list_nth(scan->custom_private, 13)), es);
 	ExplainPropertyText("CSD Wire Status",
-		"ABI v6 chunked scan/Flash-spill/expression/join/aggregate/sort descriptors", es);
+		"ABI v7 FDM-FIFO/chunked-scan/Flash-spill operator descriptors", es);
 	ExplainPropertyText("CSD Transport", "NVMe Program Execute", es);
 }
 

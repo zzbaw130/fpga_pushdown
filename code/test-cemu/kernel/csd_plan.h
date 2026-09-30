@@ -6,14 +6,16 @@
 /*
  * Stable little-endian wire ABI between PostgreSQL and the CEMU program.
  * PostgreSQL executor nodes are deliberately not sent across this boundary.
- * Version 6 adds bounded FDM spill staging and writable NVMe spill extents.
+ * Version 7 adds two capacity-accounted FDM FIFO buffers between scan and
+ * downstream operators. Version 6 added bounded FDM spill staging and writable
+ * NVMe spill extents.
  * Version 5 added bounded FDM chunk buffers and NVMe physical extents to the
  * scan ABI. Version 4 added the TPC-H expression bytecode, multi-column blocking
  * operators, fixed-point scale metadata, and explicit canonicalization
  * counters. PostgreSQL executor structs never cross this boundary.
  */
 #define CSD_SQL_PLAN_MAGIC       UINT32_C(0x43534450) /* "CSDP" */
-#define CSD_SQL_PLAN_VERSION     6
+#define CSD_SQL_PLAN_VERSION     7
 #define CSD_SQL_RESULT_MAGIC     UINT32_C(0x43534452) /* "CSDR" */
 #define CSD_SQL_INVALID_NODE     UINT32_C(0xffffffff)
 #define CSD_SQL_INVALID_RANGE    UINT32_C(0xffffffff)
@@ -62,6 +64,8 @@ enum CsdSqlPlanFlags {
     CSD_SQL_PLAN_CHUNKED_SCAN = UINT32_C(1) << 4,
     /* spill_range is a bounded staging window; spill bytes live on Flash. */
     CSD_SQL_PLAN_FLASH_SPILL = UINT32_C(1) << 5,
+    /* fifo_range_a/b are alternating, fixed-capacity FDM tuple buffers. */
+    CSD_SQL_PLAN_FDM_FIFO = UINT32_C(1) << 6,
 };
 
 enum CsdSqlNodeFlags {
@@ -163,6 +167,7 @@ enum CsdSqlStatusCode {
     CSD_SQL_STATUS_OUTPUT_TOO_SMALL = 7,
     CSD_SQL_STATUS_SPILL_TOO_SMALL = 8,
     CSD_SQL_STATUS_NO_INPUT_RANGE = 9,
+    CSD_SQL_STATUS_FIFO_TOO_SMALL = 10,
 };
 
 /*
@@ -187,6 +192,10 @@ struct CsdSqlPlanHeader {
     uint32_t parallel_workers;
     uint64_t plan_id;
     uint64_t work_mem_bytes;
+    uint32_t fifo_range_a;
+    uint32_t fifo_range_b;
+    uint64_t fifo_bytes;
+    uint64_t fdm_reserved_bytes;
     uint32_t spill_extent_count;
     uint32_t spill_extent_offset;
     uint64_t spill_bytes;
@@ -354,6 +363,10 @@ struct CsdSqlExecutionStatus {
     uint64_t input_chunks;
     uint64_t spill_write_bytes;
     uint64_t spill_read_bytes;
+    uint64_t fifo_batches;
+    uint64_t fifo_write_bytes;
+    uint64_t fifo_read_bytes;
+    uint64_t fdm_reserved_bytes;
     uint64_t modeled_cycles;
     uint32_t canonicalized_nodes;
     uint32_t software_fallback_nodes;
