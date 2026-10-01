@@ -6,8 +6,9 @@
 /*
  * Stable little-endian wire ABI between PostgreSQL and the CEMU program.
  * PostgreSQL executor nodes are deliberately not sent across this boundary.
- * Version 7 adds two capacity-accounted FDM FIFO buffers between scan and
- * downstream operators. Version 6 added bounded FDM spill staging and writable
+ * Version 8 adds a query-level FDM operator arena whose free capacity controls
+ * blocking-operator spill. Version 7 added two capacity-accounted FDM FIFO
+ * buffers between scan and downstream operators. Version 6 added bounded FDM spill staging and writable
  * NVMe spill extents.
  * Version 5 added bounded FDM chunk buffers and NVMe physical extents to the
  * scan ABI. Version 4 added the TPC-H expression bytecode, multi-column blocking
@@ -15,7 +16,7 @@
  * counters. PostgreSQL executor structs never cross this boundary.
  */
 #define CSD_SQL_PLAN_MAGIC       UINT32_C(0x43534450) /* "CSDP" */
-#define CSD_SQL_PLAN_VERSION     7
+#define CSD_SQL_PLAN_VERSION     8
 #define CSD_SQL_RESULT_MAGIC     UINT32_C(0x43534452) /* "CSDR" */
 #define CSD_SQL_INVALID_NODE     UINT32_C(0xffffffff)
 #define CSD_SQL_INVALID_RANGE    UINT32_C(0xffffffff)
@@ -66,6 +67,8 @@ enum CsdSqlPlanFlags {
     CSD_SQL_PLAN_FLASH_SPILL = UINT32_C(1) << 5,
     /* fifo_range_a/b are alternating, fixed-capacity FDM tuple buffers. */
     CSD_SQL_PLAN_FDM_FIFO = UINT32_C(1) << 6,
+    /* operator_range owns the remaining query-level FDM working capacity. */
+    CSD_SQL_PLAN_FDM_ARENA = UINT32_C(1) << 7,
 };
 
 enum CsdSqlNodeFlags {
@@ -195,6 +198,9 @@ struct CsdSqlPlanHeader {
     uint32_t fifo_range_a;
     uint32_t fifo_range_b;
     uint64_t fifo_bytes;
+    uint32_t operator_range;
+    uint32_t reserved_operator32;
+    uint64_t operator_bytes;
     uint64_t fdm_reserved_bytes;
     uint32_t spill_extent_count;
     uint32_t spill_extent_offset;
@@ -367,6 +373,10 @@ struct CsdSqlExecutionStatus {
     uint64_t fifo_write_bytes;
     uint64_t fifo_read_bytes;
     uint64_t fdm_reserved_bytes;
+    uint64_t operator_memory_bytes;
+    uint64_t operator_peak_bytes;
+    uint64_t operator_allocations;
+    uint64_t operator_spill_count;
     uint64_t modeled_cycles;
     uint32_t canonicalized_nodes;
     uint32_t software_fallback_nodes;

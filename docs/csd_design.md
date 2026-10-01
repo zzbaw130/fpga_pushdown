@@ -28,8 +28,8 @@ operators (`HASH_AGG`, `HASH_JOIN`, `SORT`, and `MATERIALIZE`) and keeps all
 other compatible operators in one streaming pipeline.  Thus a planner and a
 scheduler can use one interface even though the implementations differ.
 
-ABI v7 implements bounded, extent-driven raw-heap `SCAN`, alternating FDM tuple
-FIFOs, NVMe-backed spill staging, expression
+ABI v8 implements bounded, extent-driven raw-heap `SCAN`, alternating FDM tuple
+FIFOs, a query-level FDM operator arena, NVMe-backed spill staging, expression
 `FILTER`/`PROJECT`, multi-key
 hash/group aggregate, inner/left/semi/anti joins with residual predicates,
 multi-key external-style `SORT`/top-N, `MATERIALIZE`, `LIMIT`, and subplan DAG
@@ -71,9 +71,12 @@ and appends them to the plan. During one Program Execute, the CEMU service
 callback copies the next logical chunk directly from namespace 1 into the
 scan's FDM range. The default window is 32 MiB and is reused until the relation
 is exhausted, so a relation larger than FDM never has to be resident in full.
-The configured FDM namespace is 4 GiB; query-local scan windows, two tuple FIFOs
+The configured FDM namespace is 4 GiB. Query-local scan windows, two tuple FIFOs
 (`csd.fifo_mb`, 32 MiB each by default), result, a bounded spill staging window,
-plan, and status reservations are capacity-checked before execution.
+plan, and status reservations are deducted first; all remaining page-aligned
+bytes become a real FDMFS operator-arena MRS range. `csd.device_work_mem_mb=0`
+uses that full remainder and a positive value caps it. Blocking operators take
+query-scoped leases and spill only when the arena cannot satisfy a lease.
 `csd.spill_mb` reserves query-local ext4
 blocks on the PGDATA NVMe namespace (4 GiB by default), while
 `csd.spill_stage_mb` controls only the reusable FDM transfer window (32 MiB by
@@ -87,9 +90,9 @@ CEMU:
 | Operator | Functional model | Blocking / spill rule |
 | --- | --- | --- |
 | Filter, project | SIMD-like lanes executing bounded expression bytecode | Never blocks; output compacts valid lanes |
-| Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state | Current model serializes oversized state; partition/replay remains required for a hard memory bound |
-| Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE | Current model records oversized build state; radix partition/replay remains required for a hard memory bound |
-| Sort | multi-key bounded run generation followed by stable merge passes | Functional runs are serialized to `spill-to-flash`; the C++ model still retains run objects during replay |
+| Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state | Arena capacity is checked; partition/replay remains required for a physical hard bound |
+| Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE | Build batch takes an arena lease; failure triggers spill, while radix replay remains future work |
+| Sort | multi-key bounded run generation followed by stable merge passes | Input takes an arena lease; failed allocation generates Flash-sized runs |
 
 The choices follow the streaming filter/project and hash GQE direction in the
 [Xilinx Vitis Database Library](https://github.com/Xilinx/Vitis_Libraries/tree/master/database).
@@ -221,7 +224,7 @@ orchestration, while host scan/join/aggregate/sort nodes are rejected by the
 planner test.
 
 `PlanCustomPath` emits a packed,
-structurally self-validated ABI-v7 plan with postorder node IDs, dependencies,
+structurally self-validated ABI-v8 plan with postorder node IDs, dependencies,
 blocking/spill flags, estimates, work-mem budget, logical MRS slots, real heap
 page counts, and one physical column descriptor per PostgreSQL attribute.
 The scan descriptor intentionally does not assert the frozen-page flag: that
@@ -236,7 +239,7 @@ explicit fixed-point scale inferred from their columns, constants, and
 arithmetic operators rather than silently collapsing to integer scale.
 
 Join keys, aggregate group/argument descriptors, aggregate `DISTINCT`, sort
-keys/direction/null ordering, and limits are now serialized as real ABI-v7
+keys/direction/null ordering, and limits are now serialized as real ABI-v8
 payloads. Complex aggregate inputs are projected before the FPGA-style
 aggregate core; HAVING and final expressions form later streaming stages.
 PostgreSQL columns removed from a physical Group Key through functional

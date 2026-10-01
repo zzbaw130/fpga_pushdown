@@ -70,7 +70,9 @@ normalize() {
 }
 
 cleanup_q15_view() {
-    "${psql_base[@]}" -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1 || true
+    "${psql_base[@]}" -c 'SET default_transaction_read_only=off' \
+        -c 'DROP VIEW IF EXISTS revenue0' \
+        >/dev/null 2>&1 || true
 }
 
 failures=0
@@ -83,6 +85,7 @@ for query in $(seq 1 22); do
 
     [[ "${query}" -ne 15 ]] || cleanup_q15_view
     if ! "${psql_base[@]}" \
+        -c 'SET default_transaction_read_only=off' \
         -c "LOAD 'csd_pg'; SET csd.shared_library='${SHARED_LIBRARY}'; SET csd.exe_path='csd';" \
         -f "${sql}" >"${csd_raw}" 2>&1; then
         printf 'Q%02d CSD FAIL\n' "${query}"
@@ -93,7 +96,8 @@ for query in $(seq 1 22); do
     fi
 
     [[ "${query}" -ne 15 ]] || cleanup_q15_view
-    if ! "${psql_base[@]}" -c "LOAD 'csd_pg'; SET csd.exe_path='host';" \
+    if ! "${psql_base[@]}" -c 'SET default_transaction_read_only=off' \
+        -c "LOAD 'csd_pg'; SET csd.exe_path='host';" \
         -f "${sql}" >"${host_raw}" 2>&1; then
         printf 'Q%02d HOST FAIL\n' "${query}"
         tail -n 12 "${host_raw}"

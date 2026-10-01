@@ -114,17 +114,21 @@ CSD 计划 ABI、FPGA 风格算子、spill-to-flash、AER 缓存回填和 Postgr
 
 PostgreSQL 规划器扩展位于 `code/postgres-csd`。它目前支持
 `csd.exe_path = host|csd|auto`、TPC-H 所需表达式白名单、CSD
-scan/project/join/aggregate/sort/limit 的真实 ABI v7 lowering 和递归算子成本
+scan/project/join/aggregate/sort/limit 的真实 ABI v8 lowering 和递归算子成本
 元数据；Q2 的相关标量 SubPlan 会解相关为分组聚合加双键连接，Q16 在证明
 两侧列均为 NOT NULL 后转为 hash anti-join，因此 22 条查询已无 pending
 表达式。执行器通过 FIEMAP 将 heap 的 NVMe 物理 extent 写入计划；CEMU 使用
 每个逻辑 Scan 的 32 MiB 可复用 FDM 窗口分块读取，不再把整表复制进 FDMFS。
-解码后的元组经过两块交替的 32 MiB FDM FIFO，再进入算子 DAG。输出、FIFO、
-Scan 窗口、spill staging、计划和状态统一计入默认 4 GiB FDM 容量；巨型阻塞
-算子的 spill extent 位于 NVMe Flash，不占用 FDM。执行仍通过原始
+解码后的元组经过两块交替的 32 MiB FDM FIFO，再进入算子 DAG。ABI v8 先从
+默认 4 GiB FDM 中扣除输出、FIFO、Scan 窗口、spill staging、计划和状态，再把
+全部剩余空间建成查询级 operator arena；`csd.device_work_mem_mb=0` 表示自动使用
+这些剩余空间，正值才是人为上限。Join/Sort 等阻塞状态只有申请 arena 失败时
+才 spill 到 NVMe Flash。执行仍通过原始
 `NVME_IOCTL_IO_CMD` Program Execute 路径触发 TCG VM-Freeze，随后把结果 cell
 解码回 PostgreSQL slot。query-local range 和 spill 文件在成功或错误退出时都会
-回收。可用 SF1 已启动实例验证 planner：
+回收。FDMFS 空闲区按地址双向合并，避免不同查询释放不等长 range 后出现“总量
+充足但无连续空间”的假性 OOM；guest 内可用 `tests/test_fdmfs_reuse.sh` 验证完整
+4 GiB 的回收与再分配。可用 SF1 已启动实例验证 planner：
 
 ```bash
 ./tests/test_csd_planner.sh --sf 1 --mode csd
@@ -144,7 +148,8 @@ cd /mnt/cemu
 当前 SF=1 的全部 22 条查询已经在真实 CEMU Program Execute 路径执行并与
 同一 guest PostgreSQL 的 HOST 结果逐字符一致。该结论是功能正确性里程碑，
 不是最终性能结论；正式性能实验仍需固定 cache 状态、CEMU runtime 参数和
-主机墙钟/模拟时钟口径。
+主机墙钟/模拟时钟口径。ABI v8 operator arena、Q8 零 spill 以及 FDMFS 跨查询
+回收数据记录在 [SF=1 FDM arena 验证](results/tpch_sf1_fdm_arena_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD
@@ -164,6 +169,6 @@ make -C kernel all && make all
 
 算子实现位于 `kernel/csd_{fifo,scan,expression,filter,project,aggregate,join,sort,control}.cc`；
 `kernel/csd_sql.cc` 仅负责 ABI 校验、任务 DAG 调度、并行 worker 预算、状态和
-结果序列化。ABI v7 的无跳转表达式指令流覆盖 TPC-H 所需的定点算术、布尔
+结果序列化。ABI v8 的无跳转表达式指令流覆盖 TPC-H 所需的定点算术、布尔
 逻辑、`LIKE`、`CASE`、`substring` 和日期年份提取；单元测试同时覆盖多键
 group/join/sort、join residual、`DISTINCT`、top-N、spill 及规范化节点计数。

@@ -83,7 +83,14 @@
         for (uint16_t key = 0; key < spec->key_count; ++key)
             if (keys[key].left_key >= left.columns || keys[key].right_key >= right.columns)
                 return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
-        if (!spill_if_needed(index, node, right)) return false;
+        /* The build side owns an FDM arena lease for the lifetime of the hash
+         * table. Only an allocation failure selects the Flash partition path. */
+        OperatorMemoryLease build_memory(this, batch_bytes(right));
+        if (!build_memory.acquired()) {
+            if (!(node.flags & CSD_SQL_NODE_SPILLABLE))
+                return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+            if (!spill_batch(index, right)) return false;
+        }
 
         bool scalar_key = !nested_loop && spec->key_count == 1 &&
             (left.rows.empty() || left.rows[0][keys[0].left_key].type != CSD_SQL_TYPE_BYTES) &&

@@ -273,7 +273,7 @@ void test_chunked_nvm_scan()
     assert(execution->fdm_reserved_bytes == header.fdm_reserved_bytes);
 }
 
-void test_heap_pipeline_with_spill()
+void test_heap_pipeline_memory_policy(bool use_fdm_arena)
 {
     std::vector<unsigned char> left_page(CSD_SQL_PAGE_BYTES, 0);
     std::vector<unsigned char> right_page(CSD_SQL_PAGE_BYTES, 0);
@@ -408,6 +408,7 @@ void test_heap_pipeline_with_spill()
     nodes[5].expression_length = sizeof(sort) + sizeof(sort_key);
 
     nodes[6].left_input = 5;
+    nodes[6].flags = CSD_SQL_NODE_BLOCKING | CSD_SQL_NODE_SPILLABLE;
     CsdSqlAggregateSpec aggregate = {};
     aggregate.aggregate_count = 2;
     nodes[6].expression_offset = append(&plan, aggregate);
@@ -425,7 +426,7 @@ void test_heap_pipeline_with_spill()
     nodes[6].expression_length = sizeof(aggregate) + 2 * sizeof(CsdSqlAggregateColumn);
 
     FakeNvm spill_nvm;
-    spill_nvm.bytes.resize(4096, 0);
+    spill_nvm.bytes.resize(16384, 0);
     CsdSqlNvmExtent spill_extent = {};
     spill_extent.logical_offset = 0;
     spill_extent.nvm_offset = 0;
@@ -443,10 +444,15 @@ void test_heap_pipeline_with_spill()
     header.root_node = 6;
     header.flags = CSD_SQL_PLAN_STATUS_LAST_RANGE | CSD_SQL_PLAN_FROZEN_SNAPSHOT |
                    CSD_SQL_PLAN_STAGED_RANGE | CSD_SQL_PLAN_FLASH_SPILL;
+    if (use_fdm_arena)
+        header.flags |= CSD_SQL_PLAN_FDM_ARENA;
     header.output_range = 2;
     header.spill_range = 3;
+    header.operator_range = 4;
+    header.operator_bytes = use_fdm_arena ? 4096 : 0;
     header.plan_id = 0x1234;
-    header.work_mem_bytes = 64; // forces the two-row sort to create Flash runs
+    /* ABI v8 must use the FDM arena rather than this obsolete low threshold. */
+    header.work_mem_bytes = 64;
     header.parallel_workers = 4;
     header.spill_extent_count = 1;
     header.spill_extent_offset = spill_extent_offset;
@@ -457,21 +463,34 @@ void test_heap_pipeline_with_spill()
 
     std::vector<unsigned char> output(4096, 0);
     std::vector<unsigned char> spill(4096, 0);
+    std::vector<unsigned char> operator_arena(4096, 0);
     std::vector<unsigned char> staged_plan = plan;
     std::vector<unsigned char> status_buffer(sizeof(CsdSqlExecutionStatus), 0);
-    void *ranges[] = {left_page.data(), right_page.data(), output.data(), spill.data(),
-                      staged_plan.data(), status_buffer.data()};
-    long long lengths[] = {
-        static_cast<long long>(left_page.size()), static_cast<long long>(right_page.size()),
-        static_cast<long long>(output.size()), static_cast<long long>(spill.size()),
-        static_cast<long long>(staged_plan.size()),
-        static_cast<long long>(status_buffer.size())};
+    std::vector<void *> ranges;
+    std::vector<long long> lengths;
+    ranges.push_back(left_page.data());
+    lengths.push_back(static_cast<long long>(left_page.size()));
+    ranges.push_back(right_page.data());
+    lengths.push_back(static_cast<long long>(right_page.size()));
+    ranges.push_back(output.data());
+    lengths.push_back(static_cast<long long>(output.size()));
+    ranges.push_back(spill.data());
+    lengths.push_back(static_cast<long long>(spill.size()));
+    if (use_fdm_arena) {
+        ranges.push_back(operator_arena.data());
+        lengths.push_back(static_cast<long long>(operator_arena.size()));
+    }
+    const uint32_t plan_range = ranges.size();
+    ranges.push_back(staged_plan.data());
+    lengths.push_back(static_cast<long long>(staged_plan.size()));
+    ranges.push_back(status_buffer.data());
+    lengths.push_back(static_cast<long long>(status_buffer.size()));
     struct cemu_args args = {};
-    args.numr = 6;
-    args.mr_addr = ranges;
-    args.mr_len = lengths;
+    args.numr = ranges.size();
+    args.mr_addr = ranges.data();
+    args.mr_len = lengths.data();
     args.cparam1 = staged_plan.size();
-    args.cparam2 = 4;
+    args.cparam2 = plan_range;
     args.service_context = &spill_nvm;
     args.nvm_write = fake_nvm_write;
 
@@ -493,12 +512,24 @@ void test_heap_pipeline_with_spill()
     assert(status->status_code == CSD_SQL_STATUS_OK);
     assert(status->validated_nodes == 7);
     assert(status->executed_nodes == 7);
-    assert(status->spill_write_bytes > 0);
-    assert(status->flash_write_bytes == status->spill_write_bytes);
-    assert(spill_nvm.writes > 0);
-    uint32_t spill_magic = 0;
-    memcpy(&spill_magic, spill_nvm.bytes.data(), sizeof(spill_magic));
-    assert(spill_magic == UINT32_C(0x4353504c));
+    if (use_fdm_arena) {
+        assert(status->operator_memory_bytes == operator_arena.size());
+        assert(status->operator_peak_bytes > header.work_mem_bytes);
+        assert(status->operator_allocations > 0);
+        assert(status->operator_spill_count == 0);
+        assert(status->spill_write_bytes == 0);
+        assert(status->flash_write_bytes == 0);
+        assert(spill_nvm.writes == 0);
+    } else {
+        assert(status->operator_memory_bytes == header.work_mem_bytes);
+        assert(status->operator_spill_count > 0);
+        assert(status->spill_write_bytes > 0);
+        assert(status->flash_write_bytes == status->spill_write_bytes);
+        assert(spill_nvm.writes > 0);
+        uint32_t spill_magic = 0;
+        memcpy(&spill_magic, spill_nvm.bytes.data(), sizeof(spill_magic));
+        assert(spill_magic == UINT32_C(0x4353504c));
+    }
 }
 
 void test_tpch_expression_and_multikey_pipeline()
@@ -1084,7 +1115,8 @@ void test_postgres_numeric_division_scale()
 int main()
 {
     test_chunked_nvm_scan();
-    test_heap_pipeline_with_spill();
+    test_heap_pipeline_memory_policy(false);
+    test_heap_pipeline_memory_policy(true);
     test_tpch_expression_and_multikey_pipeline();
     test_join_canonicalization_and_residual();
     test_group_only_distinct_aggregate();

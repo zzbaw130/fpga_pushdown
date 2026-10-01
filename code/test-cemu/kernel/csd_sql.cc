@@ -137,7 +137,8 @@ public:
     explicit Engine(struct cemu_args *args)
         : args_(args), plan_data_(NULL), plan_length_(0), plan_from_range_(false), header_(NULL),
           nodes_(NULL), plan_bytes_(0), work_mem_bytes_(0), parallel_workers_(1), spill_offset_(0),
-          spill_run_id_(0), fifo_generation_(0), worker_budget_key_valid_(false), failed_(false)
+          spill_run_id_(0), fifo_generation_(0), operator_memory_capacity_(0),
+          operator_memory_used_(0), worker_budget_key_valid_(false), failed_(false)
     {
         worker_budget_key_valid_ = pthread_key_create(&worker_budget_key_, NULL) == 0;
         std::memset(&status_, 0, sizeof(status_));
@@ -257,6 +258,21 @@ private:
                 header_->fifo_bytes > static_cast<uint64_t>(args_->mr_len[header_->fifo_range_b]))
                 return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, CSD_SQL_INVALID_NODE, 0x301);
         }
+        if (header_->flags & CSD_SQL_PLAN_FDM_ARENA) {
+            if (header_->operator_range == CSD_SQL_INVALID_RANGE ||
+                header_->operator_range >= static_cast<uint32_t>(args_->numr) ||
+                header_->operator_bytes == 0 ||
+                args_->mr_addr[header_->operator_range] == NULL ||
+                args_->mr_len[header_->operator_range] < 0 ||
+                header_->operator_bytes > static_cast<uint64_t>(
+                    args_->mr_len[header_->operator_range]))
+                return fail(CSD_SQL_STATUS_BAD_ABI, CSD_SQL_INVALID_NODE, 0x309);
+            operator_memory_capacity_ = header_->operator_bytes;
+        } else {
+            /* Stand-alone ABI tests retain the pre-v8 work-memory contract. */
+            operator_memory_capacity_ = work_mem_bytes_;
+        }
+        status_.operator_memory_bytes = operator_memory_capacity_;
         nodes_ = reinterpret_cast<const CsdSqlPlanNode *>(static_cast<const char *>(plan_data_) + header_->header_bytes);
         for (uint32_t index = 0; index < header_->node_count; ++index) {
             const CsdSqlPlanNode &node = nodes_[index];
@@ -417,6 +433,43 @@ private:
     {
         if (worker_budget_key_valid_) pthread_setspecific(worker_budget_key_, NULL);
     }
+
+    bool try_acquire_operator_memory(uint64_t bytes)
+    {
+        std::lock_guard<std::mutex> memory_guard(operator_memory_mutex_);
+        if (bytes > operator_memory_capacity_ - operator_memory_used_) return false;
+        operator_memory_used_ += bytes;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.operator_allocations;
+            status_.operator_peak_bytes = std::max<uint64_t>(
+                status_.operator_peak_bytes, operator_memory_used_);
+        }
+        return true;
+    }
+
+    void release_operator_memory(uint64_t bytes)
+    {
+        std::lock_guard<std::mutex> memory_guard(operator_memory_mutex_);
+        if (bytes <= operator_memory_used_) operator_memory_used_ -= bytes;
+        else operator_memory_used_ = 0;
+    }
+
+    class OperatorMemoryLease {
+    public:
+        OperatorMemoryLease(Engine *engine, uint64_t bytes)
+            : engine_(engine), bytes_(bytes), acquired_(
+                engine_->try_acquire_operator_memory(bytes)) {}
+        ~OperatorMemoryLease()
+        {
+            if (acquired_) engine_->release_operator_memory(bytes_);
+        }
+        bool acquired() const { return acquired_; }
+    private:
+        Engine *engine_;
+        uint64_t bytes_;
+        bool acquired_;
+    };
 
     bool execute_node(uint32_t index, Batch *output, std::vector<Batch> &results,
                       const std::vector<uint32_t> &consumers,
@@ -679,6 +732,8 @@ private:
     uint64_t spill_offset_;
     uint32_t spill_run_id_;
     uint32_t fifo_generation_;
+    uint64_t operator_memory_capacity_;
+    uint64_t operator_memory_used_;
     pthread_key_t worker_budget_key_;
     bool worker_budget_key_valid_;
     CsdSqlExecutionStatus status_;
@@ -686,6 +741,7 @@ private:
     std::mutex status_mutex_;
     std::mutex spill_mutex_;
     std::mutex fifo_mutex_;
+    std::mutex operator_memory_mutex_;
 };
 
 } // namespace

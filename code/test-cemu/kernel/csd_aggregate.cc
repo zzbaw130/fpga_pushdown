@@ -243,6 +243,42 @@
             state.distinct.resize(spec->aggregate_count);
             states.push_back(state);
         }
+
+        /* Model the compact FPGA hash-table state rather than charging the
+         * entire input batch. Group keys, accumulators and DISTINCT entries
+         * stay live until result emission completes. */
+        uint64_t aggregate_state_bytes = 0;
+        for (std::vector<AggregateState>::const_iterator state = states.begin();
+             state != states.end(); ++state) {
+            if (!checked_add(aggregate_state_bytes, 64 + state->key.size(),
+                             &aggregate_state_bytes))
+                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
+            for (Row::const_iterator group = state->groups.begin();
+                 group != state->groups.end(); ++group)
+                if (!checked_add(aggregate_state_bytes,
+                                 sizeof(CsdSqlResultCell) + group->bytes.size(),
+                                 &aggregate_state_bytes))
+                    return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
+            uint64_t accumulator_bytes = 0;
+            if (!checked_mul(spec->aggregate_count, UINT64_C(64),
+                             &accumulator_bytes) ||
+                !checked_add(aggregate_state_bytes, accumulator_bytes,
+                             &aggregate_state_bytes))
+                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
+            for (std::vector<std::unordered_set<std::string> >::const_iterator set =
+                     state->distinct.begin(); set != state->distinct.end(); ++set)
+                for (std::unordered_set<std::string>::const_iterator value =
+                         set->begin(); value != set->end(); ++value)
+                    if (!checked_add(aggregate_state_bytes,
+                                     sizeof(uint64_t) + value->size(),
+                                     &aggregate_state_bytes))
+                        return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
+        }
+        OperatorMemoryLease aggregate_memory(this, aggregate_state_bytes);
+        const bool spill_aggregate = !aggregate_memory.acquired();
+        if (spill_aggregate && !(node.flags & CSD_SQL_NODE_SPILLABLE))
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+
         output->columns = spec->group_count + spec->aggregate_count;
         for (std::vector<AggregateState>::const_iterator state = states.begin(); state != states.end(); ++state) {
             Row result = state->groups;
@@ -314,7 +350,7 @@
             }
             output->rows.push_back(std::move(result));
         }
-        if (!spill_if_needed(index, node, *output)) return false;
+        if (spill_aggregate && !spill_batch(index, *output)) return false;
         if (project_node != NULL) add_cycles(input.rows.size(), *project_node);
         add_cycles(input.rows.size() * 2 + output->rows.size(), node);
         return true;

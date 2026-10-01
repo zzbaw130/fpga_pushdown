@@ -26,7 +26,8 @@
 
     bool spill_if_needed(uint32_t index, const CsdSqlPlanNode &node, const Batch &batch)
     {
-        if (batch_bytes(batch) <= work_mem_bytes_) return true;
+        OperatorMemoryLease memory(this, batch_bytes(batch));
+        if (memory.acquired()) return true;
         if (!(node.flags & CSD_SQL_NODE_SPILLABLE)) return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
         return spill_batch(index, batch);
     }
@@ -200,6 +201,7 @@
         {
             std::lock_guard<std::mutex> status_guard(status_mutex_);
             status_.spill_write_bytes += total_bytes;
+            ++status_.operator_spill_count;
         }
         return true;
     }

@@ -168,8 +168,8 @@ _PG_init(void)
 						&csd_program_runtime, 0, 0, INT_MAX, PGC_USERSET, 0,
 						NULL, NULL, NULL);
 	DefineCustomIntVariable("csd.device_work_mem_mb",
-						"Functional-model memory threshold before spill.", NULL,
-						&csd_device_work_mem_mb, 512, 0, INT_MAX, PGC_USERSET, 0,
+						"Optional cap for the query-level FDM operator arena; zero uses all remaining FDM.", NULL,
+						&csd_device_work_mem_mb, 0, 0, INT_MAX, PGC_USERSET, 0,
 						NULL, NULL, NULL);
 	DefineCustomBoolVariable("csd.profile", "Report CSD functional-model time by operator.", NULL,
 						 &csd_profile, false, PGC_USERSET, 0,
@@ -313,7 +313,7 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	ExplainPropertyInteger("CSD SubPlan Rewrites", NULL,
 						   intVal(list_nth(scan->custom_private, 13)), es);
 	ExplainPropertyText("CSD Wire Status",
-		"ABI v7 FDM-FIFO/chunked-scan/Flash-spill operator descriptors", es);
+		"ABI v8 FDM-arena/FDM-FIFO/chunked-scan/Flash-spill operator descriptors", es);
 	ExplainPropertyText("CSD Transport", "NVMe Program Execute", es);
 }
 

@@ -113,6 +113,7 @@ static int fdmfs_fill_super(struct super_block *sb, void *data, int silent)
 	// add free region
 	INIT_LIST_HEAD(&sbi->fdm_free);
 	INIT_LIST_HEAD(&sbi->fdm_used);
+	mutex_init(&sbi->fdm_lock);
 	region = kzalloc(sizeof(struct fdm_region), GFP_KERNEL);
 	region->inode = NULL;
 	region->off = 0;

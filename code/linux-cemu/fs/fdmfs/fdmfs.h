@@ -3,6 +3,7 @@
 
 #include <linux/list.h>
 #include <linux/fs.h>
+#include <linux/mutex.h>
 #include <linux/nvme.h>
 
 #define FDMFS_BLKSIZE		512
@@ -42,6 +43,7 @@ struct fdmfs_sb_info {
 	size_t fdm_size;
 	struct list_head fdm_free;
 	struct list_head fdm_used;
+	struct mutex fdm_lock;
 	dev_t cemu_dev;
 	struct block_device *cemu_bdev;
 	struct fdmfs_inode *root_inode;

@@ -124,32 +124,53 @@ void fdmfs_deallocate(struct fdmfs_inode *inode)
 {
 	struct fdmfs_sb_info *sbi = inode->sbi;
 	struct fdm_region *region = inode->region;
-	struct fdm_region *r;
+	struct fdm_region *r, *previous = NULL, *next = NULL;
+	bool inserted = false;
 
 	if (region == NULL)
 		return;
 
+	mutex_lock(&sbi->fdm_lock);
+
+	/* Keep the free list ordered by address.  The previous implementation
+	 * only coalesced a released region with a free region on its right and
+	 * contained an impossible overflow comparison in place of ordered
+	 * insertion.  Releasing query-local CSD ranges therefore fragmented the
+	 * whole FDM pool after a single query. */
 	list_for_each_entry(r, &sbi->fdm_free, list) {
-		if (region->off + region->size == r->off) {
-			r->size += region->size;
-			r->off -= region->size;
-			list_del(&region->list);
-			kfree(region);
-			goto out;
-		} else if (region->off + region->size < region->off) {
+		if (region->off < r->off) {
 			list_del(&region->list);
 			list_add_tail(&region->list, &r->list);
-			goto out;
+			inserted = true;
+			break;
 		}
 	}
+	if (!inserted) {
+		list_del(&region->list);
+		list_add_tail(&region->list, &sbi->fdm_free);
+	}
 
-	list_del(&region->list);
-	list_add_tail(&region->list, &sbi->fdm_free);
+	if (region->list.prev != &sbi->fdm_free)
+		previous = list_prev_entry(region, list);
+	if (previous != NULL &&
+	    previous->off + previous->size == region->off) {
+		previous->size += region->size;
+		list_del(&region->list);
+		kfree(region);
+		region = previous;
+	}
 
-out:
+	if (region->list.next != &sbi->fdm_free)
+		next = list_next_entry(region, list);
+	if (next != NULL && region->off + region->size == next->off) {
+		region->size += next->size;
+		list_del(&next->list);
+		kfree(next);
+	}
+
 	inode->region = NULL;
 	i_size_write(inode->inode, 0);
-	return;
+	mutex_unlock(&sbi->fdm_lock);
 }
 
 static long fdmfs_fallocate(struct file *filp, int mode,
@@ -196,6 +217,8 @@ static long fdmfs_fallocate(struct file *filp, int mode,
 	if (ret)
 		goto err;
 
+	mutex_lock(&sbi->fdm_lock);
+
 	// find free region with equal size first
 	list_for_each_entry(region, &sbi->fdm_free, list) {
 		if (region->size == length) {
@@ -208,6 +231,10 @@ static long fdmfs_fallocate(struct file *filp, int mode,
 	list_for_each_entry(region, &sbi->fdm_free, list) {
 		if (region->size > length) {
 			new_region = kzalloc(sizeof(struct fdm_region), GFP_KERNEL);
+			if (new_region == NULL) {
+				ret = -ENOMEM;
+				goto unlock;
+			}
 			new_region->off = region->off;
 			new_region->size = length;
 			region->size -= length;
@@ -217,16 +244,20 @@ static long fdmfs_fallocate(struct file *filp, int mode,
 	}
 
 	ret = -ENOMEM;
-	goto err;
+	goto unlock;
 out:
 	list_add(&new_region->list, &sbi->fdm_used);
 	FDMFS_I(inode)->region = new_region;
+	mutex_unlock(&sbi->fdm_lock);
 	if (!(mode & FALLOC_FL_KEEP_SIZE)) {
 		i_size_write(inode, length);
 		inode->i_blocks = (length+(1<<inode->i_blkbits)-1) >> inode->i_blkbits;
 	}
 	inode_set_ctime_current(inode);
 	pr_info("FDMFS: fallocate success, inode size %lld\n", filp->f_inode->i_size);
+	goto err;
+unlock:
+	mutex_unlock(&sbi->fdm_lock);
 err:
 	inode_unlock(inode);
 	return ret;

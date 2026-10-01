@@ -30,7 +30,8 @@
         output->columns = input.columns;
         const size_t input_rows = input.rows.size();
         const uint64_t input_bytes = batch_bytes(input);
-        if (input_bytes <= work_mem_bytes_) {
+        OperatorMemoryLease sort_memory(this, input_bytes);
+        if (sort_memory.acquired()) {
             if (consume_input) output->rows.swap(input.rows);
             else output->rows = input.rows;
             std::stable_sort(output->rows.begin(), output->rows.end(), [spec, keys](const Row &left, const Row &right) {
@@ -39,7 +40,8 @@
         } else {
             if (!(node.flags & CSD_SQL_NODE_SPILLABLE)) return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
             const uint64_t average_row_bytes = input.rows.empty() ? 1 : std::max<uint64_t>(1, input_bytes / input.rows.size());
-            const size_t run_rows = std::max<size_t>(1, work_mem_bytes_ / average_row_bytes);
+            const size_t run_rows = std::max<size_t>(1,
+                operator_memory_capacity_ / average_row_bytes);
             std::vector<std::vector<Row> > runs;
             for (size_t start = 0; start < input.rows.size(); start += run_rows) {
                 const size_t end = std::min(input.rows.size(), start + run_rows);

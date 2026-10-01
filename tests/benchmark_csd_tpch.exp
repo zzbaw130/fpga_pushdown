@@ -62,12 +62,12 @@ proc restart_postgres {pg_os_user pg_ctl pgdata} {
 set failures 0
 foreach query {1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22} {
     if {$query == 15} {
-        send "$psql -X -q -h $socket_dir -p $port -U $database_user -d $database -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1\r"
+        send "$psql -X -q -h $socket_dir -p $port -U $database_user -d $database -c 'SET default_transaction_read_only=off' -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1\r"
         expect "*# "
     }
 
     restart_postgres $pg_os_user $pg_ctl $pgdata
-    set csd_setup "LOAD 'csd_pg'; SET csd.shared_library='$shared_library'; SET csd.exe_path='csd'; SET csd.parallel_workers=$workers; SET csd.profile=off; SET csd.program_runtime=0;"
+    set csd_setup "SET default_transaction_read_only=off; LOAD 'csd_pg'; SET csd.shared_library='$shared_library'; SET csd.exe_path='csd'; SET csd.parallel_workers=$workers; SET csd.profile=off; SET csd.program_runtime=0;"
     set csd_started [clock milliseconds]
     send "sync; echo 3 > /proc/sys/vm/drop_caches; $psql -X -q -v ON_ERROR_STOP=1 -h $socket_dir -p $port -U $database_user -d $database -c \"$csd_setup\" -f $query_dir/$query.sql > /tmp/csd-bench-q$query-csd.raw 2>&1; echo __CSD__:\$?\r"
     expect {
@@ -80,12 +80,12 @@ foreach query {1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22} {
     expect "*# "
 
     if {$query == 15} {
-        send "$psql -X -q -h $socket_dir -p $port -U $database_user -d $database -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1\r"
+        send "$psql -X -q -h $socket_dir -p $port -U $database_user -d $database -c 'SET default_transaction_read_only=off' -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1\r"
         expect "*# "
     }
 
     restart_postgres $pg_os_user $pg_ctl $pgdata
-    set host_setup "LOAD 'csd_pg'; SET csd.exe_path='host';"
+    set host_setup "SET default_transaction_read_only=off; LOAD 'csd_pg'; SET csd.exe_path='host';"
     set host_started [clock milliseconds]
     send "sync; echo 3 > /proc/sys/vm/drop_caches; $psql -X -q -v ON_ERROR_STOP=1 -h $socket_dir -p $port -U $database_user -d $database -c \"$host_setup\" -f $query_dir/$query.sql > /tmp/csd-bench-q$query-host.raw 2>&1; echo __HOST__:\$?\r"
     expect {
@@ -98,7 +98,7 @@ foreach query {1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22} {
     expect "*# "
 
     if {$query == 15} {
-        send "$psql -X -q -h $socket_dir -p $port -U $database_user -d $database -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1\r"
+        send "$psql -X -q -h $socket_dir -p $port -U $database_user -d $database -c 'SET default_transaction_read_only=off' -c 'DROP VIEW IF EXISTS revenue0' >/dev/null 2>&1\r"
         expect "*# "
     }
 
