@@ -67,10 +67,12 @@ pairs back through the spill staging range for stable merge passes. Oversized
 Hash Join build sides radix-partition both inputs and replay one partition pair
 at a time; probe ordinals preserve deterministic output order. The current
 functional executor still stores decoded tuple payloads and partition-formation
-buffers in C++ `Batch` objects, while Aggregate retains its state after a spill
-protection copy. Arena leases enforce the modeled CSD capacity, but end-to-end
-physical memory becomes hard-bounded only after scan/partition streaming and
-Aggregate replay use arena-backed state.
+buffers in C++ `Batch` objects. Oversized grouped Aggregate state now
+radix-partitions input by the complete group key and replays each partition,
+including grouped DISTINCT and AVG; global Aggregate retains its protection
+copy. Arena leases enforce the modeled CSD capacity, but end-to-end physical
+memory becomes hard-bounded only after scan/partition streaming and incremental
+arena-backed state replace the initial full C++ state build.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

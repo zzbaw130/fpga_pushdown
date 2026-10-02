@@ -645,6 +645,7 @@ void test_tpch_expression_and_multikey_pipeline()
     nodes[2].expression_length = sizeof(project) + project.instruction_count * sizeof(CsdSqlExpressionInstruction);
 
     nodes[3].left_input = 2;
+    nodes[3].flags = CSD_SQL_NODE_BLOCKING | CSD_SQL_NODE_SPILLABLE;
     CsdSqlAggregateSpec aggregate = {};
     aggregate.group_count = 3;
     aggregate.aggregate_count = 5;
@@ -695,7 +696,9 @@ void test_tpch_expression_and_multikey_pipeline()
     header.output_range = 1;
     header.spill_range = 2;
     header.parallel_workers = 4;
-    header.work_mem_bytes = 1U << 20;
+    /* Two grouped DISTINCT states exceed this budget, while each replay
+     * partition fits and must reacquire the bounded aggregate lease. */
+    header.work_mem_bytes = 640;
     overwrite(&plan, 0, header);
     for (uint32_t node = 0; node < nodes.size(); ++node)
         overwrite(&plan, sizeof(header) + node * sizeof(CsdSqlPlanNode), nodes[node]);
@@ -723,6 +726,11 @@ void test_tpch_expression_and_multikey_pipeline()
     assert(cells[8].integer == 1 && cells[9].integer == 2 && cells[10].integer == 1995);
     assert(cells[11].integer == 40 && cells[12].integer == 1 && cells[13].integer == 20);
     assert(cells[14].integer == 20 && cells[15].integer == 20);
+    const CsdSqlExecutionStatus *execution =
+        reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
+    assert(execution->spill_write_bytes > 0);
+    assert(execution->spill_read_bytes > 0);
+    assert(execution->operator_allocations > 0);
 }
 
 void test_join_canonicalization_and_residual()

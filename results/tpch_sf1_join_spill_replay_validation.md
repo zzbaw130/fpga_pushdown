@@ -62,6 +62,7 @@ is exactly the two base relation sizes plus the replayed partition bytes.
 The original decoded inputs and the first-generation radix partition buffers
 are still C++ `Batch` objects, so partition creation temporarily duplicates
 rows before their handles replace those buffers. A streaming partition writer
-is required for a physical hard bound at SF=32. Aggregate partition replay and
-arena-backed operator data structures also remain future work. Extreme skew
-that cannot produce an arena-sized build partition is rejected explicitly.
+is required for a physical hard bound at SF=32. Grouped Aggregate replay was
+implemented in the following milestone, but incremental arena-backed state is
+still required. Extreme skew that cannot produce an arena-sized build
+partition is rejected explicitly.

@@ -37,9 +37,100 @@
 		return scale <= 36 ? static_cast<int16_t>(scale) : -1;
 	}
 
+    /* Partition complete groups by their canonical key. Every row for one
+     * group lands in exactly one record, so DISTINCT and AVG remain local to
+     * a replay partition and partial-state combination is unnecessary. */
+    bool execute_partitioned_aggregate(uint32_t index, const CsdSqlPlanNode &node,
+                                       const Batch &input, Batch *output,
+                                       const CsdSqlPlanNode *project_node,
+                                       const CsdSqlAggregateSpec &spec,
+                                       const std::vector<uint16_t> &group_columns,
+                                       uint64_t aggregate_state_bytes,
+                                       uint8_t radix_shift)
+    {
+        const uint64_t capacity = std::max<uint64_t>(1, operator_memory_capacity_);
+        const uint64_t required_partitions = aggregate_state_bytes == 0 ? 1 :
+            1 + (aggregate_state_bytes - 1) / capacity;
+        const size_t max_partitions = size_t(1) << 16;
+        size_t partition_count = 2;
+        while (partition_count < required_partitions &&
+               partition_count < max_partitions)
+            partition_count <<= 1;
+        if (partition_count < required_partitions)
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x501);
+        uint8_t radix_bits = 0;
+        for (size_t count = partition_count; count > 1; count >>= 1)
+            ++radix_bits;
+        if (radix_shift >= sizeof(size_t) * 8 ||
+            radix_bits > sizeof(size_t) * 8 - radix_shift)
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x503);
+
+        const CsdSqlExpressionSpec *project_spec = NULL;
+        const CsdSqlExpressionInstruction *project_instructions = NULL;
+        if (project_node != NULL &&
+            !expression_program(project_node->node_id,
+                                project_node->expression_offset,
+                                project_node->expression_length,
+                                &project_spec, &project_instructions))
+            return false;
+        (void) project_instructions;
+
+        std::vector<Batch> partitions(partition_count);
+        for (size_t partition = 0; partition < partition_count; ++partition)
+            partitions[partition].columns = input.columns;
+        Row projected_row;
+        std::vector<EvalValue> expression_stack;
+        if (project_spec != NULL) projected_row.reserve(project_spec->output_count);
+        for (std::vector<Row>::const_iterator source = input.rows.begin();
+             source != input.rows.end(); ++source) {
+            const Row *row = &*source;
+            if (project_spec != NULL) {
+                if (!evaluate_expression(project_node->node_id,
+                        project_node->expression_offset,
+                        project_node->expression_length, *source, NULL,
+                        &projected_row, &expression_stack))
+                    return false;
+                row = &projected_row;
+            }
+            const std::string key = group_key(*row, group_columns.data(),
+                                              spec.group_count);
+            const size_t partition =
+                (std::hash<std::string>()(key) >> radix_shift) &
+                (partition_count - 1);
+            partitions[partition].rows.push_back(*source);
+        }
+
+        std::vector<SpillHandle> handles(partition_count);
+        for (size_t partition = 0; partition < partition_count; ++partition) {
+            if (!spill_batch(index, partitions[partition], &handles[partition]))
+                return false;
+            std::vector<Row>().swap(partitions[partition].rows);
+        }
+        std::vector<Batch>().swap(partitions);
+
+        output->columns = spec.group_count + spec.aggregate_count;
+        for (size_t partition = 0; partition < partition_count; ++partition) {
+            Batch restored, partial;
+            if (!read_spill_batch(index, handles[partition], &restored) ||
+                !execute_aggregate(index, node, restored, &partial,
+                                   project_node, true,
+                                   static_cast<uint8_t>(radix_shift + radix_bits)))
+                return false;
+            output->rows.insert(output->rows.end(),
+                std::make_move_iterator(partial.rows.begin()),
+                std::make_move_iterator(partial.rows.end()));
+        }
+        uint64_t partition_work = 0;
+        if (!checked_mul(input.rows.size(), 2, &partition_work))
+            partition_work = std::numeric_limits<uint64_t>::max();
+        add_cycles(partition_work, node);
+        return true;
+    }
+
     /* Blocking banked hash aggregate with multi-key and DISTINCT state. */
     bool execute_aggregate(uint32_t index, const CsdSqlPlanNode &node, const Batch &input,
-                           Batch *output, const CsdSqlPlanNode *project_node = NULL)
+                           Batch *output, const CsdSqlPlanNode *project_node = NULL,
+                           bool allow_partition = true, uint8_t radix_shift = 0)
     {
         const CsdSqlAggregateSpec *spec = NULL;
         if (!expression_as(node, sizeof(CsdSqlAggregateSpec), &spec) ||
@@ -248,8 +339,10 @@
          * entire input batch. Group keys, accumulators and DISTINCT entries
          * stay live until result emission completes. */
         uint64_t aggregate_state_bytes = 0;
+        uint64_t largest_aggregate_state_bytes = 0;
         for (std::vector<AggregateState>::const_iterator state = states.begin();
              state != states.end(); ++state) {
+            const uint64_t state_begin = aggregate_state_bytes;
             if (!checked_add(aggregate_state_bytes, 64 + state->key.size(),
                              &aggregate_state_bytes))
                 return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
@@ -273,11 +366,32 @@
                                      sizeof(uint64_t) + value->size(),
                                      &aggregate_state_bytes))
                         return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
+            largest_aggregate_state_bytes = std::max<uint64_t>(
+                largest_aggregate_state_bytes,
+                aggregate_state_bytes - state_begin);
         }
-        OperatorMemoryLease aggregate_memory(this, aggregate_state_bytes);
+        OperatorMemoryLease aggregate_memory(this, aggregate_state_bytes,
+                                              !allow_partition || radix_shift != 0);
         const bool spill_aggregate = !aggregate_memory.acquired();
         if (spill_aggregate && !(node.flags & CSD_SQL_NODE_SPILLABLE))
             return fail(CSD_SQL_STATUS_UNSUPPORTED, index);
+        if (spill_aggregate && allow_partition && spec->group_count != 0) {
+            if (largest_aggregate_state_bytes > operator_memory_capacity_)
+                return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x504);
+            for (size_t tile = 0; tile < local_maps.size(); ++tile) {
+                std::unordered_map<std::string, size_t>().swap(local_maps[tile]);
+                std::vector<AggregateState>().swap(local_states[tile]);
+            }
+            std::vector<std::unordered_map<std::string, size_t> >().swap(local_maps);
+            std::vector<std::vector<AggregateState> >().swap(local_states);
+            std::unordered_map<std::string, size_t>().swap(group_map);
+            std::vector<AggregateState>().swap(states);
+            return execute_partitioned_aggregate(index, node, input, output,
+                project_node, *spec, group_columns, aggregate_state_bytes,
+                radix_shift);
+        }
+        if (spill_aggregate && !allow_partition)
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x502);
 
         output->columns = spec->group_count + spec->aggregate_count;
         for (std::vector<AggregateState>::const_iterator state = states.begin(); state != states.end(); ++state) {

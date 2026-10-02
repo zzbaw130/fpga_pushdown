@@ -90,7 +90,7 @@ CEMU:
 | Operator | Functional model | Blocking / spill rule |
 | --- | --- | --- |
 | Filter, project | SIMD-like lanes executing bounded expression bytecode | Never blocks; output compacts valid lanes |
-| Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state | Arena capacity is checked; partition/replay remains required for a physical hard bound |
+| Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state | Oversized grouped state radix-partitions input rows by the complete group key and replays each partition |
 | Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE | An intrinsically oversized build side radix-partitions both inputs to Flash and replays one matching pair at a time |
 | Sort | multi-key bounded run generation followed by stable merge passes | Input takes an arena lease; failed allocation writes runs to Flash, retains only handles, and reads pairs back for stable merge |
 
@@ -162,11 +162,19 @@ arena wait on its condition variable when an independent DAG branch currently
 holds capacity, so parallel blocking operators serialize at the memory
 boundary instead of failing spuriously.
 
+Grouped Aggregate uses the same handle/replay infrastructure. All rows for a
+group are assigned to one radix partition, so `DISTINCT` sets and AVG's
+sum/count pair never require cross-partition reconciliation. Hash collisions
+are resolved recursively with later hash bits. Every replayed state must fit
+and wait for an arena lease; a single group larger than the arena is rejected.
+Global aggregates currently retain the protection-copy path.
+
 The implementation is still not a proof of a hard controller-memory bound:
 scans accumulate decoded `Batch` objects, radix partition formation currently
-duplicates rows in C++ before they are serialized, and Aggregate retains its
-state after a protection copy. The spill range itself is only a reusable FDM
-staging window; serialized records reside in real NVM scratch extents.
+duplicates rows in C++ before they are serialized, and Aggregate first builds
+the complete state to measure it before switching to replay. The spill range
+itself is only a reusable FDM staging window; serialized records reside in real
+NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and
 `spill_read_bytes` with the bytes actually fetched.

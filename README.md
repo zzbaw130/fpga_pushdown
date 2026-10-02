@@ -154,6 +154,8 @@ cd /mnt/cemu
 [SF=1 Sort spill replay 验证](results/tpch_sf1_sort_spill_replay_validation.md)。
 Hash Join 的 radix 分区、Flash replay 和低内存 build lease 记录在
 [SF=1 Join spill replay 验证](results/tpch_sf1_join_spill_replay_validation.md)。
+分组 Aggregate（含 grouped `DISTINCT`/`AVG`）的递归 radix replay 记录在
+[SF=1 Aggregate spill replay 验证](results/tpch_sf1_aggregate_spill_replay_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD
