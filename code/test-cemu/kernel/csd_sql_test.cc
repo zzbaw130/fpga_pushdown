@@ -523,6 +523,9 @@ void test_heap_pipeline_memory_policy(bool use_fdm_arena)
         assert(spill_nvm.writes == 0);
     } else {
         assert(status->operator_memory_bytes == header.work_mem_bytes);
+        /* The oversized build side is radix-partitioned, replayed, and each
+         * reconstructed build partition obtains its own bounded lease. */
+        assert(status->operator_allocations > 0);
         assert(status->operator_spill_count > 0);
         assert(status->spill_write_bytes > 0);
         assert(status->spill_read_bytes > 0);
@@ -742,6 +745,8 @@ void test_join_canonicalization_and_residual()
     nodes.push_back(make_node(4, CSD_SQL_OP_NL_JOIN));
     nodes.push_back(make_node(5, CSD_SQL_OP_HASH_JOIN));
     nodes.push_back(make_node(6, CSD_SQL_OP_HASH_JOIN));
+    for (size_t node = 2; node < nodes.size(); ++node)
+        nodes[node].flags = CSD_SQL_NODE_BLOCKING | CSD_SQL_NODE_SPILLABLE;
 
     CsdSqlExpressionSpec residual = {};
     residual.output_count = 1; residual.instruction_count = 4; residual.max_stack = 2;
@@ -808,12 +813,14 @@ void test_join_canonicalization_and_residual()
     header.root_node = 4;
     header.flags = CSD_SQL_PLAN_STATUS_LAST_RANGE | CSD_SQL_PLAN_FROZEN_SNAPSHOT |
                    CSD_SQL_PLAN_STAGED_RANGE;
-    header.output_range = 2; header.spill_range = 3; header.parallel_workers = 4;
-    header.work_mem_bytes = 1U << 20;
+    header.output_range = 2; header.spill_range = 3; header.parallel_workers = 1;
+    /* Force merge/hash joins through partition replay while retaining the
+     * nested-loop compatibility spill and the residual predicate checks. */
+    header.work_mem_bytes = 64;
     overwrite(&plan, 0, header);
     for (uint32_t node = 0; node < nodes.size(); ++node)
         overwrite(&plan, sizeof(header) + node * sizeof(CsdSqlPlanNode), nodes[node]);
-    std::vector<unsigned char> output(4096, 0), spill(4096, 0), status(sizeof(CsdSqlExecutionStatus), 0);
+    std::vector<unsigned char> output(4096, 0), spill(16384, 0), status(sizeof(CsdSqlExecutionStatus), 0);
     void *ranges[] = {left_page.data(), right_page.data(), output.data(), spill.data(), plan.data(), status.data()};
     long long lengths[] = {static_cast<long long>(left_page.size()), static_cast<long long>(right_page.size()),
                            static_cast<long long>(output.size()), static_cast<long long>(spill.size()),

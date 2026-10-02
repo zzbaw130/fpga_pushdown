@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
@@ -456,18 +457,39 @@ private:
         return true;
     }
 
+    bool wait_acquire_operator_memory(uint64_t bytes)
+    {
+        std::unique_lock<std::mutex> memory_guard(operator_memory_mutex_);
+        if (bytes > operator_memory_capacity_) return false;
+        operator_memory_available_.wait(memory_guard, [this, bytes]() {
+            return bytes <= operator_memory_capacity_ - operator_memory_used_;
+        });
+        operator_memory_used_ += bytes;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.operator_allocations;
+            status_.operator_peak_bytes = std::max<uint64_t>(
+                status_.operator_peak_bytes, operator_memory_used_);
+        }
+        return true;
+    }
+
     void release_operator_memory(uint64_t bytes)
     {
-        std::lock_guard<std::mutex> memory_guard(operator_memory_mutex_);
-        if (bytes <= operator_memory_used_) operator_memory_used_ -= bytes;
-        else operator_memory_used_ = 0;
+        {
+            std::lock_guard<std::mutex> memory_guard(operator_memory_mutex_);
+            if (bytes <= operator_memory_used_) operator_memory_used_ -= bytes;
+            else operator_memory_used_ = 0;
+        }
+        operator_memory_available_.notify_all();
     }
 
     class OperatorMemoryLease {
     public:
-        OperatorMemoryLease(Engine *engine, uint64_t bytes)
+        OperatorMemoryLease(Engine *engine, uint64_t bytes, bool wait = false)
             : engine_(engine), bytes_(bytes), acquired_(
-                engine_->try_acquire_operator_memory(bytes)) {}
+                wait ? engine_->wait_acquire_operator_memory(bytes) :
+                       engine_->try_acquire_operator_memory(bytes)) {}
         ~OperatorMemoryLease()
         {
             if (acquired_) engine_->release_operator_memory(bytes_);
@@ -750,6 +772,7 @@ private:
     std::mutex spill_mutex_;
     std::mutex fifo_mutex_;
     std::mutex operator_memory_mutex_;
+    std::condition_variable operator_memory_available_;
 };
 
 } // namespace

@@ -152,6 +152,8 @@ cd /mnt/cemu
 回收数据记录在 [SF=1 FDM arena 验证](results/tpch_sf1_fdm_arena_validation.md)。
 外部 Sort 的 Flash run 写入、真实读回和稳定归并记录在
 [SF=1 Sort spill replay 验证](results/tpch_sf1_sort_spill_replay_validation.md)。
+Hash Join 的 radix 分区、Flash replay 和低内存 build lease 记录在
+[SF=1 Join spill replay 验证](results/tpch_sf1_join_spill_replay_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD

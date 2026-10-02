@@ -91,7 +91,7 @@ CEMU:
 | --- | --- | --- |
 | Filter, project | SIMD-like lanes executing bounded expression bytecode | Never blocks; output compacts valid lanes |
 | Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state | Arena capacity is checked; partition/replay remains required for a physical hard bound |
-| Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE | Build batch takes an arena lease; failure triggers spill, while radix replay remains future work |
+| Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE | An intrinsically oversized build side radix-partitions both inputs to Flash and replays one matching pair at a time |
 | Sort | multi-key bounded run generation followed by stable merge passes | Input takes an arena lease; failed allocation writes runs to Flash, retains only handles, and reads pairs back for stable merge |
 
 The choices follow the streaming filter/project and hash GQE direction in the
@@ -149,14 +149,27 @@ operator output. Top-N sorts truncate every run and merge result to N rows,
 which bounds their Flash traffic without changing the global top-N result.
 Spill records and every read are range-checked before deserialization.
 
-The current aggregate/join model also serializes oversized blocking state but
-does not yet replay radix partitions. The implementation is therefore not yet
-a proof of a hard controller-memory bound: scans still accumulate decoded
-`Batch` objects and join/aggregate C++ state is retained after its protection
-copy. The spill range itself is only a reusable FDM staging window; serialized
-records reside in real NVM scratch extents. `flash_write_bytes` and
-`spill_write_bytes` count backend writes, while Sort replay increments both
-`flash_read_bytes` and `spill_read_bytes` with the bytes actually fetched.
+An oversized equi-join uses power-of-two radix partitions. Both build and probe
+rows are serialized to Flash, only partition handles survive the write phase,
+and each matching pair is read back before a bounded build/probe pass. A hidden
+probe ordinal is removed after replay and used to restore the original probe
+order; residual predicates see only the logical columns. NULL join keys retain
+the correct INNER/LEFT/SEMI/ANTI semantics. A single build row larger than the
+arena, or an unresolvable skew partition, is rejected explicitly instead of
+silently claiming a bound. Nested loops and transient contention retain the
+older protection-copy compatibility path. Replayed partitions that fit the
+arena wait on its condition variable when an independent DAG branch currently
+holds capacity, so parallel blocking operators serialize at the memory
+boundary instead of failing spuriously.
+
+The implementation is still not a proof of a hard controller-memory bound:
+scans accumulate decoded `Batch` objects, radix partition formation currently
+duplicates rows in C++ before they are serialized, and Aggregate retains its
+state after a protection copy. The spill range itself is only a reusable FDM
+staging window; serialized records reside in real NVM scratch extents.
+`flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
+and Hash Join replay increment both `flash_read_bytes` and
+`spill_read_bytes` with the bytes actually fetched.
 
 ## Timing model
 

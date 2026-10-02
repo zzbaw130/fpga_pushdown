@@ -51,8 +51,8 @@ spill bytes. The forced-CSD result matched the HOST result byte for byte.
 
 ## Remaining boundary
 
-Hash Join and Aggregate still write protection copies when an arena lease
-fails; they do not yet release and replay partition state. Scan output is also
-materialized as a C++ `Batch` before a blocking consumer. Consequently this
-milestone establishes genuine Sort I/O and replay semantics, but it is not yet
+At this Sort milestone, Hash Join and Aggregate still wrote protection copies
+when an arena lease failed. Hash Join replay was implemented in the following
+milestone; Aggregate and fully streamed scan/partition buffers remain. This
+result therefore establishes genuine Sort I/O and replay semantics, but is not
 the final SF=32 hard-memory-bound claim.
