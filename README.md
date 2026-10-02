@@ -150,6 +150,8 @@ cd /mnt/cemu
 不是最终性能结论；正式性能实验仍需固定 cache 状态、CEMU runtime 参数和
 主机墙钟/模拟时钟口径。ABI v8 operator arena、Q8 零 spill 以及 FDMFS 跨查询
 回收数据记录在 [SF=1 FDM arena 验证](results/tpch_sf1_fdm_arena_validation.md)。
+外部 Sort 的 Flash run 写入、真实读回和稳定归并记录在
+[SF=1 Sort spill replay 验证](results/tpch_sf1_sort_spill_replay_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD

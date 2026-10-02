@@ -492,6 +492,7 @@ void test_heap_pipeline_memory_policy(bool use_fdm_arena)
     args.cparam1 = staged_plan.size();
     args.cparam2 = plan_range;
     args.service_context = &spill_nvm;
+    args.nvm_read = fake_nvm_read;
     args.nvm_write = fake_nvm_write;
 
     const long long execution_result = csd_sql(&args);
@@ -524,8 +525,11 @@ void test_heap_pipeline_memory_policy(bool use_fdm_arena)
         assert(status->operator_memory_bytes == header.work_mem_bytes);
         assert(status->operator_spill_count > 0);
         assert(status->spill_write_bytes > 0);
+        assert(status->spill_read_bytes > 0);
         assert(status->flash_write_bytes == status->spill_write_bytes);
+        assert(status->flash_read_bytes == status->spill_read_bytes);
         assert(spill_nvm.writes > 0);
+        assert(spill_nvm.reads > 0);
         uint32_t spill_magic = 0;
         memcpy(&spill_magic, spill_nvm.bytes.data(), sizeof(spill_magic));
         assert(spill_magic == UINT32_C(0x4353504c));

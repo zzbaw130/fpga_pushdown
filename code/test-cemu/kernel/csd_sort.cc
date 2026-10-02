@@ -42,42 +42,61 @@
             const uint64_t average_row_bytes = input.rows.empty() ? 1 : std::max<uint64_t>(1, input_bytes / input.rows.size());
             const size_t run_rows = std::max<size_t>(1,
                 operator_memory_capacity_ / average_row_bytes);
-            std::vector<std::vector<Row> > runs;
+            std::vector<SpillHandle> runs;
             for (size_t start = 0; start < input.rows.size(); start += run_rows) {
                 const size_t end = std::min(input.rows.size(), start + run_rows);
-                std::vector<Row> run(input.rows.begin() + start, input.rows.begin() + end);
-                std::stable_sort(run.begin(), run.end(), [spec, keys](const Row &left, const Row &right) {
+                Batch run;
+                run.columns = input.columns;
+                run.rows.assign(input.rows.begin() + start, input.rows.begin() + end);
+                std::stable_sort(run.rows.begin(), run.rows.end(), [spec, keys](const Row &left, const Row &right) {
                     return sort_less(left, right, keys, spec->key_count);
                 });
-                Batch spilled;
-                spilled.columns = input.columns;
-                spilled.rows = run;
-                if (!spill_batch(index, spilled)) return false;
-                runs.push_back(std::move(run));
+                if (spec->top_n != 0 && run.rows.size() > spec->top_n)
+                    run.rows.resize(spec->top_n);
+                SpillHandle handle;
+                if (!spill_batch(index, run, &handle)) return false;
+                runs.push_back(handle);
+            }
+            if (consume_input) {
+                std::vector<Row> released;
+                input.rows.swap(released);
             }
             while (runs.size() > 1) {
-                std::vector<std::vector<Row> > merged_runs;
+                std::vector<SpillHandle> merged_runs;
                 for (size_t run = 0; run < runs.size(); run += 2) {
-                    if (run + 1 == runs.size()) { merged_runs.push_back(std::move(runs[run])); continue; }
-                    std::vector<Row> merged;
-                    merged.reserve(runs[run].size() + runs[run + 1].size());
-                    size_t left_index = 0, right_index = 0;
-                    while (left_index < runs[run].size() && right_index < runs[run + 1].size()) {
-                        if (sort_less(runs[run + 1][right_index], runs[run][left_index], keys, spec->key_count))
-                            merged.push_back(runs[run + 1][right_index++]);
-                        else merged.push_back(runs[run][left_index++]);
+                    if (run + 1 == runs.size()) {
+                        merged_runs.push_back(runs[run]);
+                        continue;
                     }
-                    merged.insert(merged.end(), runs[run].begin() + left_index, runs[run].end());
-                    merged.insert(merged.end(), runs[run + 1].begin() + right_index, runs[run + 1].end());
-                    Batch spilled;
-                    spilled.columns = input.columns;
-                    spilled.rows = merged;
-                    if (!spill_batch(index, spilled)) return false;
-                    merged_runs.push_back(std::move(merged));
+                    Batch left, right, merged;
+                    if (!read_spill_batch(index, runs[run], &left) ||
+                        !read_spill_batch(index, runs[run + 1], &right))
+                        return false;
+                    merged.columns = input.columns;
+                    const size_t merged_limit = spec->top_n == 0 ?
+                        left.rows.size() + right.rows.size() :
+                        std::min<size_t>(spec->top_n,
+                            left.rows.size() + right.rows.size());
+                    merged.rows.reserve(merged_limit);
+                    size_t left_index = 0, right_index = 0;
+                    while (merged.rows.size() < merged_limit &&
+                           left_index < left.rows.size() && right_index < right.rows.size()) {
+                        if (sort_less(right.rows[right_index], left.rows[left_index], keys, spec->key_count))
+                            merged.rows.push_back(std::move(right.rows[right_index++]));
+                        else merged.rows.push_back(std::move(left.rows[left_index++]));
+                    }
+                    while (merged.rows.size() < merged_limit && left_index < left.rows.size())
+                        merged.rows.push_back(std::move(left.rows[left_index++]));
+                    while (merged.rows.size() < merged_limit && right_index < right.rows.size())
+                        merged.rows.push_back(std::move(right.rows[right_index++]));
+                    SpillHandle handle;
+                    if (!spill_batch(index, merged, &handle)) return false;
+                    merged_runs.push_back(handle);
                 }
                 runs.swap(merged_runs);
             }
-            if (!runs.empty()) output->rows.swap(runs[0]);
+            if (!runs.empty() && !read_spill_batch(index, runs[0], output))
+                return false;
         }
         if (spec->top_n != 0 && output->rows.size() > spec->top_n) output->rows.resize(spec->top_n);
         const uint64_t logarithm = input_rows <= 1 ? 1 :

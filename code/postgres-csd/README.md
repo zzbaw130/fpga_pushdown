@@ -61,12 +61,14 @@ host fallback. Numeric
 results preserve PostgreSQL dynamic scales for AVG and division, subject to
 the fixed-point int64 range.
 
-The ABI-v8 FIFO and operator arena are real, capacity-accounted FDM ranges. The
-current functional executor still stores tuple payloads in C++ `Batch` objects;
-arena leases enforce the modeled CSD capacity but do not yet relocate those
-payload bytes into the mapped FDM address. End-to-end physical memory becomes
-hard-bounded only after Join/Aggregate/Sort partition and replay state uses an
-arena-backed allocator.
+The ABI-v8 FIFO and operator arena are real, capacity-accounted FDM ranges.
+External Sort now writes bounded runs to Flash, retains only handles, and reads
+run pairs back through the spill staging range for stable merge passes. The
+current functional executor still stores decoded tuple payloads in C++ `Batch`
+objects, and Join/Aggregate still retain their state after a spill protection
+copy. Arena leases enforce the modeled CSD capacity, but end-to-end physical
+memory becomes hard-bounded only after the scan pipeline and those remaining
+blocking operators use partition replay and arena-backed state.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

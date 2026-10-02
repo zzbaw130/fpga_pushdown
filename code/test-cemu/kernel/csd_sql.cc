@@ -55,6 +55,14 @@ struct SpillRecordHeader {
     uint64_t cell_count;
     uint64_t bytes_length;
 } __attribute__((packed));
+struct SpillHandle {
+    uint64_t offset;
+    uint64_t length;
+    uint32_t row_count;
+    uint16_t column_count;
+    uint16_t reserved16;
+    SpillHandle() : offset(0), length(0), row_count(0), column_count(0), reserved16(0) {}
+};
 struct FifoBatchHeader {
     uint32_t magic;
     uint32_t generation;

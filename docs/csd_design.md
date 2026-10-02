@@ -92,7 +92,7 @@ CEMU:
 | Filter, project | SIMD-like lanes executing bounded expression bytecode | Never blocks; output compacts valid lanes |
 | Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state | Arena capacity is checked; partition/replay remains required for a physical hard bound |
 | Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE | Build batch takes an arena lease; failure triggers spill, while radix replay remains future work |
-| Sort | multi-key bounded run generation followed by stable merge passes | Input takes an arena lease; failed allocation generates Flash-sized runs |
+| Sort | multi-key bounded run generation followed by stable merge passes | Input takes an arena lease; failed allocation writes runs to Flash, retains only handles, and reads pairs back for stable merge |
 
 The choices follow the streaming filter/project and hash GQE direction in the
 [Xilinx Vitis Database Library](https://github.com/Xilinx/Vitis_Libraries/tree/master/database).
@@ -142,18 +142,21 @@ page cache. Spill records contain operator/run identity, tuple and column
 counts, cell descriptors, and byte payloads.
 
 `SORT` emits bounded runs and merge intermediates to the designated spill
-range. The current aggregate/join model also serializes oversized blocking
-state there, but it does not yet replay radix partitions. The present C++
-functional model therefore validates Flash allocation, bounded staging writes,
-layout and accounting;
-it is not yet a proof of a hard controller-memory bound because emitted scan
-batches, hash state, and sort run objects are retained in the CEMU process.
-The spill range is now only a reusable FDM staging window; serialized records
-are written to real NVM scratch extents. Bounded FIFO streaming plus
-Flash deserialization/replay is a separate required milestone before SF32
-memory claims. `flash_write_bytes` and `spill_write_bytes` count real backend
-writes; `spill_read_bytes` remains zero until replay reads the extents,
-avoiding fictional I/O in cost calibration.
+range. Once a run is written, the sort keeps only its offset/length handle;
+merge passes read two records back through the same bounded FDM staging window,
+perform a stable merge, and write the next run. A final read reconstructs the
+operator output. Top-N sorts truncate every run and merge result to N rows,
+which bounds their Flash traffic without changing the global top-N result.
+Spill records and every read are range-checked before deserialization.
+
+The current aggregate/join model also serializes oversized blocking state but
+does not yet replay radix partitions. The implementation is therefore not yet
+a proof of a hard controller-memory bound: scans still accumulate decoded
+`Batch` objects and join/aggregate C++ state is retained after its protection
+copy. The spill range itself is only a reusable FDM staging window; serialized
+records reside in real NVM scratch extents. `flash_write_bytes` and
+`spill_write_bytes` count backend writes, while Sort replay increments both
+`flash_read_bytes` and `spill_read_bytes` with the bytes actually fetched.
 
 ## Timing model
 
