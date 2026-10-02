@@ -79,6 +79,14 @@
         return true;
     }
 
+    static bool join_row_bytes(const Row &row, uint16_t columns, uint64_t *bytes)
+    {
+        if (!checked_mul(columns, sizeof(CsdSqlResultCell), bytes)) return false;
+        for (Row::const_iterator value = row.begin(); value != row.end(); ++value)
+            if (!checked_add(*bytes, value->bytes.size(), bytes)) return false;
+        return true;
+    }
+
     bool join_residual_matches(uint32_t index, const CsdSqlJoinSpec &spec, const Row &joined,
                                bool *matches, std::vector<EvalValue> *expression_stack)
     {
@@ -237,15 +245,11 @@
         const uint64_t right_bytes = batch_bytes(right);
         const bool scalar_key = join_uses_scalar_key(left, right, keys,
                                                       spec.key_count, false);
-        for (std::vector<Row>::const_iterator row = right.rows.begin();
-             row != right.rows.end(); ++row) {
-            uint64_t bytes = 0;
-            if (!checked_mul(right.columns, sizeof(CsdSqlResultCell), &bytes))
-                return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x406);
-            for (Row::const_iterator value = row->begin(); value != row->end(); ++value)
-                if (!checked_add(bytes, value->bytes.size(), &bytes))
-                    return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x406);
-            if (bytes > capacity)
+        std::vector<uint64_t> right_row_bytes(right.rows.size());
+        for (size_t row_index = 0; row_index < right.rows.size(); ++row_index) {
+            if (!join_row_bytes(right.rows[row_index], right.columns,
+                                &right_row_bytes[row_index]) ||
+                right_row_bytes[row_index] > capacity)
                 return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x406);
         }
         const size_t max_partitions = size_t(1) << 16;
@@ -258,31 +262,57 @@
         if (partition_count < required_partitions)
             return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x402);
 
-        std::vector<Batch> right_partitions;
+        /* Classify with row ordinals and serialized byte counters. This keeps
+         * adaptive radix sizing independent of full Row copies. */
+        std::vector<std::vector<size_t> > right_partition_rows;
         for (;;) {
-            right_partitions.assign(partition_count, Batch());
-            for (size_t partition = 0; partition < partition_count; ++partition)
-                right_partitions[partition].columns = right.columns;
-            for (std::vector<Row>::const_iterator row = right.rows.begin();
-                 row != right.rows.end(); ++row) {
+            right_partition_rows.assign(partition_count, std::vector<size_t>());
+            std::vector<uint64_t> partition_bytes(partition_count, 0);
+            for (size_t row_index = 0; row_index < right.rows.size(); ++row_index) {
                 size_t partition = 0;
-                if (join_partition_index(*row, keys, spec.key_count, false,
-                                         scalar_key, partition_count, &partition))
-                    right_partitions[partition].rows.push_back(*row);
+                if (!join_partition_index(right.rows[row_index], keys,
+                                          spec.key_count, false, scalar_key,
+                                          partition_count, &partition))
+                    continue;
+                right_partition_rows[partition].push_back(row_index);
+                if (!checked_add(partition_bytes[partition],
+                                 right_row_bytes[row_index],
+                                 &partition_bytes[partition]))
+                    return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x406);
             }
             uint64_t largest_partition = 0;
             for (size_t partition = 0; partition < partition_count; ++partition)
                 largest_partition = std::max<uint64_t>(largest_partition,
-                    batch_bytes(right_partitions[partition]));
+                                                       partition_bytes[partition]);
             if (largest_partition <= capacity) break;
             if (partition_count == max_partitions)
                 return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x403);
             partition_count <<= 1;
         }
 
-        std::vector<Batch> left_partitions(partition_count);
-        for (size_t partition = 0; partition < partition_count; ++partition)
-            left_partitions[partition].columns = left.columns + 1;
+        struct JoinPartitionHandles {
+            SpillHandle left;
+            SpillHandle right;
+        };
+        std::vector<JoinPartitionHandles> handles(partition_count);
+
+        /* Materialize and serialize only one build partition at a time. */
+        for (size_t partition = 0; partition < partition_count; ++partition) {
+            Batch batch;
+            batch.columns = right.columns;
+            batch.rows.reserve(right_partition_rows[partition].size());
+            for (std::vector<size_t>::const_iterator row =
+                     right_partition_rows[partition].begin();
+                 row != right_partition_rows[partition].end(); ++row)
+                batch.rows.push_back(right.rows[*row]);
+            if (!spill_batch(index, batch, &handles[partition].right))
+                return false;
+            std::vector<size_t>().swap(right_partition_rows[partition]);
+        }
+        std::vector<std::vector<size_t> >().swap(right_partition_rows);
+        std::vector<uint64_t>().swap(right_row_bytes);
+
+        std::vector<std::vector<size_t> > left_partition_rows(partition_count);
         struct OrderedJoinRow {
             uint64_t ordinal;
             Row row;
@@ -292,13 +322,7 @@
             size_t partition = 0;
             if (join_partition_index(left.rows[row_index], keys, spec.key_count,
                                      true, scalar_key, partition_count, &partition)) {
-                Row tagged = left.rows[row_index];
-                Value ordinal;
-                ordinal.is_null = false;
-                ordinal.type = CSD_SQL_TYPE_INT64;
-                ordinal.integer = static_cast<int64_t>(row_index);
-                tagged.push_back(ordinal);
-                left_partitions[partition].rows.push_back(std::move(tagged));
+                left_partition_rows[partition].push_back(row_index);
                 continue;
             }
             if (spec.join_kind != CSD_SQL_JOIN_LEFT &&
@@ -312,22 +336,29 @@
             ordered.push_back(std::move(unmatched));
         }
 
-        struct JoinPartitionHandles {
-            SpillHandle left;
-            SpillHandle right;
-        };
-        std::vector<JoinPartitionHandles> handles(partition_count);
+        /* Add the private probe ordinal only while materializing the current
+         * partition. It restores PostgreSQL's original probe-row order after
+         * all radix partitions have replayed. */
         for (size_t partition = 0; partition < partition_count; ++partition) {
-            if (!spill_batch(index, right_partitions[partition],
-                             &handles[partition].right) ||
-                !spill_batch(index, left_partitions[partition],
-                             &handles[partition].left))
+            Batch batch;
+            batch.columns = left.columns + 1;
+            batch.rows.reserve(left_partition_rows[partition].size());
+            for (std::vector<size_t>::const_iterator row =
+                     left_partition_rows[partition].begin();
+                 row != left_partition_rows[partition].end(); ++row) {
+                Row tagged = left.rows[*row];
+                Value ordinal;
+                ordinal.is_null = false;
+                ordinal.type = CSD_SQL_TYPE_INT64;
+                ordinal.integer = static_cast<int64_t>(*row);
+                tagged.push_back(ordinal);
+                batch.rows.push_back(std::move(tagged));
+            }
+            if (!spill_batch(index, batch, &handles[partition].left))
                 return false;
-            std::vector<Row>().swap(right_partitions[partition].rows);
-            std::vector<Row>().swap(left_partitions[partition].rows);
+            std::vector<size_t>().swap(left_partition_rows[partition]);
         }
-        std::vector<Batch>().swap(right_partitions);
-        std::vector<Batch>().swap(left_partitions);
+        std::vector<std::vector<size_t> >().swap(left_partition_rows);
 
         for (size_t partition = 0; partition < partition_count; ++partition) {
             Batch partition_right, partition_left, partition_output;

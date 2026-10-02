@@ -65,10 +65,10 @@ The ABI-v8 FIFO and operator arena are real, capacity-accounted FDM ranges.
 External Sort writes bounded runs to Flash, retains only handles, and reads run
 pairs back through the spill staging range for stable merge passes. Oversized
 Hash Join build sides radix-partition both inputs and replay one partition pair
-at a time; probe ordinals preserve deterministic output order. The current
-functional executor still stores decoded tuple payloads in C++ `Batch` objects.
-Aggregate partition classification stores row ordinals and materializes only
-one partition Batch at a time. Oversized grouped Aggregate state now
+at a time; probe ordinals preserve deterministic output order. Join and
+Aggregate partition classification store row ordinals and materialize only one
+partition Batch at a time. The current functional executor still stores decoded
+tuple payloads in C++ `Batch` objects. Oversized grouped Aggregate state now
 radix-partitions input by the complete group key and replays each partition,
 including grouped DISTINCT and AVG; global Aggregate retains its protection
 copy. Arena leases enforce the modeled CSD capacity, but end-to-end physical

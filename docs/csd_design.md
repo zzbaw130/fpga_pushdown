@@ -160,7 +160,9 @@ silently claiming a bound. Nested loops and transient contention retain the
 older protection-copy compatibility path. Replayed partitions that fit the
 arena wait on its condition variable when an independent DAG branch currently
 holds capacity, so parallel blocking operators serialize at the memory
-boundary instead of failing spuriously.
+boundary instead of failing spuriously. Initial build/probe classification
+stores row ordinals rather than copied `Row` objects; each side materializes
+and writes only one partition `Batch` at a time.
 
 Grouped Aggregate uses the same handle/replay infrastructure. All rows for a
 group are assigned to one radix partition, so `DISTINCT` sets and AVG's
@@ -173,9 +175,10 @@ The implementation is still not a proof of a hard controller-memory bound:
 scans accumulate decoded `Batch` objects and Aggregate first builds the complete
 state to measure it before switching to replay. Aggregate classification now
 retains only row ordinals and materializes one partition at a time, rather than
-duplicating all partition rows simultaneously; that remaining partition Batch
-still needs replacement by a streaming writer. The spill range itself is only
-a reusable FDM staging window; serialized records reside in real NVM scratch
+duplicating all partition rows simultaneously. Hash Join uses the same bounded
+classification strategy. Their remaining per-partition `Batch` objects still
+need replacement by a streaming writer. The spill range itself is only a
+reusable FDM staging window; serialized records reside in real NVM scratch
 extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and
