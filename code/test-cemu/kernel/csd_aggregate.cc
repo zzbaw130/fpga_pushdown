@@ -75,19 +75,20 @@
             return false;
         (void) project_instructions;
 
-        std::vector<Batch> partitions(partition_count);
-        for (size_t partition = 0; partition < partition_count; ++partition)
-            partitions[partition].columns = input.columns;
+        /* Keep only row ordinals during classification. Materialize one
+         * partition at a time for serialization instead of duplicating every
+         * Value object across a full vector<Batch>. */
+        std::vector<std::vector<size_t> > partition_rows(partition_count);
         Row projected_row;
         std::vector<EvalValue> expression_stack;
         if (project_spec != NULL) projected_row.reserve(project_spec->output_count);
-        for (std::vector<Row>::const_iterator source = input.rows.begin();
-             source != input.rows.end(); ++source) {
-            const Row *row = &*source;
+        for (size_t row_index = 0; row_index < input.rows.size(); ++row_index) {
+            const Row &source = input.rows[row_index];
+            const Row *row = &source;
             if (project_spec != NULL) {
                 if (!evaluate_expression(project_node->node_id,
                         project_node->expression_offset,
-                        project_node->expression_length, *source, NULL,
+                        project_node->expression_length, source, NULL,
                         &projected_row, &expression_stack))
                     return false;
                 row = &projected_row;
@@ -97,16 +98,23 @@
             const size_t partition =
                 (std::hash<std::string>()(key) >> radix_shift) &
                 (partition_count - 1);
-            partitions[partition].rows.push_back(*source);
+            partition_rows[partition].push_back(row_index);
         }
 
         std::vector<SpillHandle> handles(partition_count);
         for (size_t partition = 0; partition < partition_count; ++partition) {
-            if (!spill_batch(index, partitions[partition], &handles[partition]))
+            Batch batch;
+            batch.columns = input.columns;
+            batch.rows.reserve(partition_rows[partition].size());
+            for (std::vector<size_t>::const_iterator row =
+                     partition_rows[partition].begin();
+                 row != partition_rows[partition].end(); ++row)
+                batch.rows.push_back(input.rows[*row]);
+            if (!spill_batch(index, batch, &handles[partition]))
                 return false;
-            std::vector<Row>().swap(partitions[partition].rows);
+            std::vector<size_t>().swap(partition_rows[partition]);
         }
-        std::vector<Batch>().swap(partitions);
+        std::vector<std::vector<size_t> >().swap(partition_rows);
 
         output->columns = spec.group_count + spec.aggregate_count;
         for (size_t partition = 0; partition < partition_count; ++partition) {

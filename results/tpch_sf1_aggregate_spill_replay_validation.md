@@ -55,9 +55,10 @@ byte for byte.
 ## Remaining boundary
 
 The first pass currently constructs the complete C++ aggregate state to measure
-its modeled size, releases it, and then partitions the source rows. Partition
-buffers also duplicate input rows before serialization. This validates Flash
-layout, recursive grouping semantics and real replay, but an incremental
-arena-backed table with threshold-triggered streaming partition writes is still
-required for a physical SF=32 memory bound. Global aggregates, particularly a
-large global DISTINCT set, retain the protection-copy compatibility path.
+its modeled size, releases it, and then classifies source rows into lightweight
+ordinal buckets. Only one partition's rows are materialized at a time for
+serialization, but that per-partition Batch remains. This validates Flash
+layout, recursive grouping semantics and real replay; an incremental
+arena-backed table with threshold-triggered streaming writes is still required
+for a physical SF=32 memory bound. Global aggregates, particularly a large
+global DISTINCT set, retain the protection-copy compatibility path.

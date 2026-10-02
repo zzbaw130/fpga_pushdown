@@ -170,11 +170,13 @@ and wait for an arena lease; a single group larger than the arena is rejected.
 Global aggregates currently retain the protection-copy path.
 
 The implementation is still not a proof of a hard controller-memory bound:
-scans accumulate decoded `Batch` objects, radix partition formation currently
-duplicates rows in C++ before they are serialized, and Aggregate first builds
-the complete state to measure it before switching to replay. The spill range
-itself is only a reusable FDM staging window; serialized records reside in real
-NVM scratch extents.
+scans accumulate decoded `Batch` objects and Aggregate first builds the complete
+state to measure it before switching to replay. Aggregate classification now
+retains only row ordinals and materializes one partition at a time, rather than
+duplicating all partition rows simultaneously; that remaining partition Batch
+still needs replacement by a streaming writer. The spill range itself is only
+a reusable FDM staging window; serialized records reside in real NVM scratch
+extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and
 `spill_read_bytes` with the bytes actually fetched.
