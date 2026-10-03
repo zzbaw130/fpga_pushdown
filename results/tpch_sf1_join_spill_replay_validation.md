@@ -1,6 +1,6 @@
 # SF=1 Hash Join Flash-replay validation
 
-Date: 2026-10-02 (Asia/Shanghai)
+Date: 2026-10-03 (Asia/Shanghai)
 
 ## Scope
 
@@ -54,6 +54,9 @@ is exactly the two base relation sizes plus the replayed partition bytes.
   compatibility behavior.
 - With the normal 4-GiB FDM configuration, all Q1 through Q22 again reported
   `EXACT` against HOST.
+- Replacing partition `Batch` copies with the direct selection writer retained
+  the exact 241,548,724-byte write/read totals, four spill records and the
+  750,240-byte peak replay lease.
 - AddressSanitizer and UndefinedBehaviorSanitizer passed; LeakSanitizer itself
   is unavailable in the ptrace-based test environment.
 
@@ -61,11 +64,11 @@ is exactly the two base relation sizes plus the replayed partition bytes.
 
 The original decoded inputs and the first-generation radix partition buffers
 were initially both C++ `Batch` objects. Partition classification now stores
-only source-row ordinals and serialized byte counters, then materializes and
-writes one build or probe partition at a time. This removes the simultaneous
-full set of copied partition rows. The original decoded inputs and one current
-partition `Batch` remain, so a streaming scan/partition writer is still
-required for a physical hard bound at SF=32. Grouped Aggregate replay was
-implemented in the following milestone, but incremental arena-backed state is
-still required. Extreme skew that cannot produce an arena-sized build
-partition is rejected explicitly.
+only source-row ordinals and serialized byte counters. A two-pass selection
+writer now emits descriptors and payload directly from the source rows and
+appends the hidden probe ordinal during serialization, eliminating every copied
+partition `Batch`. The original decoded input batches remain, so a streaming
+scan consumer is still required for a physical hard bound at SF=32. Grouped
+Aggregate replay was implemented in the following milestone, but a true
+arena-backed hash-table allocator is still required. Extreme skew that cannot
+produce an arena-sized build partition is rejected explicitly.

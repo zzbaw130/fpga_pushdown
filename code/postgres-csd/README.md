@@ -66,16 +66,17 @@ External Sort writes bounded runs to Flash, retains only handles, and reads run
 pairs back through the spill staging range for stable merge passes. Oversized
 Hash Join build sides radix-partition both inputs and replay one partition pair
 at a time; probe ordinals preserve deterministic output order. Join and
-Aggregate partition classification store row ordinals and materialize only one
-partition Batch at a time. The current functional executor still stores decoded
-tuple payloads in C++ `Batch` objects. Oversized grouped Aggregate state now
+Aggregate partition classification store row ordinals; a two-pass writer emits
+each selection directly to Flash without a copied partition Batch. The current
+functional executor still stores decoded scan payloads in C++ `Batch` objects.
+Oversized grouped Aggregate state now
 radix-partitions input by the complete group key and replays each partition,
 including grouped DISTINCT and AVG; global Aggregate retains its protection
 copy. Grouped state is accounted during construction and switches to radix
 spill as soon as it crosses the modeled arena threshold; per-lane partial state
 is released immediately after merge. Arena leases enforce the modeled CSD
 capacity, but end-to-end physical memory becomes hard-bounded only after
-scan/partition streaming and a real arena-backed container allocator replace
+scan-to-operator streaming and a real arena-backed container allocator replace
 the remaining C++ heap objects.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In

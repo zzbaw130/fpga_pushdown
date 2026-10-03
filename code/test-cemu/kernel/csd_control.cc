@@ -176,8 +176,11 @@
         return true;
     }
 
-    /* Flash allocation is serialized: all CSD lanes share one append cursor. */
-    bool spill_batch(uint32_t index, const Batch &batch, SpillHandle *handle = NULL)
+    /* Serialize either a complete Batch or a row-ordinal selection directly.
+     * Selection mode avoids constructing a copied partition Batch. */
+    bool spill_batch_selection(uint32_t index, const Batch &batch,
+                               const std::vector<size_t> *selection,
+                               bool append_ordinal, SpillHandle *handle)
     {
         std::lock_guard<std::mutex> spill_guard(spill_mutex_);
         if (header_->spill_range == CSD_SQL_INVALID_RANGE ||
@@ -185,16 +188,28 @@
             args_->mr_addr[header_->spill_range] == NULL ||
             args_->mr_len[header_->spill_range] <= 0)
             return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
+        if (append_ordinal && batch.columns == std::numeric_limits<uint16_t>::max())
+            return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x207);
+        const size_t row_count = selection == NULL ? batch.rows.size() : selection->size();
+        const uint16_t column_count = batch.columns + (append_ordinal ? 1 : 0);
         uint64_t cells_bytes = 0, total_bytes = sizeof(SpillRecordHeader), payload_bytes = 0;
-        if (batch.rows.size() > std::numeric_limits<uint32_t>::max() ||
-            !checked_mul(batch.rows.size(), batch.columns, &cells_bytes) ||
+        if (row_count > std::numeric_limits<uint32_t>::max() ||
+            !checked_mul(row_count, column_count, &cells_bytes) ||
             !checked_mul(cells_bytes, sizeof(CsdSqlResultCell), &cells_bytes) ||
             !checked_add(total_bytes, cells_bytes, &total_bytes))
             return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
-        for (std::vector<Row>::const_iterator row = batch.rows.begin(); row != batch.rows.end(); ++row)
-            for (Row::const_iterator value = row->begin(); value != row->end(); ++value)
+        for (size_t logical_row = 0; logical_row < row_count; ++logical_row) {
+            const size_t source_row = selection == NULL ? logical_row : (*selection)[logical_row];
+            if (source_row >= batch.rows.size() ||
+                batch.rows[source_row].size() != batch.columns ||
+                (append_ordinal &&
+                 source_row > static_cast<size_t>(std::numeric_limits<int64_t>::max())))
+                return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x208);
+            for (Row::const_iterator value = batch.rows[source_row].begin();
+                 value != batch.rows[source_row].end(); ++value)
                 if (!checked_add(payload_bytes, value->bytes.size(), &payload_bytes))
                     return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
+        }
         if (!checked_add(total_bytes, payload_bytes, &total_bytes))
             return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
 
@@ -202,9 +217,9 @@
         record.magic = kSpillMagic;
         record.node_id = index;
         record.run_id = spill_run_id_++;
-        record.row_count = batch.rows.size();
-        record.column_count = batch.columns;
-        record.cell_count = static_cast<uint64_t>(batch.rows.size()) * batch.columns;
+        record.row_count = row_count;
+        record.column_count = column_count;
+        record.cell_count = static_cast<uint64_t>(row_count) * column_count;
         record.bytes_length = payload_bytes;
 
         const uint64_t record_offset = spill_offset_;
@@ -220,9 +235,11 @@
             if (!append_spill_bytes(index, stage, capacity, record_offset,
                                     &flushed, &staged, &record, sizeof(record)))
                 return false;
-            for (std::vector<Row>::const_iterator row = batch.rows.begin();
-                 row != batch.rows.end(); ++row)
-                for (Row::const_iterator value = row->begin(); value != row->end(); ++value) {
+            for (size_t logical_row = 0; logical_row < row_count; ++logical_row) {
+                const size_t source_row = selection == NULL ? logical_row :
+                                          (*selection)[logical_row];
+                for (Row::const_iterator value = batch.rows[source_row].begin();
+                     value != batch.rows[source_row].end(); ++value) {
                     CsdSqlResultCell cell = {};
                     cell.integer = value->integer;
                     cell.bytes_offset = payload_offset;
@@ -235,13 +252,27 @@
                         return false;
                     payload_offset += value->bytes.size();
                 }
-            for (std::vector<Row>::const_iterator row = batch.rows.begin();
-                 row != batch.rows.end(); ++row)
-                for (Row::const_iterator value = row->begin(); value != row->end(); ++value)
+                if (append_ordinal) {
+                    CsdSqlResultCell ordinal = {};
+                    ordinal.integer = static_cast<int64_t>(source_row);
+                    ordinal.bytes_offset = payload_offset;
+                    ordinal.datum_type = CSD_SQL_TYPE_INT64;
+                    if (!append_spill_bytes(index, stage, capacity, record_offset,
+                                            &flushed, &staged, &ordinal,
+                                            sizeof(ordinal)))
+                        return false;
+                }
+            }
+            for (size_t logical_row = 0; logical_row < row_count; ++logical_row) {
+                const size_t source_row = selection == NULL ? logical_row :
+                                          (*selection)[logical_row];
+                for (Row::const_iterator value = batch.rows[source_row].begin();
+                     value != batch.rows[source_row].end(); ++value)
                     if (!value->bytes.empty() &&
                         !append_spill_bytes(index, stage, capacity, record_offset,
                             &flushed, &staged, value->bytes.data(), value->bytes.size()))
                         return false;
+            }
             if (staged != 0 &&
                 !write_flash_spill(index, record_offset + flushed, stage, staged))
                 return false;
@@ -257,9 +288,11 @@
                 target + sizeof(record));
             unsigned char *payload = target + sizeof(record) + cells_bytes;
             uint64_t payload_offset = 0, cell_index = 0;
-            for (std::vector<Row>::const_iterator row = batch.rows.begin();
-                 row != batch.rows.end(); ++row)
-                for (Row::const_iterator value = row->begin(); value != row->end(); ++value) {
+            for (size_t logical_row = 0; logical_row < row_count; ++logical_row) {
+                const size_t source_row = selection == NULL ? logical_row :
+                                          (*selection)[logical_row];
+                for (Row::const_iterator value = batch.rows[source_row].begin();
+                     value != batch.rows[source_row].end(); ++value) {
                     CsdSqlResultCell cell = {};
                     cell.integer = value->integer;
                     cell.bytes_offset = payload_offset;
@@ -274,6 +307,14 @@
                         payload_offset += value->bytes.size();
                     }
                 }
+                if (append_ordinal) {
+                    CsdSqlResultCell ordinal = {};
+                    ordinal.integer = static_cast<int64_t>(source_row);
+                    ordinal.bytes_offset = payload_offset;
+                    ordinal.datum_type = CSD_SQL_TYPE_INT64;
+                    cells[cell_index++] = ordinal;
+                }
+            }
         }
         spill_offset_ += total_bytes;
         if (handle != NULL) {
@@ -288,6 +329,20 @@
             ++status_.operator_spill_count;
         }
         return true;
+    }
+
+    /* Flash allocation is serialized: all CSD lanes share one append cursor. */
+    bool spill_batch(uint32_t index, const Batch &batch, SpillHandle *handle = NULL)
+    {
+        return spill_batch_selection(index, batch, NULL, false, handle);
+    }
+
+    bool spill_selected_rows(uint32_t index, const Batch &batch,
+                             const std::vector<size_t> &selection,
+                             bool append_ordinal, SpillHandle *handle)
+    {
+        return spill_batch_selection(index, batch, &selection,
+                                     append_ordinal, handle);
     }
 
     bool read_spill_batch(uint32_t index, const SpillHandle &handle, Batch *output)

@@ -296,16 +296,11 @@
         };
         std::vector<JoinPartitionHandles> handles(partition_count);
 
-        /* Materialize and serialize only one build partition at a time. */
+        /* Serialize build partitions directly from source-row ordinals. */
         for (size_t partition = 0; partition < partition_count; ++partition) {
-            Batch batch;
-            batch.columns = right.columns;
-            batch.rows.reserve(right_partition_rows[partition].size());
-            for (std::vector<size_t>::const_iterator row =
-                     right_partition_rows[partition].begin();
-                 row != right_partition_rows[partition].end(); ++row)
-                batch.rows.push_back(right.rows[*row]);
-            if (!spill_batch(index, batch, &handles[partition].right))
+            if (!spill_selected_rows(index, right,
+                                     right_partition_rows[partition], false,
+                                     &handles[partition].right))
                 return false;
             std::vector<size_t>().swap(right_partition_rows[partition]);
         }
@@ -336,25 +331,12 @@
             ordered.push_back(std::move(unmatched));
         }
 
-        /* Add the private probe ordinal only while materializing the current
-         * partition. It restores PostgreSQL's original probe-row order after
-         * all radix partitions have replayed. */
+        /* The writer appends a private probe ordinal without copying/tagging
+         * the source Row. Replay uses it to restore PostgreSQL probe order. */
         for (size_t partition = 0; partition < partition_count; ++partition) {
-            Batch batch;
-            batch.columns = left.columns + 1;
-            batch.rows.reserve(left_partition_rows[partition].size());
-            for (std::vector<size_t>::const_iterator row =
-                     left_partition_rows[partition].begin();
-                 row != left_partition_rows[partition].end(); ++row) {
-                Row tagged = left.rows[*row];
-                Value ordinal;
-                ordinal.is_null = false;
-                ordinal.type = CSD_SQL_TYPE_INT64;
-                ordinal.integer = static_cast<int64_t>(*row);
-                tagged.push_back(ordinal);
-                batch.rows.push_back(std::move(tagged));
-            }
-            if (!spill_batch(index, batch, &handles[partition].left))
+            if (!spill_selected_rows(index, left,
+                                     left_partition_rows[partition], true,
+                                     &handles[partition].left))
                 return false;
             std::vector<size_t>().swap(left_partition_rows[partition]);
         }

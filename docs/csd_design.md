@@ -161,8 +161,10 @@ older protection-copy compatibility path. Replayed partitions that fit the
 arena wait on its condition variable when an independent DAG branch currently
 holds capacity, so parallel blocking operators serialize at the memory
 boundary instead of failing spuriously. Initial build/probe classification
-stores row ordinals rather than copied `Row` objects; each side materializes
-and writes only one partition `Batch` at a time.
+stores row ordinals rather than copied `Row` objects. A two-pass selection
+writer emits cell descriptors and variable payload directly from those source
+ordinals, so no partition `Batch` is materialized. Probe ordinals are appended
+by the writer without modifying or copying the source row.
 
 Grouped Aggregate uses the same handle/replay infrastructure. All rows for a
 group are assigned to one radix partition, so `DISTINCT` sets and AVG's
@@ -176,13 +178,13 @@ progress to choose the radix fan-out. Per-lane partial maps are freed directly
 after merge. Global aggregates currently retain the protection-copy path.
 
 The implementation is still not a proof of a hard controller-memory bound:
-scans accumulate decoded `Batch` objects, while Aggregate and Hash Join
-materialize one partition `Batch` at a time after classifying source-row
-ordinals. The aggregate threshold bounds its modeled state, but the table still
-uses ordinary C++ containers rather than an allocator carved from the FDM
-arena. Streaming scans/partition writers and an arena allocator are needed for
-a physical bound. The spill range itself is only a reusable FDM staging window;
-serialized records reside in real NVM scratch extents.
+scans still accumulate complete decoded input `Batch` objects. Aggregate and
+Hash Join no longer copy partition rows: their selection writer serializes
+source ordinals directly through the bounded FDM staging range. The aggregate
+threshold bounds its modeled state, but the table still uses ordinary C++
+containers rather than an allocator carved from the FDM arena. Streaming scan
+consumers and an arena allocator are needed for a physical bound. Serialized
+spill records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and
 `spill_read_bytes` with the bytes actually fetched.

@@ -60,14 +60,16 @@ byte for byte.
 - The incremental-threshold version retained the same forced-replay metrics:
   16 records, 5,996,736 bytes written/read and a 796,876-byte peak lease. This
   confirms that the projected fan-out selected the same one-pass partitioning.
+- The direct row-selection writer retained those metrics and all 74,999 exact
+  rows after removing the final per-partition `Batch` copy.
 
 ## Remaining boundary
 
 The initial grouped-state build is now threshold-bounded by the modeled arena,
-and partition classification keeps only source-row ordinals. However, decoded
-scan input and one current partition are still C++ `Batch` objects, while the
-hash state uses ordinary C++ containers rather than an allocator backed by the
-FDM arena itself. A streaming scan/partition writer and arena allocator are
-still required for a physical SF=32 memory bound. Global aggregates,
-particularly a large global DISTINCT set, retain the protection-copy
-compatibility path.
+and partition classification keeps only source-row ordinals. The two-pass
+selection writer serializes those rows directly, so no partition `Batch`
+remains. However, the complete decoded scan input is still a C++ `Batch`, while
+the hash state uses ordinary C++ containers rather than an allocator backed by
+the FDM arena itself. A streaming scan consumer and arena allocator are still
+required for a physical SF=32 memory bound. Global aggregates, particularly a
+large global DISTINCT set, retain the protection-copy compatibility path.

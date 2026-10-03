@@ -103,14 +103,8 @@
 
         std::vector<SpillHandle> handles(partition_count);
         for (size_t partition = 0; partition < partition_count; ++partition) {
-            Batch batch;
-            batch.columns = input.columns;
-            batch.rows.reserve(partition_rows[partition].size());
-            for (std::vector<size_t>::const_iterator row =
-                     partition_rows[partition].begin();
-                 row != partition_rows[partition].end(); ++row)
-                batch.rows.push_back(input.rows[*row]);
-            if (!spill_batch(index, batch, &handles[partition]))
+            if (!spill_selected_rows(index, input, partition_rows[partition],
+                                     false, &handles[partition]))
                 return false;
             std::vector<size_t>().swap(partition_rows[partition]);
         }
