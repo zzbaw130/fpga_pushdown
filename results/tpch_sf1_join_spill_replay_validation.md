@@ -7,9 +7,11 @@ Date: 2026-10-03 (Asia/Shanghai)
 This milestone replaces the oversized Hash Join protection-copy path with a
 functional Grace/radix replay path. The join chooses a power-of-two partition
 count, partitions both build and probe rows by the canonical join key, writes
-the pairs into the query-local NVMe spill file, and reads one pair at a time
-through the bounded FDM staging window. Each restored build partition must
-obtain an operator-arena lease before its hash table is created.
+the pairs into the query-local NVMe spill file, and restores one build
+partition at a time through the bounded FDM staging window. Each restored build
+partition must obtain an operator-arena lease before its hash table is created;
+the corresponding probe record is decoded and consumed in staging-bounded
+row-complete chunks instead of becoming a full `Batch`.
 
 A hidden probe ordinal restores the original probe order after replay and is
 removed before residual-expression evaluation and result emission. NULL keys
@@ -57,6 +59,9 @@ is exactly the two base relation sizes plus the replayed partition bytes.
 - Replacing partition `Batch` copies with the direct selection writer retained
   the exact 241,548,724-byte write/read totals, four spill records and the
   750,240-byte peak replay lease.
+- With both `csd.device_work_mem_mb` and `csd.spill_stage_mb` set to 1 MiB, the
+  probe records were forced through multiple bounded chunks. The result and all
+  byte/count metrics remained identical to the table above.
 - AddressSanitizer and UndefinedBehaviorSanitizer passed; LeakSanitizer itself
   is unavailable in the ptrace-based test environment.
 
@@ -67,8 +72,9 @@ were initially both C++ `Batch` objects. Partition classification now stores
 only source-row ordinals and serialized byte counters. A two-pass selection
 writer now emits descriptors and payload directly from the source rows and
 appends the hidden probe ordinal during serialization, eliminating every copied
-partition `Batch`. The original decoded input batches remain, so a streaming
-scan consumer is still required for a physical hard bound at SF=32. Grouped
-Aggregate replay was implemented in the following milestone, but a true
-arena-backed hash-table allocator is still required. Extreme skew that cannot
-produce an arena-sized build partition is rejected explicitly.
+partition `Batch`. Probe replay is also staging-bounded, but the original
+decoded input batches remain, so a streaming scan consumer is still required
+for a physical hard bound at SF=32. Grouped Aggregate replay was implemented in
+the following milestone, but a true arena-backed hash-table allocator is still
+required. Extreme skew that cannot produce an arena-sized build partition is
+rejected explicitly.

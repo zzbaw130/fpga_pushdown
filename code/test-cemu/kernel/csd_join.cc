@@ -343,33 +343,40 @@
         std::vector<std::vector<size_t> >().swap(left_partition_rows);
 
         for (size_t partition = 0; partition < partition_count; ++partition) {
-            Batch partition_right, partition_left, partition_output;
+            Batch partition_right;
             if (!read_spill_batch(index, handles[partition].right,
-                                  &partition_right) ||
-                !read_spill_batch(index, handles[partition].left,
-                                  &partition_left))
+                                  &partition_right))
                 return false;
             OperatorMemoryLease partition_memory(this,
                 batch_bytes(partition_right), true);
             if (!partition_memory.acquired())
                 return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x404);
-            if (!execute_join_core(index, spec, keys, partition_left,
-                                   partition_right, &partition_output,
-                                   false, true))
+            if (!stream_spill_batch(index, handles[partition].left,
+                    [&](const Batch &partition_left) {
+                        Batch partition_output;
+                        if (!execute_join_core(index, spec, keys, partition_left,
+                                               partition_right, &partition_output,
+                                               false, true))
+                            return false;
+                        for (std::vector<Row>::iterator row =
+                                 partition_output.rows.begin();
+                             row != partition_output.rows.end(); ++row) {
+                            if (row->empty() || row->back().is_null ||
+                                row->back().type != CSD_SQL_TYPE_INT64 ||
+                                row->back().integer < 0 ||
+                                static_cast<uint64_t>(row->back().integer) >=
+                                    left.rows.size())
+                                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x405);
+                            OrderedJoinRow restored;
+                            restored.ordinal = static_cast<uint64_t>(
+                                row->back().integer);
+                            row->pop_back();
+                            restored.row = std::move(*row);
+                            ordered.push_back(std::move(restored));
+                        }
+                        return true;
+                    }))
                 return false;
-            for (std::vector<Row>::iterator row = partition_output.rows.begin();
-                 row != partition_output.rows.end(); ++row) {
-                if (row->empty() || row->back().is_null ||
-                    row->back().type != CSD_SQL_TYPE_INT64 ||
-                    row->back().integer < 0 ||
-                    static_cast<uint64_t>(row->back().integer) >= left.rows.size())
-                    return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x405);
-                OrderedJoinRow restored;
-                restored.ordinal = static_cast<uint64_t>(row->back().integer);
-                row->pop_back();
-                restored.row = std::move(*row);
-                ordered.push_back(std::move(restored));
-            }
         }
         std::stable_sort(ordered.begin(), ordered.end(),
             [](const OrderedJoinRow &first, const OrderedJoinRow &second) {

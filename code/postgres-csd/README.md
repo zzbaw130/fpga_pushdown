@@ -64,8 +64,9 @@ the fixed-point int64 range.
 The ABI-v8 FIFO and operator arena are real, capacity-accounted FDM ranges.
 External Sort writes bounded runs to Flash, retains only handles, and reads run
 pairs back through the spill staging range for stable merge passes. Oversized
-Hash Join build sides radix-partition both inputs and replay one partition pair
-at a time; probe ordinals preserve deterministic output order. Join and
+Hash Join build sides radix-partition both inputs, lease one restored build
+partition, and stream the matching probe record in staging-bounded chunks;
+probe ordinals preserve deterministic output order. Join and
 Aggregate partition classification store row ordinals; a two-pass writer emits
 each selection directly to Flash without a copied partition Batch. The current
 functional executor still stores decoded scan payloads in C++ `Batch` objects.

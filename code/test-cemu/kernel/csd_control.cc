@@ -467,3 +467,146 @@
         *output = std::move(restored);
         return true;
     }
+
+    /* Decode a spill record in bounded row chunks. Cell descriptors and byte
+     * payload retain the existing on-Flash layout; the consumer never sees a
+     * partially decoded row. */
+    template <typename Consumer>
+    bool stream_spill_batch(uint32_t index, const SpillHandle &handle,
+                            Consumer consumer)
+    {
+        std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+        if (handle.length < sizeof(SpillRecordHeader) ||
+            handle.offset > spill_offset_ ||
+            handle.length > spill_offset_ - handle.offset)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x214);
+        SpillRecordHeader record = {};
+        if (!read_spill_bytes(index, handle.offset, &record, sizeof(record)))
+            return false;
+        uint64_t expected_cells = 0, cells_bytes = 0;
+        uint64_t expected_length = sizeof(record);
+        if (record.magic != kSpillMagic || record.node_id != index ||
+            record.row_count != handle.row_count ||
+            record.column_count != handle.column_count ||
+            (record.row_count != 0 && record.column_count == 0) ||
+            !checked_mul(record.row_count, record.column_count, &expected_cells) ||
+            record.cell_count != expected_cells ||
+            !checked_mul(record.cell_count, sizeof(CsdSqlResultCell), &cells_bytes) ||
+            !checked_add(expected_length, cells_bytes, &expected_length) ||
+            !checked_add(expected_length, record.bytes_length, &expected_length) ||
+            expected_length != handle.length)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x215);
+
+        const uint64_t stage_capacity = static_cast<uint64_t>(
+            args_->mr_len[header_->spill_range]);
+        uint64_t row_cells_bytes = 0;
+        if (!checked_mul(record.column_count, sizeof(CsdSqlResultCell),
+                         &row_cells_bytes) ||
+            (record.row_count != 0 && row_cells_bytes > stage_capacity))
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x216);
+        const uint64_t rows_per_descriptor_block = record.row_count == 0 ? 1 :
+            std::max<uint64_t>(1, stage_capacity / row_cells_bytes);
+        const uint64_t payload_start = handle.offset + sizeof(record) + cells_bytes;
+        uint64_t first_row = 0, expected_payload_offset = 0;
+        while (first_row < record.row_count) {
+            const uint64_t block_rows = std::min<uint64_t>(
+                rows_per_descriptor_block, record.row_count - first_row);
+            uint64_t block_cells = 0;
+            if (!checked_mul(block_rows, record.column_count, &block_cells) ||
+                block_cells > std::numeric_limits<size_t>::max())
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x217);
+            std::vector<CsdSqlResultCell> cells(
+                static_cast<size_t>(block_cells));
+            if (!read_spill_bytes(index,
+                    handle.offset + sizeof(record) +
+                        first_row * row_cells_bytes,
+                    cells.data(), block_cells * sizeof(CsdSqlResultCell)))
+                return false;
+            for (size_t cell_index = 0; cell_index < cells.size(); ++cell_index) {
+                uint64_t payload_end = 0;
+                if (!is_supported_type(cells[cell_index].datum_type) ||
+                    cells[cell_index].bytes_offset != expected_payload_offset ||
+                    !checked_add(cells[cell_index].bytes_offset,
+                                 cells[cell_index].bytes_length, &payload_end) ||
+                    payload_end > record.bytes_length)
+                    return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x218);
+                expected_payload_offset = payload_end;
+            }
+
+            uint64_t block_row = 0;
+            while (block_row < block_rows) {
+                const size_t first_cell = static_cast<size_t>(
+                    block_row * record.column_count);
+                const uint64_t chunk_payload_begin =
+                    cells[first_cell].bytes_offset;
+                uint64_t end_row = block_row;
+                uint64_t chunk_payload_end = chunk_payload_begin;
+                while (end_row < block_rows) {
+                    const size_t last_cell = static_cast<size_t>(
+                        (end_row + 1) * record.column_count - 1);
+                    uint64_t candidate_end = 0;
+                    if (!checked_add(cells[last_cell].bytes_offset,
+                                     cells[last_cell].bytes_length,
+                                     &candidate_end))
+                        return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x219);
+                    if (end_row != block_row &&
+                        candidate_end - chunk_payload_begin > stage_capacity)
+                        break;
+                    if (candidate_end - chunk_payload_begin > stage_capacity)
+                        return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x31a);
+                    chunk_payload_end = candidate_end;
+                    ++end_row;
+                }
+                const uint64_t chunk_rows = end_row - block_row;
+                const uint64_t payload_bytes =
+                    chunk_payload_end - chunk_payload_begin;
+                if (payload_bytes > std::numeric_limits<size_t>::max())
+                    return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x21a);
+                std::vector<unsigned char> payload(
+                    static_cast<size_t>(payload_bytes));
+                if (payload_bytes != 0 &&
+                    !read_spill_bytes(index,
+                        payload_start + chunk_payload_begin,
+                        payload.data(), payload_bytes))
+                    return false;
+
+                Batch chunk;
+                chunk.columns = record.column_count;
+                chunk.rows.resize(static_cast<size_t>(chunk_rows));
+                for (size_t row = 0; row < chunk.rows.size(); ++row) {
+                    chunk.rows[row].resize(record.column_count);
+                    for (uint16_t column = 0; column < record.column_count;
+                         ++column) {
+                        const CsdSqlResultCell &cell = cells[
+                            static_cast<size_t>((block_row + row) *
+                                record.column_count + column)];
+                        Value &value = chunk.rows[row][column];
+                        value.is_null = (cell.flags & kResultNull) != 0;
+                        value.type = cell.datum_type;
+                        value.integer = cell.integer;
+                        value.numeric_scale = cell.numeric_scale;
+                        if (cell.bytes_length != 0) {
+                            const uint64_t within =
+                                cell.bytes_offset - chunk_payload_begin;
+                            value.bytes.assign(reinterpret_cast<const char *>(
+                                payload.data() + within), cell.bytes_length);
+                        }
+                    }
+                }
+                std::vector<unsigned char>().swap(payload);
+                if (!consumer(chunk)) return false;
+                block_row = end_row;
+            }
+            first_row += block_rows;
+        }
+        if (expected_payload_offset != record.bytes_length)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x21b);
+        {
+            uint64_t total = 0;
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            if (checked_add(status_.spill_read_bytes, handle.length, &total))
+                status_.spill_read_bytes = total;
+            else status_.spill_read_bytes = std::numeric_limits<uint64_t>::max();
+        }
+        return true;
+    }

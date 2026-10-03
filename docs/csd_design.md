@@ -151,13 +151,15 @@ Spill records and every read are range-checked before deserialization.
 
 An oversized equi-join uses power-of-two radix partitions. Both build and probe
 rows are serialized to Flash, only partition handles survive the write phase,
-and each matching pair is read back before a bounded build/probe pass. A hidden
-probe ordinal is removed after replay and used to restore the original probe
-order; residual predicates see only the logical columns. NULL join keys retain
-the correct INNER/LEFT/SEMI/ANTI semantics. A single build row larger than the
-arena, or an unresolvable skew partition, is rejected explicitly instead of
-silently claiming a bound. Nested loops and transient contention retain the
-older protection-copy compatibility path. Replayed partitions that fit the
+and each build partition is read back under an arena lease. The matching probe
+record is decoded in row-complete chunks bounded by the reusable spill staging
+range, then immediately passed to the hash probe. A hidden probe ordinal is
+removed after replay and used to restore the original probe order; residual
+predicates see only the logical columns. NULL join keys retain the correct
+INNER/LEFT/SEMI/ANTI semantics. A single build row larger than the arena, or an
+unresolvable skew partition, is rejected explicitly instead of silently
+claiming a bound. Nested loops and transient contention retain the older
+protection-copy compatibility path. Replayed build partitions that fit the
 arena wait on its condition variable when an independent DAG branch currently
 holds capacity, so parallel blocking operators serialize at the memory
 boundary instead of failing spuriously. Initial build/probe classification
@@ -180,11 +182,12 @@ after merge. Global aggregates currently retain the protection-copy path.
 The implementation is still not a proof of a hard controller-memory bound:
 scans still accumulate complete decoded input `Batch` objects. Aggregate and
 Hash Join no longer copy partition rows: their selection writer serializes
-source ordinals directly through the bounded FDM staging range. The aggregate
-threshold bounds its modeled state, but the table still uses ordinary C++
-containers rather than an allocator carved from the FDM arena. Streaming scan
-consumers and an arena allocator are needed for a physical bound. Serialized
-spill records reside in real NVM scratch extents.
+source ordinals directly through the bounded FDM staging range, and Join probe
+replay is chunked by that same limit. The aggregate threshold bounds its
+modeled state, but the table still uses ordinary C++ containers rather than an
+allocator carved from the FDM arena. Streaming scan consumers, chunked
+Aggregate replay and an arena allocator are needed for a physical bound.
+Serialized spill records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and
 `spill_read_bytes` with the bytes actually fetched.
