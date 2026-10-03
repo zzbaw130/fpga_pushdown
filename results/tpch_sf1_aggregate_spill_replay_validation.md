@@ -1,6 +1,6 @@
 # SF=1 grouped Aggregate Flash-replay validation
 
-Date: 2026-10-02 (Asia/Shanghai)
+Date: 2026-10-03 (Asia/Shanghai)
 
 ## Scope
 
@@ -13,6 +13,12 @@ retain their normal semantics without a second partial-state combination pass.
 If multiple groups collide in one oversized partition, replay recursively uses
 later hash bits. Each reconstructed partition waits for and obtains an arena
 lease. A single group whose state exceeds the arena is rejected explicitly.
+During the initial build, every new group and grouped `DISTINCT` entry is
+accounted before insertion. Crossing the arena threshold aborts the partial
+build immediately, projects the complete state size from rows processed, and
+selects the first radix fan-out without ever constructing the full state.
+Per-lane partial maps and duplicate states are released as soon as their merge
+finishes.
 
 ## Forced replay case
 
@@ -51,14 +57,17 @@ byte for byte.
   CEMU guest.
 - With the normal 4-GiB FDM configuration, Q1 through Q22 all reported `EXACT`
   against HOST using the final Aggregate replay library.
+- The incremental-threshold version retained the same forced-replay metrics:
+  16 records, 5,996,736 bytes written/read and a 796,876-byte peak lease. This
+  confirms that the projected fan-out selected the same one-pass partitioning.
 
 ## Remaining boundary
 
-The first pass currently constructs the complete C++ aggregate state to measure
-its modeled size, releases it, and then classifies source rows into lightweight
-ordinal buckets. Only one partition's rows are materialized at a time for
-serialization, but that per-partition Batch remains. This validates Flash
-layout, recursive grouping semantics and real replay; an incremental
-arena-backed table with threshold-triggered streaming writes is still required
-for a physical SF=32 memory bound. Global aggregates, particularly a large
-global DISTINCT set, retain the protection-copy compatibility path.
+The initial grouped-state build is now threshold-bounded by the modeled arena,
+and partition classification keeps only source-row ordinals. However, decoded
+scan input and one current partition are still C++ `Batch` objects, while the
+hash state uses ordinary C++ containers rather than an allocator backed by the
+FDM arena itself. A streaming scan/partition writer and arena allocator are
+still required for a physical SF=32 memory bound. Global aggregates,
+particularly a large global DISTINCT set, retain the protection-copy
+compatibility path.

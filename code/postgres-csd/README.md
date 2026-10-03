@@ -71,9 +71,12 @@ partition Batch at a time. The current functional executor still stores decoded
 tuple payloads in C++ `Batch` objects. Oversized grouped Aggregate state now
 radix-partitions input by the complete group key and replays each partition,
 including grouped DISTINCT and AVG; global Aggregate retains its protection
-copy. Arena leases enforce the modeled CSD capacity, but end-to-end physical
-memory becomes hard-bounded only after scan/partition streaming and incremental
-arena-backed state replace the initial full C++ state build.
+copy. Grouped state is accounted during construction and switches to radix
+spill as soon as it crosses the modeled arena threshold; per-lane partial state
+is released immediately after merge. Arena leases enforce the modeled CSD
+capacity, but end-to-end physical memory becomes hard-bounded only after
+scan/partition streaming and a real arena-backed container allocator replace
+the remaining C++ heap objects.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

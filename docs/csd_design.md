@@ -169,17 +169,20 @@ group are assigned to one radix partition, so `DISTINCT` sets and AVG's
 sum/count pair never require cross-partition reconciliation. Hash collisions
 are resolved recursively with later hash bits. Every replayed state must fit
 and wait for an arena lease; a single group larger than the arena is rejected.
-Global aggregates currently retain the protection-copy path.
+New groups and grouped `DISTINCT` entries are charged atomically during the
+initial build. If the modeled state crosses the arena threshold, the partial
+table is discarded immediately and the complete size is projected from build
+progress to choose the radix fan-out. Per-lane partial maps are freed directly
+after merge. Global aggregates currently retain the protection-copy path.
 
 The implementation is still not a proof of a hard controller-memory bound:
-scans accumulate decoded `Batch` objects and Aggregate first builds the complete
-state to measure it before switching to replay. Aggregate classification now
-retains only row ordinals and materializes one partition at a time, rather than
-duplicating all partition rows simultaneously. Hash Join uses the same bounded
-classification strategy. Their remaining per-partition `Batch` objects still
-need replacement by a streaming writer. The spill range itself is only a
-reusable FDM staging window; serialized records reside in real NVM scratch
-extents.
+scans accumulate decoded `Batch` objects, while Aggregate and Hash Join
+materialize one partition `Batch` at a time after classifying source-row
+ordinals. The aggregate threshold bounds its modeled state, but the table still
+uses ordinary C++ containers rather than an allocator carved from the FDM
+arena. Streaming scans/partition writers and an arena allocator are needed for
+a physical bound. The spill range itself is only a reusable FDM staging window;
+serialized records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and
 `spill_read_bytes` with the bytes actually fetched.

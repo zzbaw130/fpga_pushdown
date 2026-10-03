@@ -192,21 +192,80 @@
         bool has_distinct = false;
         for (uint16_t aggregate_index = 0; aggregate_index < spec->aggregate_count; ++aggregate_index)
             has_distinct = has_distinct || (aggregates[aggregate_index].flags & CSD_SQL_AGG_DISTINCT) != 0;
+        const bool can_partition_early = allow_partition && spec->group_count != 0 &&
+                                         (node.flags & CSD_SQL_NODE_SPILLABLE);
+        std::atomic<uint64_t> incremental_state_bytes(0);
+        std::atomic<uint64_t> processed_rows(0);
+        std::atomic<uint64_t> projected_state_bytes(0);
+        std::atomic<bool> partition_early(false);
+        std::atomic<bool> oversized_group(false);
+        std::atomic<bool> state_size_overflow(false);
+
+        const auto update_atomic_max = [](std::atomic<uint64_t> *target,
+                                          uint64_t value) {
+            uint64_t current = target->load(std::memory_order_relaxed);
+            while (current < value &&
+                   !target->compare_exchange_weak(current, value,
+                       std::memory_order_relaxed, std::memory_order_relaxed)) {}
+        };
+        const auto request_state_bytes = [&](uint64_t bytes) {
+            if (!can_partition_early) return true;
+            uint64_t current = incremental_state_bytes.load(std::memory_order_relaxed);
+            for (;;) {
+                uint64_t next = 0;
+                if (!checked_add(current, bytes, &next)) {
+                    state_size_overflow.store(true, std::memory_order_release);
+                    return false;
+                }
+                if (next > operator_memory_capacity_) {
+                    const uint64_t completed = std::max<uint64_t>(1,
+                        processed_rows.load(std::memory_order_relaxed));
+                    uint64_t projected = std::numeric_limits<uint64_t>::max();
+                    uint64_t scaled = 0;
+                    if (checked_mul(next, input.rows.size(), &scaled)) {
+                        projected = scaled / completed;
+                        if (scaled % completed != 0 &&
+                            projected != std::numeric_limits<uint64_t>::max())
+                            ++projected;
+                    }
+                    update_atomic_max(&projected_state_bytes,
+                                      std::max<uint64_t>(next, projected));
+                    partition_early.store(true, std::memory_order_release);
+                    return false;
+                }
+                if (incremental_state_bytes.compare_exchange_weak(current, next,
+                        std::memory_order_relaxed, std::memory_order_relaxed))
+                    return true;
+            }
+        };
         const size_t tiles = has_distinct ? 1 :
             std::min<size_t>(parallel_workers_, std::max<size_t>(1, input.rows.size()));
         std::vector<std::unordered_map<std::string, size_t> > local_maps(tiles);
         std::vector<std::vector<AggregateState> > local_states(tiles);
+        std::vector<std::vector<uint64_t> > local_state_bytes(tiles);
         std::vector<uint8_t> local_ok(tiles, 0);
         run_parallel(tiles, [&](size_t tile) {
             const size_t begin = input.rows.size() * tile / tiles;
             const size_t end = input.rows.size() * (tile + 1) / tiles;
             std::unordered_map<std::string, size_t> &group_map = local_maps[tile];
             std::vector<AggregateState> &states = local_states[tile];
-            group_map.reserve(std::min<size_t>(end - begin, 65536));
+            std::vector<uint64_t> &state_bytes = local_state_bytes[tile];
+            const uint64_t minimum_state_bytes = std::max<uint64_t>(1,
+                UINT64_C(64) + static_cast<uint64_t>(spec->aggregate_count) * 64);
+            const size_t capacity_groups = static_cast<size_t>(std::min<uint64_t>(
+                65536, operator_memory_capacity_ / minimum_state_bytes /
+                       std::max<size_t>(1, tiles)));
+            group_map.reserve(std::min<size_t>(end - begin,
+                std::max<size_t>(1, capacity_groups)));
             Row projected_row;
             std::vector<EvalValue> expression_stack;
             if (project_spec != NULL) projected_row.reserve(project_spec->output_count);
             for (size_t row_index = begin; row_index < end; ++row_index) {
+                if (partition_early.load(std::memory_order_acquire) ||
+                    oversized_group.load(std::memory_order_acquire) ||
+                    state_size_overflow.load(std::memory_order_acquire))
+                    return;
+                processed_rows.fetch_add(1, std::memory_order_relaxed);
                 const Row *row_pointer = &input.rows[row_index];
                 if (project_spec != NULL) {
                     if (!evaluate_expression(project_node->node_id, project_node->expression_offset,
@@ -221,11 +280,36 @@
                 std::unordered_map<std::string, size_t>::iterator found = group_map.find(key);
                 if (found == group_map.end()) {
                     state_index = states.size();
-                    group_map[key] = state_index;
                     AggregateState state;
                     state.key = key;
                     for (uint16_t group = 0; group < spec->group_count; ++group)
                         state.groups.push_back(row[group_columns[group]]);
+                    uint64_t modeled_bytes = 0;
+                    if (!checked_add(UINT64_C(64), state.key.size(), &modeled_bytes)) {
+                        state_size_overflow.store(true, std::memory_order_release);
+                        return;
+                    }
+                    for (Row::const_iterator group = state.groups.begin();
+                         group != state.groups.end(); ++group)
+                        if (!checked_add(modeled_bytes,
+                                         sizeof(CsdSqlResultCell) + group->bytes.size(),
+                                         &modeled_bytes)) {
+                            state_size_overflow.store(true, std::memory_order_release);
+                            return;
+                        }
+                    uint64_t accumulator_bytes = 0;
+                    if (!checked_mul(spec->aggregate_count, UINT64_C(64),
+                                     &accumulator_bytes) ||
+                        !checked_add(modeled_bytes, accumulator_bytes,
+                                     &modeled_bytes)) {
+                        state_size_overflow.store(true, std::memory_order_release);
+                        return;
+                    }
+                    if (can_partition_early && modeled_bytes > operator_memory_capacity_) {
+                        oversized_group.store(true, std::memory_order_release);
+                        return;
+                    }
+                    if (!request_state_bytes(modeled_bytes)) return;
                     state.count.assign(spec->aggregate_count, 0);
                     state.sum.assign(spec->aggregate_count, 0);
                     state.scale.assign(spec->aggregate_count, -1);
@@ -233,7 +317,9 @@
                     state.maximum.assign(spec->aggregate_count, Value());
                     state.has_value.assign(spec->aggregate_count, false);
                     state.distinct.resize(spec->aggregate_count);
+                    group_map[key] = state_index;
                     states.push_back(std::move(state));
+                    state_bytes.push_back(modeled_bytes);
                 } else state_index = found->second;
                 AggregateState &state = states[state_index];
                 for (uint16_t aggregate_index = 0; aggregate_index < spec->aggregate_count; ++aggregate_index) {
@@ -244,7 +330,26 @@
                     if (!usable) continue;
                     if (aggregate.flags & CSD_SQL_AGG_DISTINCT) {
                         if (value == NULL) { fail(CSD_SQL_STATUS_BAD_EXPRESSION, index); return; }
-                        if (!state.distinct[aggregate_index].insert(value_key(*value)).second) continue;
+                        const std::string distinct_key = value_key(*value);
+                        if (state.distinct[aggregate_index].find(distinct_key) !=
+                            state.distinct[aggregate_index].end())
+                            continue;
+                        uint64_t distinct_bytes = 0, next_state_bytes = 0;
+                        if (!checked_add(sizeof(uint64_t), distinct_key.size(),
+                                         &distinct_bytes) ||
+                            !checked_add(state_bytes[state_index], distinct_bytes,
+                                         &next_state_bytes)) {
+                            state_size_overflow.store(true, std::memory_order_release);
+                            return;
+                        }
+                        if (can_partition_early &&
+                            next_state_bytes > operator_memory_capacity_) {
+                            oversized_group.store(true, std::memory_order_release);
+                            return;
+                        }
+                        if (!request_state_bytes(distinct_bytes)) return;
+                        state.distinct[aggregate_index].insert(distinct_key);
+                        state_bytes[state_index] = next_state_bytes;
                     }
                     if (aggregate.operation == CSD_SQL_AGG_COUNT) {
                         ++state.count[aggregate_index];
@@ -287,6 +392,29 @@
             }
             local_ok[tile] = 1;
         });
+        if (failed_) return false;
+        if (state_size_overflow.load(std::memory_order_acquire))
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
+        if (oversized_group.load(std::memory_order_acquire))
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x504);
+        if (partition_early.load(std::memory_order_acquire)) {
+            for (size_t tile = 0; tile < local_maps.size(); ++tile) {
+                std::unordered_map<std::string, size_t>().swap(local_maps[tile]);
+                std::vector<AggregateState>().swap(local_states[tile]);
+                std::vector<uint64_t>().swap(local_state_bytes[tile]);
+            }
+            std::vector<std::unordered_map<std::string, size_t> >().swap(local_maps);
+            std::vector<std::vector<AggregateState> >().swap(local_states);
+            std::vector<std::vector<uint64_t> >().swap(local_state_bytes);
+            uint64_t partition_estimate = projected_state_bytes.load(
+                std::memory_order_relaxed);
+            uint64_t over_capacity = 0;
+            if (checked_add(operator_memory_capacity_, 1, &over_capacity))
+                partition_estimate = std::max(partition_estimate, over_capacity);
+            return execute_partitioned_aggregate(index, node, input, output,
+                project_node, *spec, group_columns, partition_estimate,
+                radix_shift);
+        }
         for (size_t tile = 0; tile < tiles; ++tile)
             if (!local_ok[tile]) return false;
         std::unordered_map<std::string, size_t> group_map;
@@ -331,6 +459,17 @@
                 }
             }
         }
+        /* Merged states are now self-contained. Release per-lane maps,
+         * duplicate partial states and accounting vectors before obtaining
+         * the arena lease or emitting output. */
+        for (size_t tile = 0; tile < local_maps.size(); ++tile) {
+            std::unordered_map<std::string, size_t>().swap(local_maps[tile]);
+            std::vector<AggregateState>().swap(local_states[tile]);
+            std::vector<uint64_t>().swap(local_state_bytes[tile]);
+        }
+        std::vector<std::unordered_map<std::string, size_t> >().swap(local_maps);
+        std::vector<std::vector<AggregateState> >().swap(local_states);
+        std::vector<std::vector<uint64_t> >().swap(local_state_bytes);
         if (spec->group_count == 0 && states.empty()) {
             AggregateState state;
             state.count.assign(spec->aggregate_count, 0);
@@ -386,12 +525,6 @@
         if (spill_aggregate && allow_partition && spec->group_count != 0) {
             if (largest_aggregate_state_bytes > operator_memory_capacity_)
                 return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x504);
-            for (size_t tile = 0; tile < local_maps.size(); ++tile) {
-                std::unordered_map<std::string, size_t>().swap(local_maps[tile]);
-                std::vector<AggregateState>().swap(local_states[tile]);
-            }
-            std::vector<std::unordered_map<std::string, size_t> >().swap(local_maps);
-            std::vector<std::vector<AggregateState> >().swap(local_states);
             std::unordered_map<std::string, size_t>().swap(group_map);
             std::vector<AggregateState>().swap(states);
             return execute_partitioned_aggregate(index, node, input, output,
