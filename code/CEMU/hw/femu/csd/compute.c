@@ -82,7 +82,15 @@ static long long compute_cache_notify(void *context, unsigned int nsid,
                                       unsigned long long generation)
 {
     femu_csd_cache_notify(context, nsid, relation_oid, physical_offset,
-                          logical_offset, length, generation);
+                          logical_offset, length, generation, 0);
+    return 0;
+}
+
+static long long compute_cache_complete(void *context,
+                                        unsigned long long generation)
+{
+    femu_csd_cache_notify(context, 0, 0, 0, 0, 0, generation,
+                          FEMU_CSD_CACHE_EVENT_FINAL);
     return 0;
 }
 
@@ -824,6 +832,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     job->args.nvm_read = compute_nvm_read;
     job->args.nvm_write = compute_nvm_write;
     job->args.cache_notify = compute_cache_notify;
+    job->args.cache_complete = compute_cache_complete;
     if (!program->is_indirect) {
         sched_enqueue_job(compute_ns(req->ns), req);
     }
@@ -914,6 +923,33 @@ static void leave_compute_section(void) {
 //     qemu_mutex_unlock(&compute_mutex);
 // }
 
+static uint64_t div_round_up_u128(__uint128_t numerator, uint64_t denominator)
+{
+    __uint128_t result;
+
+    if (denominator == 0)
+        return 0;
+    result = (numerator + denominator - 1) / denominator;
+    return result > UINT64_MAX ? UINT64_MAX : (uint64_t)result;
+}
+
+static uint64_t sql_modeled_runtime_ns(ComputeJob *job)
+{
+    ComputeParams *params = compute_ns(job->req->ns)->params;
+    uint64_t cycle_ns = 0;
+    uint64_t flash_ns = 0;
+
+    if (job->args.modeled_cycles && params->fpga_clock_mhz)
+        cycle_ns = div_round_up_u128(
+            (__uint128_t)job->args.modeled_cycles * 1000,
+            params->fpga_clock_mhz);
+    if (job->args.flash_read_bytes && params->flash_read_mb_s)
+        flash_ns = div_round_up_u128(
+            (__uint128_t)job->args.flash_read_bytes * 1000000000ULL,
+            (uint64_t)params->flash_read_mb_s * 1024 * 1024);
+    return MAX(cycle_ns, flash_ns);
+}
+
 static uint64_t run_functional_modeling(ComputeJob *job)
 {
     Program *program = job->program;
@@ -956,9 +992,9 @@ static uint64_t run_functional_modeling(ComputeJob *job)
         }
         clock_gettime(CLOCK_MONOTONIC, &te);
         realtime = (te.tv_sec-ts.tv_sec)* 1000000000LL + (te.tv_nsec-ts.tv_nsec);
-        if(!runtime)
-        {
-            if (program->runtime_scale)
+        if (!runtime) {
+            runtime = sql_modeled_runtime_ns(job);
+            if (!runtime && program->runtime_scale)
                 runtime = realtime * program->runtime_scale;
         }
         leave_compute_section();
@@ -1356,6 +1392,8 @@ static int compute_decode_params(const cJSON *json, NvmeNamespace *ns)
 
     DECODE_PARAM(json, "nr_cu", Number, params->nr_cu, 4);
     DECODE_PARAM(json, "nr_thread", Number, params->nr_thread, 4);
+    DECODE_PARAM(json, "fpga_clock_mhz", Number, params->fpga_clock_mhz, 250);
+    DECODE_PARAM(json, "flash_read_mb_s", Number, params->flash_read_mb_s, 1000);
     DECODE_PARAM(json, "time_slice", Number, params->csf_sched_option.time_slice, 200000);
     DECODE_PARAM(json, "context_switch_time", Number, params->csf_sched_option.context_switch_time, 200);
     DECODE_PARAM(json, "csf_runtime_scale", Number, params->csf_runtime_scale, 3);

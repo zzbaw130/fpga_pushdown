@@ -10,6 +10,8 @@
 #include <sys/ioctl.h>
 
 #define CEMU_IOCTL_MAGIC  'C'
+#define CEMU_EXEC_CACHE_TRACK        0x40
+#define CEMU_EXEC_HOST_CACHE_OVERLAP 0x80
 
 /* IOCTL_CEMU_DOWNLOAD / IOCTL_CEMU_UNLOAD / ACTIVATE / DEACTIVATE argument */
 struct ioctl_download {
@@ -71,6 +73,12 @@ struct ioctl_cemu_cache_stats {
     uint64_t    unmapped_bytes;
     uint64_t    controller_dropped;
     uint64_t    errors;
+    uint64_t    final_events;
+    uint64_t    execute_start_ns;
+    uint64_t    execute_complete_ns;
+    uint64_t    first_prefetch_ns;
+    uint64_t    last_prefetch_ns;
+    uint64_t    overlap_prefetched_bytes;
 };
 
 struct ioctl_cemu_cache_wait {

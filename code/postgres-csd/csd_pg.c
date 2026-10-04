@@ -179,6 +179,10 @@ _PG_init(void)
 						 "Use CSD scan AERs to prefetch heap segments into the host page cache.", NULL,
 						 &csd_cache_fill, true, PGC_USERSET, 0,
 						 NULL, NULL, NULL);
+	DefineCustomBoolVariable("csd.cache_overlap",
+						 "Allow host CPUs to service AER cache fill while a CSD Program Execute request is outstanding.", NULL,
+						 &csd_cache_overlap, true, PGC_USERSET, 0,
+						 NULL, NULL, NULL);
 	DefineCustomBoolVariable("csd.profile", "Report CSD functional-model time by operator.", NULL,
 						 &csd_profile, false, PGC_USERSET, 0,
 						 NULL, NULL, NULL);

@@ -87,6 +87,8 @@ typedef struct Program {
 
 typedef struct ComputeParams {
     uint16_t csf_runtime_scale;
+    uint32_t fpga_clock_mhz;        // SQL operator pipeline clock
+    uint32_t flash_read_mb_s;       // effective NVM-to-FPGA streaming bandwidth
     uint8_t  nr_cu;                 // number of compute unit
     uint8_t  nr_thread;             // number of functional simulation thread
     CsfSchedulerOption csf_sched_option;

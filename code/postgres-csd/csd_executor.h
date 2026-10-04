@@ -28,5 +28,6 @@ extern int csd_device_work_mem_mb;
 extern int csd_cache_wait_ms;
 extern bool csd_profile;
 extern bool csd_cache_fill;
+extern bool csd_cache_overlap;
 
 #endif

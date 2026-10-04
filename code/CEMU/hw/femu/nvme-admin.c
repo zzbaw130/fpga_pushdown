@@ -1266,14 +1266,15 @@ static uint16_t nvme_aer(FemuCtrl *n, NvmeCmd *cmd, uint16_t sq_head)
 
 void femu_csd_cache_notify(FemuCtrl *n, uint32_t nsid, uint32_t relation_oid,
                            uint64_t physical_offset, uint64_t logical_offset,
-                           uint64_t byte_length, uint64_t generation)
+                           uint64_t byte_length, uint64_t generation,
+                           uint32_t flags)
 {
     FemuCsdCacheEvent *entry;
     FemuCsdCacheEvent *previous = NULL;
     NvmeAsyncEvent *event = NULL;
     bool signal;
 
-    if (!n || !byte_length) {
+    if (!n || (!byte_length && !(flags & FEMU_CSD_CACHE_EVENT_FINAL))) {
         return;
     }
 
@@ -1283,7 +1284,8 @@ void femu_csd_cache_notify(FemuCtrl *n, uint32_t nsid, uint32_t relation_oid,
         previous = &n->csd_cache_events[
             (n->csd_cache_head + n->csd_cache_count - 1) %
             FEMU_CSD_CACHE_EVENT_CAPACITY];
-        if (previous->generation == generation &&
+        if (flags == 0 && previous->flags == 0 &&
+            previous->generation == generation &&
             previous->nsid == nsid &&
             previous->relation_oid == relation_oid &&
             previous->logical_offset + previous->byte_length == logical_offset &&
@@ -1310,7 +1312,7 @@ void femu_csd_cache_notify(FemuCtrl *n, uint32_t nsid, uint32_t relation_oid,
     entry->byte_length = byte_length;
     entry->nsid = nsid;
     entry->relation_oid = relation_oid;
-    entry->flags = 0;
+    entry->flags = flags;
     entry->reserved = 0;
     n->csd_cache_count++;
 

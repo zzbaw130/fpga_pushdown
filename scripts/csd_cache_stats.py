@@ -9,7 +9,7 @@ import struct
 
 CEMU_IOCTL_MAGIC = ord("C")
 CACHE_STATS_NUMBER = 0x09
-STATS_FORMAT = "=10Q"
+STATS_FORMAT = "=16Q"
 STATS_SIZE = struct.calcsize(STATS_FORMAT)
 IOC_READ = 2
 IOCTL_CEMU_CACHE_STATS = (
@@ -29,6 +29,12 @@ FIELDS = (
     "unmapped_bytes",
     "controller_dropped",
     "errors",
+    "final_events",
+    "execute_start_ns",
+    "execute_complete_ns",
+    "first_prefetch_ns",
+    "last_prefetch_ns",
+    "overlap_prefetched_bytes",
 )
 
 

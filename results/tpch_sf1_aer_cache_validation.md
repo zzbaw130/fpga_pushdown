@@ -47,10 +47,12 @@ controller 的全局累计 dropped 为 30。它说明 64-entry bounded ring 在�
 一次 VM-Freeze 窗口内可能被覆盖。当前原型按 best-effort cache hint 处理，丢事件只
 降低缓存收益、不会影响 SQL 结果；论文不能把连续 22-query 工作负载描述为零丢弃。
 
-## 模拟器限制
+## 模拟器边界与后续重叠实现
 
-CSD Program Execute 期间 CEMU 会冻结 guest CPU，所以 Linux AER completion 和 cache
-worker 只能在本次 CSD kernel 返回后运行，无法在此模拟器中真实展示“guest 回填线程
-与同一次 CSD 计算重叠”。控制器仍走真实 NVMe AER -> vendor log -> ordinary buffered
-read 控制面，实测证明它能加速后续 HOST 查询；真实硬件上的并行重叠属于后续板卡
-实验，而不是本结果已证明的结论。
+本文数据来自最初的缓存收益阶段，当时 Program Execute 没有在 functional kernel 返回
+后保留独立的模型化设备窗口，所以它只证明回填能够加速后续 HOST 查询。后续实现已
+保留 VM-Freeze：C++ functional kernel 仍在冻结区间运行；kernel 返回并解冻 guest 后，
+CEMU 根据 FPGA 周期和 Flash 字节数继续保持 NVMe 命令 outstanding，Linux AER worker
+可在该窗口内运行。SF=1 已实测 17--37 MB buffered reads 在约 1.218 s 命令窗口内完成，
+详见 `tpch_sf1_cache_compute_overlap.md`。不得把冻结区间的 C++ wall time 计入 FPGA
+时延，也不得把该重叠结果扩写为当前查询已有显著 wall-time speedup。

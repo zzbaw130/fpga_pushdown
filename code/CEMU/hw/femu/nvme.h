@@ -493,6 +493,9 @@ enum NvmeAsyncEventRequest {
 #define FEMU_CSD_CACHE_LOG_VERSION     1
 #define FEMU_CSD_CACHE_EVENT_CAPACITY  64
 #define FEMU_CSD_CACHE_AER_INFO        0x01
+#define FEMU_CSD_CACHE_EVENT_FINAL     0x01
+#define FEMU_CSD_EXEC_CACHE_TRACK      0x40
+#define FEMU_CSD_EXEC_HOST_OVERLAP     0x80
 
 typedef struct FemuCsdCacheEvent {
     uint64_t sequence;
@@ -1519,7 +1522,8 @@ void nvme_process_sq_admin(void *opaque);
 void nvme_process_aers(void *opaque);
 void femu_csd_cache_notify(FemuCtrl *n, uint32_t nsid, uint32_t relation_oid,
                            uint64_t physical_offset, uint64_t logical_offset,
-                           uint64_t byte_length, uint64_t generation);
+                           uint64_t byte_length, uint64_t generation,
+                           uint32_t flags);
 void nvme_post_cqes_io(void *opaque);
 void *nvme_poller(void *arg);
 void *nvme_cq_poller(void *arg);

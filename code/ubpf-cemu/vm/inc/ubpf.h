@@ -67,6 +67,8 @@ extern "C"
                                               unsigned long long logical_offset,
                                               unsigned long long length,
                                               unsigned long long generation);
+    typedef long long (*ubpf_cache_complete_fn)(void *context,
+                                                unsigned long long generation);
 
     struct ubpf_jit_args
     {
@@ -81,6 +83,9 @@ extern "C"
         ubpf_nvm_io_fn nvm_read;
         ubpf_nvm_io_fn nvm_write;
         ubpf_cache_notify_fn cache_notify;
+        ubpf_cache_complete_fn cache_complete;
+        unsigned long long modeled_cycles;
+        unsigned long long flash_read_bytes;
     } __attribute__((packed));
 
     /**

@@ -45,6 +45,7 @@ static struct mutex g_lock;
 #define CEMU_CACHE_LOG_VERSION		1
 #define CEMU_CACHE_EVENT_CAPACITY	64
 #define CEMU_CACHE_AER_INFO		0x01
+#define CEMU_CACHE_EVENT_FINAL		0x01
 #define CEMU_CACHE_READ_BYTES		(1024U * 1024U)
 
 struct cemu_cache_event {
@@ -262,6 +263,9 @@ static int cemu_cache_begin(struct cemu_dev *dev, unsigned long arg)
 	__cemu_cache_clear_mappings(dev);
 	memset(&dev->cache_stats, 0, sizeof(dev->cache_stats));
 	dev->cache_stats.active_generation = begin.generation;
+	dev->cache_execute_in_progress = false;
+	dev->cache_overlap_enabled = false;
+	dev->cache_aer_pending = false;
 	mutex_unlock(&dev->cache_lock);
 	return 0;
 }
@@ -348,12 +352,13 @@ static int cemu_cache_wait(struct cemu_dev *dev, unsigned long arg)
  * reads, fadvise may return while a later PostgreSQL scan is still racing the
  * asynchronous readahead I/O.
  */
-static int cemu_cache_fill_file(struct file *file, u64 offset, u64 length,
-				u64 *completed)
+static int cemu_cache_fill_file(struct cemu_dev *dev, struct file *file,
+				u64 offset, u64 length, u64 *completed)
 {
 	char *buffer;
 	loff_t position = offset;
 	u64 remaining = length;
+	u64 completed_at;
 	int ret;
 
 	*completed = 0;
@@ -379,6 +384,22 @@ static int cemu_cache_fill_file(struct file *file, u64 offset, u64 length,
 		}
 		remaining -= bytes;
 		*completed += bytes;
+		completed_at = ktime_get_ns();
+
+		/*
+		 * Continuous scan notifications are deliberately coalesced by the
+		 * controller and can describe an entire relation.  Account overlap
+		 * at the actual 1 MiB read-completion boundary; waiting until the
+		 * complete coalesced event finishes would hide useful work completed
+		 * while Program Execute was still outstanding.
+		 */
+		mutex_lock(&dev->cache_lock);
+		if (!dev->cache_stats.first_prefetch_ns)
+			dev->cache_stats.first_prefetch_ns = completed_at;
+		dev->cache_stats.last_prefetch_ns = completed_at;
+		if (dev->cache_execute_in_progress)
+			dev->cache_stats.overlap_prefetched_bytes += bytes;
+		mutex_unlock(&dev->cache_lock);
 	}
 	ret = 0;
 out:
@@ -416,8 +437,8 @@ static void cemu_cache_work(struct work_struct *work)
 			  CEMU_CACHE_EVENT_CAPACITY);
 
 	mutex_lock(&dev->cache_lock);
-	dev->cache_stats.controller_dropped =
-		le64_to_cpu(log->header.dropped);
+	dev->cache_stats.controller_dropped = le64_to_cpu(log->header.dropped);
+	mutex_unlock(&dev->cache_lock);
 	for (index = 0; index < count; ++index) {
 		struct cemu_cache_event *event = &log->events[index];
 		struct cemu_cache_mapping *mapping;
@@ -426,16 +447,37 @@ static void cemu_cache_work(struct work_struct *work)
 		u64 event_length = le64_to_cpu(event->byte_length);
 		u64 event_end;
 		u64 mapped = 0;
+		u64 requests = 0;
+		u64 errors = 0;
 		u32 relation_oid = le32_to_cpu(event->relation_oid);
+		u32 event_flags = le32_to_cpu(event->flags);
 
+		mutex_lock(&dev->cache_lock);
 		dev->cache_stats.events++;
 		dev->cache_stats.last_sequence = le64_to_cpu(event->sequence);
-		if (!event_length || event_start > U64_MAX - event_length) {
-			dev->cache_stats.errors++;
+		if (event_flags & CEMU_CACHE_EVENT_FINAL) {
+			dev->cache_stats.final_events++;
+			if (generation == dev->cache_stats.active_generation)
+				dev->cache_stats.completed_generation = generation;
+			mutex_unlock(&dev->cache_lock);
 			continue;
 		}
-		event_end = event_start + event_length;
+		if (!event_length || event_start > U64_MAX - event_length) {
+			dev->cache_stats.errors++;
+			mutex_unlock(&dev->cache_lock);
+			continue;
+		}
 		dev->cache_stats.notified_bytes += event_length;
+		mutex_unlock(&dev->cache_lock);
+		event_end = event_start + event_length;
+
+		/*
+		 * CACHE_BEGIN flushes this work item before replacing mappings, so
+		 * mapping file references remain stable while the potentially slow
+		 * buffered reads run.  Do not hold cache_lock across I/O: Program
+		 * Execute completion must be able to close the overlap interval at
+		 * the exact command-completion boundary.
+		 */
 		list_for_each_entry(mapping, &dev->cache_mappings, list) {
 			u64 mapping_end, overlap_start, overlap_end, file_offset;
 			u64 completed;
@@ -450,19 +492,21 @@ static void cemu_cache_work(struct work_struct *work)
 			if (overlap_start >= overlap_end)
 				continue;
 			file_offset = overlap_start - mapping->logical_offset;
-			fill_result = cemu_cache_fill_file(mapping->file, file_offset,
-				overlap_end - overlap_start, &completed);
-			dev->cache_stats.prefetch_requests++;
-			dev->cache_stats.prefetched_bytes += completed;
+			fill_result = cemu_cache_fill_file(dev, mapping->file,
+				file_offset, overlap_end - overlap_start, &completed);
+			requests++;
 			mapped += completed;
 			if (fill_result)
-				dev->cache_stats.errors++;
+				errors++;
 		}
+		mutex_lock(&dev->cache_lock);
+		dev->cache_stats.prefetch_requests += requests;
+		dev->cache_stats.prefetched_bytes += mapped;
+		dev->cache_stats.errors += errors;
 		if (mapped < event_length)
 			dev->cache_stats.unmapped_bytes += event_length - mapped;
-		dev->cache_stats.completed_generation = generation;
+		mutex_unlock(&dev->cache_lock);
 	}
-	mutex_unlock(&dev->cache_lock);
 out:
 	kfree(log);
 	wake_up_interruptible(&dev->cache_wait);
@@ -473,13 +517,58 @@ void cemu_cache_aer(struct nvme_ctrl *ctrl, u32 result)
 	struct cemu_dev *dev = ctrl ? ctrl->cemu_dev : NULL;
 	u8 event_info = (result >> 8) & 0xff;
 	u8 log_page = (result >> 16) & 0xff;
+	bool defer;
 
 	if (!dev || event_info != CEMU_CACHE_AER_INFO ||
 	    log_page != CEMU_CACHE_LOG_ID)
 		return;
+	mutex_lock(&dev->cache_lock);
+	defer = dev->cache_execute_in_progress && !dev->cache_overlap_enabled;
+	if (defer)
+		dev->cache_aer_pending = true;
+	mutex_unlock(&dev->cache_lock);
+	if (defer)
+		return;
 	queue_work(nvme_wq, &dev->cache_work);
 }
 EXPORT_SYMBOL_GPL(cemu_cache_aer);
+
+void cemu_cache_execute_start(struct nvme_ctrl *ctrl, bool overlap_enabled)
+{
+	struct cemu_dev *dev = ctrl ? ctrl->cemu_dev : NULL;
+
+	if (!dev)
+		return;
+	mutex_lock(&dev->cache_lock);
+	dev->cache_stats.execute_start_ns = ktime_get_ns();
+	dev->cache_stats.execute_complete_ns = 0;
+	dev->cache_stats.overlap_prefetched_bytes = 0;
+	dev->cache_execute_in_progress = true;
+	dev->cache_overlap_enabled = overlap_enabled;
+	dev->cache_aer_pending = false;
+	mutex_unlock(&dev->cache_lock);
+}
+EXPORT_SYMBOL_GPL(cemu_cache_execute_start);
+
+void cemu_cache_execute_complete(struct nvme_ctrl *ctrl)
+{
+	struct cemu_dev *dev = ctrl ? ctrl->cemu_dev : NULL;
+	bool queue_pending;
+
+	if (!dev)
+		return;
+	mutex_lock(&dev->cache_lock);
+	dev->cache_execute_in_progress = false;
+	dev->cache_stats.execute_complete_ns = ktime_get_ns();
+	queue_pending = dev->cache_aer_pending;
+	dev->cache_aer_pending = false;
+	dev->cache_overlap_enabled = false;
+	mutex_unlock(&dev->cache_lock);
+	if (queue_pending)
+		queue_work(nvme_wq, &dev->cache_work);
+	wake_up_interruptible(&dev->cache_wait);
+}
+EXPORT_SYMBOL_GPL(cemu_cache_execute_complete);
 
 static int __maybe_unused remove_program_by_id(struct cemu_dev *dev, int pind)
 {

@@ -32,6 +32,8 @@
             "parameters": {
                 "nr_cu": 1,
                 "nr_thread": 1,
+                "fpga_clock_mhz": 250,
+                "flash_read_mb_s": 1000,
                 "time_slice": 200000,
                 "csf_sched_option": "fifo",
                 "context_switch_time": 0,

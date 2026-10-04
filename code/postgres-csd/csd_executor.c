@@ -58,6 +58,8 @@ typedef struct CsdSqlResultCell CsdSqlResultCell;
 #define CSD_PROGRAM_TYPE_SHARED_LIB 2
 #define CSD_RESULT_NULL UINT8_C(1)
 #define CSD_RANGE_ALIGNMENT UINT64_C(8192)
+#define CSD_EXEC_CACHE_TRACK UINT8_C(0x40)
+#define CSD_EXEC_HOST_CACHE_OVERLAP UINT8_C(0x80)
 
 typedef struct CsdNvmeProgramExecuteCmd
 {
@@ -126,6 +128,7 @@ int csd_device_work_mem_mb = 0;
 int csd_cache_wait_ms = 0;
 bool csd_profile = false;
 bool csd_cache_fill = true;
+bool csd_cache_overlap = true;
 
 static uint64
 csd_align_range(uint64 bytes)
@@ -1133,6 +1136,12 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 		execute_command->cparam1 = plan_length;
 		execute_command->cparam2 = plan_range;
 		execute_command->user_runtime = csd_program_runtime;
+		if (cache_fill_active)
+		{
+			execute_command->flags |= CSD_EXEC_CACHE_TRACK;
+			if (csd_cache_overlap)
+				execute_command->flags |= CSD_EXEC_HOST_CACHE_OVERLAP;
+		}
 		if (ioctl(transport.execute_fd, NVME_IOCTL_IO_CMD, &command) < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_IO_ERROR),
@@ -1159,16 +1168,22 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 			if (ioctl(transport.control_fd, IOCTL_CEMU_CACHE_STATS,
 					  &cache_stats) == 0 && csd_profile)
 				ereport(NOTICE,
-						(errmsg("CSD AER cache generation=%llu completed=%llu events=%llu notified_bytes=%llu prefetch_requests=%llu prefetched_bytes=%llu unmapped_bytes=%llu controller_dropped=%llu errors=%llu",
+						(errmsg("CSD AER cache generation=%llu completed=%llu events=%llu final_events=%llu notified_bytes=%llu prefetch_requests=%llu prefetched_bytes=%llu overlap_prefetched_bytes=%llu unmapped_bytes=%llu controller_dropped=%llu errors=%llu execute_ns=%llu first_prefetch_ns=%llu last_prefetch_ns=%llu",
 								(unsigned long long) cache_stats.active_generation,
 								(unsigned long long) cache_stats.completed_generation,
 								(unsigned long long) cache_stats.events,
+								(unsigned long long) cache_stats.final_events,
 								(unsigned long long) cache_stats.notified_bytes,
 								(unsigned long long) cache_stats.prefetch_requests,
 								(unsigned long long) cache_stats.prefetched_bytes,
+								(unsigned long long) cache_stats.overlap_prefetched_bytes,
 								(unsigned long long) cache_stats.unmapped_bytes,
 								(unsigned long long) cache_stats.controller_dropped,
-								(unsigned long long) cache_stats.errors)));
+								(unsigned long long) cache_stats.errors,
+								(unsigned long long) (cache_stats.execute_complete_ns > cache_stats.execute_start_ns ?
+									cache_stats.execute_complete_ns - cache_stats.execute_start_ns : 0),
+								(unsigned long long) cache_stats.first_prefetch_ns,
+								(unsigned long long) cache_stats.last_prefetch_ns)));
 		}
 
 		csd_read_range(transport.range_fds[status_range], &status, sizeof(status),

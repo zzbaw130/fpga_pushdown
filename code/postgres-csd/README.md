@@ -88,3 +88,15 @@ Run `tests/test_csd_tpch_execution.sh` inside CEMU against a running,
 NVMe-staged guest cluster to compare all 22 forced-CSD results exactly with the
 HOST path. The PostgreSQL executable must retain `CAP_SYS_ADMIN` because the
 Linux NVMe passthrough ioctl checks it before reaching CEMU.
+
+Host-cache fill is enabled by default with `csd.cache_fill=on`.  Each CSD scan
+publishes relation ranges through a vendor AER/log-page control plane; the
+guest NVMe worker resolves those ranges to registered PostgreSQL heap files and
+performs buffered reads into the inode page cache.  `csd.cache_overlap=on`
+(the default) starts that worker while Program Execute is still outstanding in
+CEMU's modeled FPGA/Flash runtime window.  Set it to `off` only for a controlled
+non-overlap baseline.  `csd.cache_wait_ms=0` leaves fill asynchronous; a
+positive value is an experimental completion barrier.  `csd.profile=on`
+reports execute/prefetch timestamps and bytes completed during the overlap
+window.  Run `tests/test_csd_cache_overlap.sh` inside the guest for the A/B
+timeline assertion.

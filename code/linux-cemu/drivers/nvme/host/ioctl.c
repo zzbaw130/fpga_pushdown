@@ -7,6 +7,9 @@
 #include <linux/nvme_ioctl.h>
 #include <linux/io_uring/cmd.h>
 #include "nvme.h"
+#ifdef CONFIG_NVME_CEMU
+#include "cemu.h"
+#endif
 
 enum {
 	NVME_IOCTL_VEC		= (1 << 0),
@@ -289,10 +292,17 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	unsigned timeout = 0;
 	u64 result;
 	int status;
+	bool cemu_cache_tracked = false;
 
 	if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
 		return -EFAULT;
-	if (cmd.flags)
+#ifdef CONFIG_NVME_CEMU
+	cemu_cache_tracked = cmd.opcode == nvme_cmd_write && cmd.nsid == 3 &&
+		(cmd.flags & CEMU_EXEC_CACHE_TRACK) &&
+		!(cmd.flags & ~(CEMU_EXEC_CACHE_TRACK |
+				 CEMU_EXEC_HOST_CACHE_OVERLAP));
+#endif
+	if (cmd.flags && !cemu_cache_tracked)
 		return -EINVAL;
 	if (!nvme_validate_passthru_nsid(ctrl, ns, cmd.nsid))
 		return -EINVAL;
@@ -316,9 +326,18 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	if (cmd.timeout_ms)
 		timeout = msecs_to_jiffies(cmd.timeout_ms);
 
+#ifdef CONFIG_NVME_CEMU
+	if (cemu_cache_tracked)
+		cemu_cache_execute_start(ctrl,
+			cmd.flags & CEMU_EXEC_HOST_CACHE_OVERLAP);
+#endif
 	status = nvme_submit_user_cmd(ns ? ns->queue : ctrl->admin_q, &c,
 			cmd.addr, cmd.data_len, nvme_to_user_ptr(cmd.metadata),
 			cmd.metadata_len, 0, &result, timeout, 0);
+#ifdef CONFIG_NVME_CEMU
+	if (cemu_cache_tracked)
+		cemu_cache_execute_complete(ctrl);
+#endif
 
 	if (status >= 0) {
 		if (put_user(result, &ucmd->result))

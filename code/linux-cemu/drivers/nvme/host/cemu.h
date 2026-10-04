@@ -75,6 +75,9 @@ struct cemu_dev {
 	struct work_struct cache_work;
 	wait_queue_head_t cache_wait;
 	struct ioctl_cemu_cache_stats cache_stats;
+	bool cache_execute_in_progress;
+	bool cache_overlap_enabled;
+	bool cache_aer_pending;
 };
 
 extern int cemu_bdev_major;
@@ -91,5 +94,7 @@ size_t cemu_dev_get_size(struct block_device *bdev);
 void *cemu_dev_get_p2p_addr(struct block_device *bdev);
 void cemu_bio_end_io(struct bio *bio);
 void cemu_cache_aer(struct nvme_ctrl *ctrl, u32 result);
+void cemu_cache_execute_start(struct nvme_ctrl *ctrl, bool overlap_enabled);
+void cemu_cache_execute_complete(struct nvme_ctrl *ctrl);
 
 #endif /* __LINUX_CEMU_H__ */

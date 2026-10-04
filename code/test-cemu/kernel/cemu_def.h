@@ -10,6 +10,8 @@ typedef long long (*cemu_cache_notify_fn)(void *context, unsigned int nsid,
                                           unsigned long long logical_offset,
                                           unsigned long long length,
                                           unsigned long long generation);
+typedef long long (*cemu_cache_complete_fn)(void *context,
+                                            unsigned long long generation);
 
 struct cemu_args {
     int numr;
@@ -23,6 +25,9 @@ struct cemu_args {
     cemu_nvm_io_fn nvm_read;
     cemu_nvm_io_fn nvm_write;
     cemu_cache_notify_fn cache_notify;
+    cemu_cache_complete_fn cache_complete;
+    unsigned long long modeled_cycles;
+    unsigned long long flash_read_bytes;
 } __attribute__((packed));
 
 // re-impl assert

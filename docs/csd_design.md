@@ -197,8 +197,18 @@ and Hash Join replay increment both `flash_read_bytes` and
 The present functional timing model is deliberately simple and inspectable:
 each node charges a fixed 64-cycle launch plus `rows × arg1`, where `arg1` is
 the node initiation interval (default 1).  It is accumulated in
-`CsdSqlExecutionStatus::modeled_cycles`; CEMU's Program Execute runtime
-parameter can then impose a query-level delay for calibration.  The intended
+`CsdSqlExecutionStatus::modeled_cycles`; the kernel also reports actual base
+relation and spill replay bytes as `flash_read_bytes`.  Unless PostgreSQL sets
+an explicit Program Execute runtime, CEMU automatically keeps the request
+outstanding for
+
+```
+max(ceil(modeled_cycles / fpga_clock),
+    ceil(flash_read_bytes / flash_read_bandwidth))
+```
+
+after the VM-Freeze functional callback returns and the guest resumes.  The
+defaults are 250 MHz and 1000 MiB/s in `config_example.json`.  The intended
 calibrated model for each streaming stage is
 
 ```
@@ -220,12 +230,22 @@ per-command launch latency are recorded with every experiment.
 
 An Asynchronous Event Request (AER) is a notification completion, not a DMA
 path for arbitrary table data.  The CSD therefore emits a vendor-specific AER
-notice that identifies a completed input chunk by namespace ID, LBA range,
-and generation.  The host CSD agent consumes the notice, reads the matching
-vendor log-page/ring entry, verifies the generation, and issues ordinary NVMe
-reads or readahead for the range.  Those reads populate the host page cache in
-parallel with CSD computation.  The controller never writes directly into
-host cache pages.
+notice and appends a bounded vendor log entry identifying a completed input
+chunk by namespace, physical offset, relation OID, logical relation offset,
+length, and plan generation.  The guest Linux NVMe driver consumes the notice,
+verifies the generation, resolves the range to registered PostgreSQL heap
+segment file descriptors, and issues ordinary buffered reads.  Those reads
+populate the heap inode page cache in parallel with CEMU's modeled device
+execution window.  The controller never writes directly into host cache
+pages.  A final zero-length event closes the generation only after all
+preceding range entries have been processed.
+
+`csd.cache_fill` enables this best-effort path; `csd.cache_overlap` controls
+whether the driver starts reads while Program Execute is outstanding or
+defers them until completion for an experimental baseline.  A positive
+`csd.cache_wait_ms` is a reproducibility barrier, while the normal zero value
+leaves fill asynchronous.  The stats ioctl exposes command and read-completion
+timestamps plus bytes completed inside the overlap window.
 
 This is consistent with the NVMe event model in the
 [NVMe Base Specification](https://nvmexpress.org/wp-content/uploads/NVM-Express-1_4c-2021.06.28-Ratified.pdf).
@@ -296,4 +316,5 @@ patches these relocations lazily, maps heap files to physical NVM extents,
 creates bounded FDM scan windows and an MRS, submits `NVME_IOCTL_IO_CMD`, checks
 the status range, and decodes result cells into PostgreSQL tuples. SF=1 execution
 of all 22 supplied queries matches HOST results exactly. Per-relation AER cache
-feedback remains the next transport-control milestone.
+return and compute/cache overlap are implemented; feeding observed cache
+residency back into automatic placement remains a later control-loop milestone.

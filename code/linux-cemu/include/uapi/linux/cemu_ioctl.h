@@ -15,6 +15,8 @@
  * them to (void __user *)(uintptr_t) before using copy_from_user helpers.
  */
 #define CEMU_IOCTL_MAGIC  'C'
+#define CEMU_EXEC_CACHE_TRACK        0x40
+#define CEMU_EXEC_HOST_CACHE_OVERLAP 0x80
 
 /* IOCTL_CEMU_DOWNLOAD / IOCTL_CEMU_UNLOAD / ACTIVATE / DEACTIVATE argument */
 struct ioctl_download {
@@ -79,6 +81,12 @@ struct ioctl_cemu_cache_stats {
 	__u64	unmapped_bytes;
 	__u64	controller_dropped;
 	__u64	errors;
+	__u64	final_events;
+	__u64	execute_start_ns;
+	__u64	execute_complete_ns;
+	__u64	first_prefetch_ns;
+	__u64	last_prefetch_ns;
+	__u64	overlap_prefetched_bytes;
 };
 
 /* Wait until the AER worker has completed a cache-fill batch for generation. */

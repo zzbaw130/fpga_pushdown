@@ -132,9 +132,10 @@ struct FakeNvm {
     uint32_t reads;
     uint32_t writes;
     uint32_t notifications;
+    uint32_t completions;
     uint64_t notified_bytes;
     uint64_t last_generation;
-    FakeNvm() : reads(0), writes(0), notifications(0), notified_bytes(0),
+    FakeNvm() : reads(0), writes(0), notifications(0), completions(0), notified_bytes(0),
                 last_generation(0) {}
 };
 
@@ -180,6 +181,14 @@ long long fake_cache_notify(void *context, unsigned int nsid,
         return -1;
     ++nvm->notifications;
     nvm->notified_bytes += length;
+    nvm->last_generation = generation;
+    return 0;
+}
+
+long long fake_cache_complete(void *context, unsigned long long generation)
+{
+    FakeNvm *nvm = static_cast<FakeNvm *>(context);
+    ++nvm->completions;
     nvm->last_generation = generation;
     return 0;
 }
@@ -279,6 +288,7 @@ void test_chunked_nvm_scan()
     args.service_context = &nvm;
     args.nvm_read = fake_nvm_read;
     args.cache_notify = fake_cache_notify;
+    args.cache_complete = fake_cache_complete;
     assert(csd_sql(&args) == 2);
 
     const CsdSqlResultHeader *result =
@@ -292,9 +302,12 @@ void test_chunked_nvm_scan()
     assert(cells[2].integer == 2 && cells[3].integer == 20);
     assert(nvm.reads == 2);
     assert(nvm.notifications == 2);
+    assert(nvm.completions == 1);
     assert(nvm.notified_bytes == 2 * CSD_SQL_PAGE_BYTES);
     assert(nvm.last_generation == header.plan_id);
     assert(execution->flash_read_bytes == 2 * CSD_SQL_PAGE_BYTES);
+    assert(args.flash_read_bytes == execution->flash_read_bytes);
+    assert(args.modeled_cycles == execution->modeled_cycles);
     assert(execution->input_chunks == 1);
     assert(execution->fifo_batches == 2);
     assert(execution->fifo_write_bytes > 0);

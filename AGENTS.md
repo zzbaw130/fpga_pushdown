@@ -225,7 +225,17 @@ DISTINCT 仍保留 compatibility/protection-copy 路径。
 ## 9. 时延模型和已测性能
 
 每个 node 当前计 `64-cycle launch + rows * arg1`，`arg1` 是 II，默认 1；总计写入
-`modeled_cycles`。CEMU Program Execute `runtime` 可施加 query-level 模拟时延。论文
+`modeled_cycles`。CSD kernel 同时返回本次真实 scan/replay 的 `flash_read_bytes`。
+当 PostgreSQL 的 `csd.program_runtime=0` 时，CEMU 自动使用下式决定解冻 guest 后
+Program Execute 仍保持 outstanding 的设备时延；正数 `program_runtime` 仍可显式覆盖：
+
+```text
+T_device = max(modeled_cycles / fpga_clock,
+               flash_read_bytes / flash_read_bandwidth)
+```
+
+当前 `config_example.json` 默认 `fpga_clock_mhz=250`、`flash_read_mb_s=1000`。功能性
+C++ kernel 仍在 TCG VM-Freeze 中运行，其 host wall time 不计入 `T_device`。论文
 校准目标公式：
 
 ```text
@@ -318,10 +328,21 @@ CSD plan 中没有 host scan/join/aggregate/sort，允许顶层 PostgreSQL `Limi
    page cache。仅按 physical LBA 读 block device 不等价于填 heap inode page cache。
 7. 新 ioctl：`CACHE_BEGIN(0x07)`、`CACHE_REGISTER(0x08)`、`CACHE_STATS(0x09)`、
    `CACHE_WAIT(0x0a)`。统计包含 active/completed generation、sequence、events、
-   notified/prefetched/unmapped bytes、requests、controller dropped 和 errors。
+   notified/prefetched/unmapped bytes、requests、controller dropped、errors，以及
+   execute start/complete、first/last prefetch 和 overlap-prefetched bytes 时间线。
 8. PostgreSQL GUC：`csd.cache_fill` 默认 `on`；`csd.cache_wait_ms` 默认 `0`，即查询
    不等待异步 worker。实验可设非零值作为完成屏障；回填失败只产生 warning/cache
-   miss，不允许让本来正确的 CSD SQL 失败。`csd.profile=on` 输出每代统计。
+   miss，不允许让本来正确的 CSD SQL 失败。`csd.cache_overlap` 默认 `on`；关闭时
+   driver 保留 AER 事件但延迟到 Program Execute 完成后才启动 worker，作为 A/B
+   基线。`csd.profile=on` 输出每代统计。
+9. CSD kernel 在最后一个 scan 通知后发送显式 FINAL event；只有 cache worker 按序
+   处理完此前的数据 event 后才推进 `completed_generation`，因此 `CACHE_WAIT` 不会
+   把“最后一个通知已发出”误当成“全部文件页已进入 host page cache”。
+
+计算/回填重叠验证位于 `results/tpch_sf1_cache_compute_overlap.md`：默认自动模型在
+SF=1 `count(lineitem)` 上产生约 1.218 s outstanding window。关闭重叠时窗口内完成
+0 B；开启时两次分别完成 36,700,160 B 和 17,825,792 B，首块完成均早于命令完成，
+且 6,001,215 行结果、总回填 1,276,665,856 B、零 error 均保持一致。
 
 已验证的 SF=1 缓存收益位于 `results/tpch_sf1_aer_cache_validation.{md,csv}`：
 
@@ -335,9 +356,12 @@ CSD plan 中没有 host scan/join/aggregate/sort，允许顶层 PostgreSQL `Limi
 
 必须诚实保留的限制：
 
-- TCG VM-Freeze 会在 Program Execute 期间冻结 guest CPU，所以 Linux AER completion
-  和 worker 只能在本次 CSD kernel 返回后运行；当前实验只证明后续 HOST 查询加速，
-  不能宣称模拟器已展示同一次 CSD 计算与 guest 回填线程重叠。
+- 功能性 C++ kernel 仍在 VM-Freeze 内执行；真正观测到的重叠发生在功能模型返回、
+  guest 解冻，但 Program Execute 仍由 CEMU scheduler 按 FPGA/Flash 模型保持 pending
+  的设备执行窗口。不能把冻结期间的 C++ host wall time当作 FPGA 计算时间。
+- TCG guest 的 buffered-read worker 完整回填 1.27 GB 约需 24 s，显著慢于当前
+  1.218 s 模型窗口；因此本轮只证明 17--37 MB 实际重叠，没有证明同一条 CSD 查询
+  wall time 显著降低。已经验证的 2.0833x 是回填完成后下一条 HOST scan 的收益。
 - 连续 22-query 回归结束时 controller 全局累计 dropped=30，说明 64-entry ring 在
   某些复杂查询的一次 freeze 窗口中会覆盖事件。它不影响 SQL 正确性，只损失部分
   cache opportunity；论文应报告该值，后续可扩大 log 或做跨 ring 的 range 合并。
