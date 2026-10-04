@@ -35,6 +35,12 @@ AER 组的显式等待只用于建立可重复的实验屏障。正常配置默�
 `controller_dropped=0`、`errors=0`。原始数字也保存在
 `tpch_sf1_aer_cache_validation.csv`。
 
+在 cache worker 改为 folio no-copy wait，并以 32 MiB pipeline group 提交 readahead
+后，又按同一方法完成一轮复测：关闭回填时 HOST 为 23,492.340 ms，完整回填后为
+10,474.203 ms，speedup 2.2429x、延迟降低 55.41%。该轮仍完成
+1,276,665,856 B，`unmapped_bytes=0`、`controller_dropped=0`、`errors=0`；原始
+`EXPLAIN`、CSV 和 ioctl JSON 位于 `tpch_sf1_aer_cache_pipeline_raw/`。
+
 ## 正确性回归
 
 启用默认异步回填（`csd.cache_fill=on`、`csd.cache_wait_ms=0`）后，TPC-H Q1-Q22
@@ -53,6 +59,7 @@ controller 的全局累计 dropped 为 30。它说明 64-entry bounded ring 在�
 后保留独立的模型化设备窗口，所以它只证明回填能够加速后续 HOST 查询。后续实现已
 保留 VM-Freeze：C++ functional kernel 仍在冻结区间运行；kernel 返回并解冻 guest 后，
 CEMU 根据 FPGA 周期和 Flash 字节数继续保持 NVMe 命令 outstanding，Linux AER worker
-可在该窗口内运行。SF=1 已实测 17--37 MB buffered reads 在约 1.218 s 命令窗口内完成，
-详见 `tpch_sf1_cache_compute_overlap.md`。不得把冻结区间的 C++ wall time 计入 FPGA
+可在该窗口内运行。最终实现已实测 128 MiB cache fill 在约 1.218 s 命令窗口内完成，
+完整回填的首末完成区间为 10.553 s、有效吞吐 115.37 MiB/s，详见
+`tpch_sf1_cache_compute_overlap.md`。不得把冻结区间的 C++ wall time 计入 FPGA
 时延，也不得把该重叠结果扩写为当前查询已有显著 wall-time speedup。

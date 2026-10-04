@@ -323,9 +323,12 @@ CSD plan 中没有 host scan/join/aggregate/sort，允许顶层 PostgreSQL `Limi
 5. PostgreSQL 在 Program Execute 前调用 `IOCTL_CEMU_CACHE_BEGIN`，再按 plan relation
    去重并注册每个 main-fork segment fd、OID、generation、relation logical base 和
    length。kernel 持有 file reference，用户态关闭 fd 不影响 worker。
-6. cache worker 用 relation OID + logical range 找到正确 heap inode segment，先发
-   `POSIX_FADV_WILLNEED`，再以 1 MiB 普通 buffered read 等待范围真正进入 filesystem
-   page cache。仅按 physical LBA 读 block device 不等价于填 heap inode page cache。
+6. cache worker 用 relation OID + logical range 找到正确 heap inode segment。Linux
+   会把单个 `POSIX_FADV_WILLNEED` 限制为 backing-device readahead window（本机默认
+   128 KiB），因此 worker 以该窗口提交预读，但先提交一个 32 MiB pipeline group 再
+   等待。它用 folio Uptodate 状态确认真实 I/O 完成，不再把每个字节 `kernel_read` 到
+   临时缓冲区；仅在内存压力漏页时以 `read_mapping_page` 补页。仅按 physical LBA 读
+   block device 不等价于填 heap inode page cache。
 7. 新 ioctl：`CACHE_BEGIN(0x07)`、`CACHE_REGISTER(0x08)`、`CACHE_STATS(0x09)`、
    `CACHE_WAIT(0x0a)`。统计包含 active/completed generation、sequence、events、
    notified/prefetched/unmapped bytes、requests、controller dropped、errors，以及
@@ -340,17 +343,21 @@ CSD plan 中没有 host scan/join/aggregate/sort，允许顶层 PostgreSQL `Limi
    把“最后一个通知已发出”误当成“全部文件页已进入 host page cache”。
 
 计算/回填重叠验证位于 `results/tpch_sf1_cache_compute_overlap.md`：默认自动模型在
-SF=1 `count(lineitem)` 上产生约 1.218 s outstanding window。关闭重叠时窗口内完成
-0 B；开启时两次分别完成 36,700,160 B 和 17,825,792 B，首块完成均早于命令完成，
-且 6,001,215 行结果、总回填 1,276,665,856 B、零 error 均保持一致。
+SF=1 `count(lineitem)` 上产生约 1.218 s outstanding window。最终 no-copy/pipelined
+版本关闭重叠时窗口内完成 0 B，开启时完成 134,217,728 B（128 MiB）；完整回填的
+首末完成区间为 10.553 s、115.37 MiB/s，旧 buffered-read warm 版本为 22.973 s、
+53.00 MiB/s。6,001,215 行结果、总回填 1,276,665,856 B、零 error 均保持一致。
 
 已验证的 SF=1 缓存收益位于 `results/tpch_sf1_aer_cache_validation.{md,csv}`：
 
 - 三轮都执行“restart PostgreSQL + drop guest page cache + forced CSD count(lineitem) +
   forced HOST count(lineitem)”。关闭回填 HOST 均值 22,537.964 ms；AER 完整回填后
   10,818.313 ms，speedup 2.0833x，平均延迟降低 52.00%。
+- no-copy/pipelined 版本另做一轮同方法复测：关闭回填后 HOST 为 23,492.340 ms，
+  回填后为 10,474.203 ms，speedup 2.2429x、延迟降低 55.41%；原始结果位于
+  `results/tpch_sf1_aer_cache_pipeline_raw/`。
 - 每轮结果均为 6,001,215；AER 合并为 1 个 event，通知/完成 1,276,665,856 B，跨
-  两个 heap segment 发 2 个 buffered-read 请求，unmapped/drop/error 均为 0。
+  两个 heap segment 形成 2 个 cache-fill 请求，unmapped/drop/error 均为 0。
 - 默认异步回填下重新执行 TPC-H Q1-Q22，22/22 与 HOST byte-for-byte exact；原始
   输出归档在 `results/tpch_sf1_aer_exact_final.tar.gz`。
 
@@ -359,9 +366,11 @@ SF=1 `count(lineitem)` 上产生约 1.218 s outstanding window。关闭重叠时
 - 功能性 C++ kernel 仍在 VM-Freeze 内执行；真正观测到的重叠发生在功能模型返回、
   guest 解冻，但 Program Execute 仍由 CEMU scheduler 按 FPGA/Flash 模型保持 pending
   的设备执行窗口。不能把冻结期间的 C++ host wall time当作 FPGA 计算时间。
-- TCG guest 的 buffered-read worker 完整回填 1.27 GB 约需 24 s，显著慢于当前
-  1.218 s 模型窗口；因此本轮只证明 17--37 MB 实际重叠，没有证明同一条 CSD 查询
-  wall time 显著降低。已经验证的 2.0833x 是回填完成后下一条 HOST scan 的收益。
+- TCG guest 的 no-copy/pipelined worker 完整回填 1.27 GB 的首末完成区间仍约 10.55 s，
+  显著慢于当前 1.218 s 模型窗口；因此本轮证明 128 MiB 实际重叠，但没有证明同一条
+  CSD 查询 wall time 显著降低。2.0833x（三轮旧基线）与 2.2429x（最终版本一轮复测）
+  都是完整回填后下一条 HOST scan 的收益。该 115.37 MiB/s 是 TCG/Linux 原型路径，
+  不能写成真实 NVMe SSD 的介质带宽。
 - 连续 22-query 回归结束时 controller 全局累计 dropped=30，说明 64-entry ring 在
   某些复杂查询的一次 freeze 窗口中会覆盖事件。它不影响 SQL 正确性，只损失部分
   cache opportunity；论文应报告该值，后续可扩大 log 或做跨 ring 的 range 合并。

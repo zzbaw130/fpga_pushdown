@@ -1,4 +1,5 @@
 #include <linux/blkdev.h>
+#include <linux/backing-dev.h>
 #include <linux/dma-mapping.h>
 #include <linux/pci.h>
 #include <linux/module.h>
@@ -12,7 +13,8 @@
 #include <linux/io_uring/cmd.h>
 #include <linux/mutex.h>
 #include <linux/jiffies.h>
-#include <linux/vmalloc.h>
+#include <linux/pagemap.h>
+#include <linux/pagevec.h>
 
 #include "cemu.h"
 #include "../../../fs/fdmfs/fdmfs.h"
@@ -46,7 +48,7 @@ static struct mutex g_lock;
 #define CEMU_CACHE_EVENT_CAPACITY	64
 #define CEMU_CACHE_AER_INFO		0x01
 #define CEMU_CACHE_EVENT_FINAL		0x01
-#define CEMU_CACHE_READ_BYTES		(1024U * 1024U)
+#define CEMU_CACHE_PIPELINE_BYTES	(32ULL << 20)
 
 struct cemu_cache_event {
 	__le64 sequence;
@@ -344,67 +346,130 @@ static int cemu_cache_wait(struct cemu_dev *dev, unsigned long arg)
 	return result ? 0 : -ETIMEDOUT;
 }
 
+static int cemu_cache_wait_window(struct file *file, loff_t offset, u64 length,
+				  u64 *completed)
+{
+	struct address_space *mapping = file->f_mapping;
+	pgoff_t index = offset >> PAGE_SHIFT;
+	pgoff_t last = (offset + length - 1) >> PAGE_SHIFT;
+	u64 request_start = offset;
+	u64 request_end = offset + length;
+
+	while (index <= last) {
+		struct folio_batch fbatch;
+		unsigned int count, i;
+
+		folio_batch_init(&fbatch);
+		count = filemap_get_folios_contig(mapping, &index, last,
+						   &fbatch);
+		if (!count) {
+			/*
+			 * Readahead can omit a folio under transient memory pressure.
+			 * Populate only that exceptional page synchronously; unlike the
+			 * old kernel_read loop this does not copy its contents into a
+			 * throwaway buffer.
+			 */
+			struct page *page = read_mapping_page(mapping, index, file);
+			u64 page_start, page_end;
+
+			if (IS_ERR(page))
+				return PTR_ERR(page);
+			page_start = (u64)index << PAGE_SHIFT;
+			page_end = page_start + PAGE_SIZE;
+			*completed += min(page_end, request_end) -
+				      max(page_start, request_start);
+			put_page(page);
+			index++;
+			continue;
+		}
+
+		for (i = 0; i < count; ++i) {
+			struct folio *folio = fbatch.folios[i];
+			u64 folio_start, folio_end;
+
+			folio_wait_locked(folio);
+			if (!folio_test_uptodate(folio)) {
+				folio_batch_release(&fbatch);
+				return -EIO;
+			}
+			folio_start = folio_pos(folio);
+			folio_end = folio_start + folio_size(folio);
+			*completed += min(folio_end, request_end) -
+				      max(folio_start, request_start);
+		}
+		folio_batch_release(&fbatch);
+	}
+	return 0;
+}
+
 /*
- * Populate the inode page cache, not merely the block-device cache.  The
- * WILLNEED hint starts readahead, while the buffered reads below wait for the
- * requested range to become resident before completed_generation advances.
- * This makes CACHE_WAIT useful for reproducible experiments; without the
- * reads, fadvise may return while a later PostgreSQL scan is still racing the
- * asynchronous readahead I/O.
+ * Populate the inode page cache, not merely the block-device cache.  Linux
+ * caps one WILLNEED request to the backing device's readahead window, so issue
+ * one request per window.  Submit a 32-MiB group before waiting so the NVMe
+ * queue can keep multiple reads in flight instead of serialising every 128-KiB
+ * default window.  Waiting for the resulting folios to become Uptodate proves
+ * I/O completion without copying every byte through a TCG-executed temporary
+ * buffer.
  */
 static int cemu_cache_fill_file(struct cemu_dev *dev, struct file *file,
 				u64 offset, u64 length, u64 *completed)
 {
-	char *buffer;
+	struct address_space *mapping = file->f_mapping;
+	struct backing_dev_info *bdi = inode_to_bdi(mapping->host);
 	loff_t position = offset;
 	u64 remaining = length;
-	u64 completed_at;
+	u64 window_pages;
 	int ret;
 
 	*completed = 0;
-	ret = vfs_fadvise(file, position, length, POSIX_FADV_WILLNEED);
-	if (ret)
-		return ret;
-
-	buffer = kvmalloc(min_t(u64, length, CEMU_CACHE_READ_BYTES), GFP_KERNEL);
-	if (!buffer)
-		return -ENOMEM;
+	window_pages = max_t(unsigned long, bdi->io_pages,
+			     file->f_ra.ra_pages);
+	if (!window_pages)
+		window_pages = 1;
 
 	while (remaining) {
-		size_t requested = min_t(u64, remaining, CEMU_CACHE_READ_BYTES);
-		ssize_t bytes = kernel_read(file, buffer, requested, &position);
+		u64 group_length = min_t(u64, remaining,
+					 CEMU_CACHE_PIPELINE_BYTES);
+		u64 submitted = 0;
+		u64 group_completed = 0;
+		u64 completed_at;
 
-		if (bytes < 0) {
-			ret = bytes;
-			goto out;
+		while (submitted < group_length) {
+			u64 requested = min_t(u64, group_length - submitted,
+						window_pages << PAGE_SHIFT);
+
+			ret = vfs_fadvise(file, position + submitted, requested,
+					  POSIX_FADV_WILLNEED);
+			if (ret)
+				return ret;
+			submitted += requested;
 		}
-		if (!bytes) {
-			ret = -EIO;
-			goto out;
-		}
-		remaining -= bytes;
-		*completed += bytes;
+		ret = cemu_cache_wait_window(file, position, group_length,
+					     &group_completed);
+		if (ret)
+			return ret;
+		if (group_completed != group_length)
+			return -EIO;
+		position += group_length;
+		remaining -= group_length;
+		*completed += group_length;
 		completed_at = ktime_get_ns();
 
 		/*
 		 * Continuous scan notifications are deliberately coalesced by the
-		 * controller and can describe an entire relation.  Account overlap
-		 * at the actual 1 MiB read-completion boundary; waiting until the
-		 * complete coalesced event finishes would hide useful work completed
-		 * while Program Execute was still outstanding.
+		 * controller and can describe an entire relation.  Account overlap at
+		 * each pipeline-group completion; waiting until the complete coalesced
+		 * event finishes would hide useful concurrent work.
 		 */
 		mutex_lock(&dev->cache_lock);
 		if (!dev->cache_stats.first_prefetch_ns)
 			dev->cache_stats.first_prefetch_ns = completed_at;
 		dev->cache_stats.last_prefetch_ns = completed_at;
 		if (dev->cache_execute_in_progress)
-			dev->cache_stats.overlap_prefetched_bytes += bytes;
+			dev->cache_stats.overlap_prefetched_bytes += group_length;
 		mutex_unlock(&dev->cache_lock);
 	}
-	ret = 0;
-out:
-	kvfree(buffer);
-	return ret;
+	return 0;
 }
 
 static void cemu_cache_work(struct work_struct *work)

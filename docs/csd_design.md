@@ -234,11 +234,14 @@ notice and appends a bounded vendor log entry identifying a completed input
 chunk by namespace, physical offset, relation OID, logical relation offset,
 length, and plan generation.  The guest Linux NVMe driver consumes the notice,
 verifies the generation, resolves the range to registered PostgreSQL heap
-segment file descriptors, and issues ordinary buffered reads.  Those reads
-populate the heap inode page cache in parallel with CEMU's modeled device
-execution window.  The controller never writes directly into host cache
-pages.  A final zero-length event closes the generation only after all
-preceding range entries have been processed.
+segment file descriptors, and issues inode readahead.  Linux limits one
+`POSIX_FADV_WILLNEED` call to the backing device's readahead window, so the
+worker submits all such windows in a 32-MiB pipeline group before waiting for
+their folios to become Uptodate.  It does not copy relation bytes through a
+throwaway kernel buffer.  This populates the heap inode page cache in parallel
+with CEMU's modeled device execution window; the controller never writes
+directly into host cache pages.  A final zero-length event closes the
+generation only after all preceding range entries have been processed.
 
 `csd.cache_fill` enables this best-effort path; `csd.cache_overlap` controls
 whether the driver starts reads while Program Execute is outstanding or

@@ -1,0 +1,15 @@
+                                                         QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=187943.72..187943.73 rows=1 width=8) (actual rows=1 loops=1)
+   Buffers: shared read=155843
+   ->  Gather  (cost=187943.50..187943.71 rows=2 width=8) (actual rows=3 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared read=155843
+         ->  Partial Aggregate  (cost=186943.50..186943.51 rows=1 width=8) (actual rows=1 loops=3)
+               Buffers: shared read=155843
+               ->  Parallel Seq Scan on lineitem  (cost=0.00..180723.40 rows=2488040 width=0) (actual rows=2000405 loops=3)
+                     Buffers: shared read=155843
+ Planning Time: 21.528 ms
+ Execution Time: 23492.340 ms
+(12 rows)
