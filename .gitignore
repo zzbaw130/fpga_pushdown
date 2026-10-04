@@ -1,5 +1,7 @@
 code/dqib_amd64-pc
 build/
+__pycache__/
+*.pyc
 code/test-cemu/build/
 .pgsock_*/
 results/**/*.log

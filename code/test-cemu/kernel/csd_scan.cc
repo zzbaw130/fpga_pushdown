@@ -130,11 +130,16 @@
             const uint64_t within_extent = current - extent.logical_offset;
             const uint64_t transfer = std::min<uint64_t>(length - copied,
                 extent.length - within_extent);
+            const uint64_t physical_offset = extent.nvm_offset + within_extent;
             if (transfer == 0 ||
                 args_->nvm_read(args_->service_context, extent.nsid,
-                                extent.nvm_offset + within_extent,
-                                target + copied, transfer) != 0)
+                                physical_offset, target + copied, transfer) != 0)
                 return fail(CSD_SQL_STATUS_NO_INPUT_RANGE, index, 0x10d);
+            if (args_->cache_notify != NULL)
+                (void) args_->cache_notify(args_->service_context, extent.nsid,
+                                           spec.relation_oid, physical_offset,
+                                           current, transfer,
+                                           header_->plan_id);
             copied += transfer;
         }
         if (copied != length)

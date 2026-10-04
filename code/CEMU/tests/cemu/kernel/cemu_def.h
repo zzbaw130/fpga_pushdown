@@ -4,6 +4,12 @@
 typedef long long (*cemu_nvm_io_fn)(void *context, unsigned int nsid,
                                     unsigned long long byte_offset,
                                     void *buffer, unsigned long long length);
+typedef long long (*cemu_cache_notify_fn)(void *context, unsigned int nsid,
+                                          unsigned int relation_oid,
+                                          unsigned long long physical_offset,
+                                          unsigned long long logical_offset,
+                                          unsigned long long length,
+                                          unsigned long long generation);
 
 struct cemu_args {
     int numr;
@@ -16,6 +22,7 @@ struct cemu_args {
     void *service_context;
     cemu_nvm_io_fn nvm_read;
     cemu_nvm_io_fn nvm_write;
+    cemu_cache_notify_fn cache_notify;
 } __attribute__((packed));
 
 // re-impl assert

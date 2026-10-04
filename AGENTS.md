@@ -68,6 +68,9 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
   guest 中运行主机编译产物。
 - 9P 仅用于源码共享和一次性数据装载，不进入性能关键路径。PGDATA 从 9P 复制到
   CEMU NVMe 后运行，禁止每次查询复制整表或 cluster。
+- 当前 CEMU FTL 的 LPN->PPA 映射没有随容器/控制器重启持久化；即使 backing volume
+  仍存在，重启后的 namespace 也会表现为空盘。镜像重建后需重新执行
+  `stage_tpch_nvme.sh`，不能把这段 9P->NVMe 恢复时间计入查询实验。
 - 默认先用 SF=1 做功能和快速回归，再用 SF=32 验证内存边界和可扩展性。
 - FDMFS 表示 CSD 内存，不是无限磁盘。默认总容量 4 GiB。表数据按默认 32 MiB
   scan window 从 NVMe 分块进入 FDM；不得把大表整体复制到 FDMFS。
@@ -288,41 +291,59 @@ CSD plan 中没有 host scan/join/aggregate/sort，允许顶层 PostgreSQL `Limi
 编排。性能回归需固定 cache 状态、runtime、parallel workers、FDM/spill 参数，保留
 原始 result/status，不可只保存汇总图。
 
-## 11. AER 与缓存阶段（2026-10-04 开始）
+## 11. AER 与缓存回填（2026-10-04 已实现）
 
 前置事实：FEMU 原代码虽声明 `aer_reqs`、`aer_queue` 和 command-effect support，管理
 命令 switch 实际没有 `ASYNC_EVENT_REQUEST`，Linux 发出的 AER 会收到 invalid opcode。
 
-正在实现的最小闭环：
+已实现的端到端闭环：
 
 1. FEMU 支持真正 pending 的 AER：admin SQ 消费命令但不立即 CQ completion；事件到达
    后由 QEMU bottom half 在 admin CQ 有空间时完成。controller reset/exit 回收 pending
    request 和 queued event。
-2. vendor log page `0xC0` 保存 bounded chunk ring。entry 至少包含 sequence、plan
-   generation、nsid、physical offset 和 length；后续为 host file-cache mapping 增加
-   relation OID 与 relation logical offset。ring 满时允许覆盖最旧 entry 并累计 dropped，
-   暂不追求强一致性。
+2. vendor log page `0xC0` 保存 64-entry bounded chunk ring。entry 包含 sequence、plan
+   generation、nsid、physical offset、relation OID、relation logical offset、length 和
+   flags。相同 generation/relation 的相邻 logical chunk 会合并；ring 满时覆盖最旧
+   entry 并累计 dropped，符合当前 best-effort、弱一致性目标。
 3. `cemu_args`/`ubpf_jit_args` 增加 `cache_notify` callback。chunked Scan 每次成功读取
    physical extent 后发通知；通知失败是 opportunistic cache miss，不能使 SQL 失败。
-4. Linux host driver 识别 vendor AER，读取 log page，并把 entry 暴露给 cache worker；
-   AER 本身不能携带或 DMA table data。
-5. cache worker 根据 relation OID + logical offset 对 heap file 发普通 `readahead`/buffered
-   read，以真正填 PostgreSQL 所在主机的 filesystem page cache。仅按 physical LBA 读
-   block device 不等价于填 heap inode page cache，不能用它伪造缓存效果。
-6. 若 host file-cache mapping 成本过高，可并行实现 query 间持久 FDM chunk cache，键为
-   `(nsid, physical offset, length, generation)`，只使用 4 GiB FDM 中未被 query reservation
-   占用的富余空间；必须可逐出并与 operator arena 共同计费。
+4. Linux NVMe host driver 即使 FEMU 未声明标准 OAES，也会为 CEMU quirk 保持一个
+   outstanding AER。收到 vendor event 后在 `nvme_wq` 读取 log page 并调度 cache
+   worker；AER 本身不携带或 DMA table data。
+5. PostgreSQL 在 Program Execute 前调用 `IOCTL_CEMU_CACHE_BEGIN`，再按 plan relation
+   去重并注册每个 main-fork segment fd、OID、generation、relation logical base 和
+   length。kernel 持有 file reference，用户态关闭 fd 不影响 worker。
+6. cache worker 用 relation OID + logical range 找到正确 heap inode segment，先发
+   `POSIX_FADV_WILLNEED`，再以 1 MiB 普通 buffered read 等待范围真正进入 filesystem
+   page cache。仅按 physical LBA 读 block device 不等价于填 heap inode page cache。
+7. 新 ioctl：`CACHE_BEGIN(0x07)`、`CACHE_REGISTER(0x08)`、`CACHE_STATS(0x09)`、
+   `CACHE_WAIT(0x0a)`。统计包含 active/completed generation、sequence、events、
+   notified/prefetched/unmapped bytes、requests、controller dropped 和 errors。
+8. PostgreSQL GUC：`csd.cache_fill` 默认 `on`；`csd.cache_wait_ms` 默认 `0`，即查询
+   不等待异步 worker。实验可设非零值作为完成屏障；回填失败只产生 warning/cache
+   miss，不允许让本来正确的 CSD SQL 失败。`csd.profile=on` 输出每代统计。
 
-缓存收益实验至少包含：
+已验证的 SF=1 缓存收益位于 `results/tpch_sf1_aer_cache_validation.{md,csv}`：
 
-- AER/backfill 关闭 vs 开启；首次 CSD 查询相同，随后执行复用同一大表的 HOST 或 CSD
-  查询。
-- 记录 event、log entries、dropped、prefetch bytes、cache hits/misses、重复 Flash reads、
-  query wall time 和 cache fraction。
-- 结果仍需 exact；generation 不匹配的 entry 丢弃即可。当前论文原型不要求处理所有
-  truncate/rewrite/drop 并发竞态，但必须在局限章节明确。
-- 最终要证明“计算与回填重叠后，后续查询比无回填 baseline 更快”，不能仅证明 AER
-  completion 被触发。
+- 三轮都执行“restart PostgreSQL + drop guest page cache + forced CSD count(lineitem) +
+  forced HOST count(lineitem)”。关闭回填 HOST 均值 22,537.964 ms；AER 完整回填后
+  10,818.313 ms，speedup 2.0833x，平均延迟降低 52.00%。
+- 每轮结果均为 6,001,215；AER 合并为 1 个 event，通知/完成 1,276,665,856 B，跨
+  两个 heap segment 发 2 个 buffered-read 请求，unmapped/drop/error 均为 0。
+- 默认异步回填下重新执行 TPC-H Q1-Q22，22/22 与 HOST byte-for-byte exact；原始
+  输出归档在 `results/tpch_sf1_aer_exact_final.tar.gz`。
+
+必须诚实保留的限制：
+
+- TCG VM-Freeze 会在 Program Execute 期间冻结 guest CPU，所以 Linux AER completion
+  和 worker 只能在本次 CSD kernel 返回后运行；当前实验只证明后续 HOST 查询加速，
+  不能宣称模拟器已展示同一次 CSD 计算与 guest 回填线程重叠。
+- 连续 22-query 回归结束时 controller 全局累计 dropped=30，说明 64-entry ring 在
+  某些复杂查询的一次 freeze 窗口中会覆盖事件。它不影响 SQL 正确性，只损失部分
+  cache opportunity；论文应报告该值，后续可扩大 log 或做跨 ring 的 range 合并。
+- generation 只处理计划轮次陈旧事件，不覆盖生产级 truncate/rewrite/drop 并发一致性。
+- 本阶段选择 host filesystem page cache，没有占用 4 GiB FDM 的 operator arena；若
+  后续实现持久 FDM chunk cache，必须支持逐出并与 scan/FIFO/spill staging 共同计费。
 
 ## 12. 常见陷阱
 

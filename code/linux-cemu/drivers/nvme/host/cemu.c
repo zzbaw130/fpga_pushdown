@@ -4,12 +4,15 @@
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/fadvise.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/pci-p2pdma.h>
 #include <linux/list.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/mutex.h>
+#include <linux/jiffies.h>
+#include <linux/vmalloc.h>
 
 #include "cemu.h"
 #include "../../../fs/fdmfs/fdmfs.h"
@@ -36,6 +39,43 @@ struct cemu_dev *cemu_bdev[CEMU_MAX_MINOR];
 static struct class *bdev_class;
 static struct class *cdev_class;
 static struct mutex g_lock;
+
+#define CEMU_CACHE_LOG_ID		0xc0
+#define CEMU_CACHE_LOG_MAGIC		0x41435343U
+#define CEMU_CACHE_LOG_VERSION		1
+#define CEMU_CACHE_EVENT_CAPACITY	64
+#define CEMU_CACHE_AER_INFO		0x01
+#define CEMU_CACHE_READ_BYTES		(1024U * 1024U)
+
+struct cemu_cache_event {
+	__le64 sequence;
+	__le64 generation;
+	__le64 physical_offset;
+	__le64 logical_offset;
+	__le64 byte_length;
+	__le32 nsid;
+	__le32 relation_oid;
+	__le32 flags;
+	__le32 reserved;
+} __packed;
+
+struct cemu_cache_log_header {
+	__le32 magic;
+	__le16 version;
+	__le16 header_bytes;
+	__le16 entry_bytes;
+	__le16 capacity;
+	__le32 count;
+	__le64 first_sequence;
+	__le64 next_sequence;
+	__le64 dropped;
+	__le64 reserved[2];
+} __packed;
+
+struct cemu_cache_log {
+	struct cemu_cache_log_header header;
+	struct cemu_cache_event events[CEMU_CACHE_EVENT_CAPACITY];
+} __packed;
 
 size_t cemu_dev_get_size(struct block_device *bdev)
 {
@@ -195,6 +235,251 @@ static void __remove_program_locked(struct cemu_dev *dev, struct sysfs_program *
 	kfree(prog->attr.attr.name);
 	kfree(prog);
 }
+
+static void __cemu_cache_clear_mappings(struct cemu_dev *dev)
+{
+	struct cemu_cache_mapping *mapping, *tmp;
+
+	list_for_each_entry_safe(mapping, tmp, &dev->cache_mappings, list) {
+		list_del(&mapping->list);
+		fput(mapping->file);
+		kfree(mapping);
+	}
+}
+
+static int cemu_cache_begin(struct cemu_dev *dev, unsigned long arg)
+{
+	struct ioctl_cemu_cache_begin begin;
+
+	if (copy_from_user(&begin, (void __user *)arg, sizeof(begin)))
+		return -EFAULT;
+	if (!begin.generation)
+		return -EINVAL;
+
+	/* Finish any older AER snapshot before replacing its file mappings. */
+	flush_work(&dev->cache_work);
+	mutex_lock(&dev->cache_lock);
+	__cemu_cache_clear_mappings(dev);
+	memset(&dev->cache_stats, 0, sizeof(dev->cache_stats));
+	dev->cache_stats.active_generation = begin.generation;
+	mutex_unlock(&dev->cache_lock);
+	return 0;
+}
+
+static int cemu_cache_register(struct cemu_dev *dev, unsigned long arg)
+{
+	struct ioctl_cemu_cache_register registration;
+	struct cemu_cache_mapping *mapping;
+	struct file *file;
+
+	if (copy_from_user(&registration, (void __user *)arg,
+				   sizeof(registration)))
+		return -EFAULT;
+	if (!registration.generation || !registration.relation_oid ||
+	    !registration.length || registration.fd < 0 ||
+	    registration.logical_offset > U64_MAX - registration.length)
+		return -EINVAL;
+
+	file = fget(registration.fd);
+	if (!file)
+		return -EBADF;
+	if (!S_ISREG(file_inode(file)->i_mode) ||
+	    registration.length > i_size_read(file_inode(file))) {
+		fput(file);
+		return -EINVAL;
+	}
+	mapping = kzalloc(sizeof(*mapping), GFP_KERNEL);
+	if (!mapping) {
+		fput(file);
+		return -ENOMEM;
+	}
+	mapping->file = file;
+	mapping->generation = registration.generation;
+	mapping->relation_oid = registration.relation_oid;
+	mapping->logical_offset = registration.logical_offset;
+	mapping->length = registration.length;
+
+	mutex_lock(&dev->cache_lock);
+	if (dev->cache_stats.active_generation != registration.generation) {
+		mutex_unlock(&dev->cache_lock);
+		fput(file);
+		kfree(mapping);
+		return -ESTALE;
+	}
+	list_add_tail(&mapping->list, &dev->cache_mappings);
+	mutex_unlock(&dev->cache_lock);
+	return 0;
+}
+
+static int cemu_cache_get_stats(struct cemu_dev *dev, unsigned long arg)
+{
+	struct ioctl_cemu_cache_stats stats;
+
+	mutex_lock(&dev->cache_lock);
+	stats = dev->cache_stats;
+	mutex_unlock(&dev->cache_lock);
+	if (copy_to_user((void __user *)arg, &stats, sizeof(stats)))
+		return -EFAULT;
+	return 0;
+}
+
+static int cemu_cache_wait(struct cemu_dev *dev, unsigned long arg)
+{
+	struct ioctl_cemu_cache_wait wait;
+	long result;
+
+	if (copy_from_user(&wait, (void __user *)arg, sizeof(wait)))
+		return -EFAULT;
+	if (!wait.generation || !wait.timeout_ms)
+		return -EINVAL;
+	result = wait_event_interruptible_timeout(dev->cache_wait,
+		READ_ONCE(dev->cache_stats.completed_generation) == wait.generation,
+		msecs_to_jiffies(wait.timeout_ms));
+	if (result < 0)
+		return result;
+	return result ? 0 : -ETIMEDOUT;
+}
+
+/*
+ * Populate the inode page cache, not merely the block-device cache.  The
+ * WILLNEED hint starts readahead, while the buffered reads below wait for the
+ * requested range to become resident before completed_generation advances.
+ * This makes CACHE_WAIT useful for reproducible experiments; without the
+ * reads, fadvise may return while a later PostgreSQL scan is still racing the
+ * asynchronous readahead I/O.
+ */
+static int cemu_cache_fill_file(struct file *file, u64 offset, u64 length,
+				u64 *completed)
+{
+	char *buffer;
+	loff_t position = offset;
+	u64 remaining = length;
+	int ret;
+
+	*completed = 0;
+	ret = vfs_fadvise(file, position, length, POSIX_FADV_WILLNEED);
+	if (ret)
+		return ret;
+
+	buffer = kvmalloc(min_t(u64, length, CEMU_CACHE_READ_BYTES), GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+
+	while (remaining) {
+		size_t requested = min_t(u64, remaining, CEMU_CACHE_READ_BYTES);
+		ssize_t bytes = kernel_read(file, buffer, requested, &position);
+
+		if (bytes < 0) {
+			ret = bytes;
+			goto out;
+		}
+		if (!bytes) {
+			ret = -EIO;
+			goto out;
+		}
+		remaining -= bytes;
+		*completed += bytes;
+	}
+	ret = 0;
+out:
+	kvfree(buffer);
+	return ret;
+}
+
+static void cemu_cache_work(struct work_struct *work)
+{
+	struct cemu_dev *dev = container_of(work, struct cemu_dev, cache_work);
+	struct cemu_cache_log *log;
+	u32 count, index;
+	int ret;
+
+	log = kzalloc(sizeof(*log), GFP_KERNEL);
+	if (!log) {
+		mutex_lock(&dev->cache_lock);
+		dev->cache_stats.errors++;
+		mutex_unlock(&dev->cache_lock);
+		wake_up_interruptible(&dev->cache_wait);
+		return;
+	}
+	ret = nvme_get_log(dev->ctrl, NVME_NSID_ALL, CEMU_CACHE_LOG_ID, 0,
+			   NVME_CSI_NVM, log, sizeof(*log), 0);
+	if (ret || le32_to_cpu(log->header.magic) != CEMU_CACHE_LOG_MAGIC ||
+	    le16_to_cpu(log->header.version) != CEMU_CACHE_LOG_VERSION ||
+	    le16_to_cpu(log->header.header_bytes) != sizeof(log->header) ||
+	    le16_to_cpu(log->header.entry_bytes) != sizeof(log->events[0])) {
+		mutex_lock(&dev->cache_lock);
+		dev->cache_stats.errors++;
+		mutex_unlock(&dev->cache_lock);
+		goto out;
+	}
+	count = min_t(u32, le32_to_cpu(log->header.count),
+			  CEMU_CACHE_EVENT_CAPACITY);
+
+	mutex_lock(&dev->cache_lock);
+	dev->cache_stats.controller_dropped =
+		le64_to_cpu(log->header.dropped);
+	for (index = 0; index < count; ++index) {
+		struct cemu_cache_event *event = &log->events[index];
+		struct cemu_cache_mapping *mapping;
+		u64 generation = le64_to_cpu(event->generation);
+		u64 event_start = le64_to_cpu(event->logical_offset);
+		u64 event_length = le64_to_cpu(event->byte_length);
+		u64 event_end;
+		u64 mapped = 0;
+		u32 relation_oid = le32_to_cpu(event->relation_oid);
+
+		dev->cache_stats.events++;
+		dev->cache_stats.last_sequence = le64_to_cpu(event->sequence);
+		if (!event_length || event_start > U64_MAX - event_length) {
+			dev->cache_stats.errors++;
+			continue;
+		}
+		event_end = event_start + event_length;
+		dev->cache_stats.notified_bytes += event_length;
+		list_for_each_entry(mapping, &dev->cache_mappings, list) {
+			u64 mapping_end, overlap_start, overlap_end, file_offset;
+			u64 completed;
+			int fill_result;
+
+			if (mapping->generation != generation ||
+			    mapping->relation_oid != relation_oid)
+				continue;
+			mapping_end = mapping->logical_offset + mapping->length;
+			overlap_start = max(event_start, mapping->logical_offset);
+			overlap_end = min(event_end, mapping_end);
+			if (overlap_start >= overlap_end)
+				continue;
+			file_offset = overlap_start - mapping->logical_offset;
+			fill_result = cemu_cache_fill_file(mapping->file, file_offset,
+				overlap_end - overlap_start, &completed);
+			dev->cache_stats.prefetch_requests++;
+			dev->cache_stats.prefetched_bytes += completed;
+			mapped += completed;
+			if (fill_result)
+				dev->cache_stats.errors++;
+		}
+		if (mapped < event_length)
+			dev->cache_stats.unmapped_bytes += event_length - mapped;
+		dev->cache_stats.completed_generation = generation;
+	}
+	mutex_unlock(&dev->cache_lock);
+out:
+	kfree(log);
+	wake_up_interruptible(&dev->cache_wait);
+}
+
+void cemu_cache_aer(struct nvme_ctrl *ctrl, u32 result)
+{
+	struct cemu_dev *dev = ctrl ? ctrl->cemu_dev : NULL;
+	u8 event_info = (result >> 8) & 0xff;
+	u8 log_page = (result >> 16) & 0xff;
+
+	if (!dev || event_info != CEMU_CACHE_AER_INFO ||
+	    log_page != CEMU_CACHE_LOG_ID)
+		return;
+	queue_work(nvme_wq, &dev->cache_work);
+}
+EXPORT_SYMBOL_GPL(cemu_cache_aer);
 
 static int __maybe_unused remove_program_by_id(struct cemu_dev *dev, int pind)
 {
@@ -546,6 +831,14 @@ static long cemu_cdev_ioctl(struct file *filp, unsigned int ioctl_cmd,
 	case IOCTL_CEMU_DELETE_MRS:
 		printk(KERN_INFO "cemu_cdev_ioctl IOCTL_CEMU_DELETE_MRS\n");
 		return cemu_delete_mrs(dev, arg);
+	case IOCTL_CEMU_CACHE_BEGIN:
+		return cemu_cache_begin(dev, arg);
+	case IOCTL_CEMU_CACHE_REGISTER:
+		return cemu_cache_register(dev, arg);
+	case IOCTL_CEMU_CACHE_STATS:
+		return cemu_cache_get_stats(dev, arg);
+	case IOCTL_CEMU_CACHE_WAIT:
+		return cemu_cache_wait(dev, arg);
 	default:
 		printk(KERN_ERR "CEMU CSD ioctl: unknown ioctl cmd %d!!!\n", ioctl_cmd);
 		return -ENOTTY;
@@ -701,6 +994,10 @@ int cemu_dev_add(struct pci_dev *pdev, struct nvme_ctrl *ctrl)
 	}
 	dev->pdev = pdev;
 	mutex_init(&dev->lock);
+	mutex_init(&dev->cache_lock);
+	INIT_LIST_HEAD(&dev->cache_mappings);
+	INIT_WORK(&dev->cache_work, cemu_cache_work);
+	init_waitqueue_head(&dev->cache_wait);
 
 	ns = nvme_find_get_ns(ctrl, 1);	// FIXME: nsid
 	if (ns == NULL) {
@@ -820,6 +1117,11 @@ void cemu_dev_remove(struct pci_dev *pdev, struct nvme_ctrl *ctrl)
 	struct sysfs_program *prog, *tmp;
 
 	printk(KERN_INFO "CEMU cemu_dev_remove\n");
+	ctrl->cemu_dev = NULL;
+	cancel_work_sync(&dev->cache_work);
+	mutex_lock(&dev->cache_lock);
+	__cemu_cache_clear_mappings(dev);
+	mutex_unlock(&dev->cache_lock);
 	mutex_lock(&g_lock);
 	if (dev->idx >= 0 && dev->idx < CEMU_MAX_MINOR) {
 		cemu_bdev[dev->idx] = NULL;

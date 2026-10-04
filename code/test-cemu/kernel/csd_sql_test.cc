@@ -131,7 +131,11 @@ struct FakeNvm {
     std::vector<unsigned char> bytes;
     uint32_t reads;
     uint32_t writes;
-    FakeNvm() : reads(0), writes(0) {}
+    uint32_t notifications;
+    uint64_t notified_bytes;
+    uint64_t last_generation;
+    FakeNvm() : reads(0), writes(0), notifications(0), notified_bytes(0),
+                last_generation(0) {}
 };
 
 long long fake_nvm_read(void *context, unsigned int nsid,
@@ -157,6 +161,26 @@ long long fake_nvm_write(void *context, unsigned int nsid,
         return -1;
     memcpy(nvm->bytes.data() + byte_offset, buffer, length);
     ++nvm->writes;
+    return 0;
+}
+
+long long fake_cache_notify(void *context, unsigned int nsid,
+                            unsigned int relation_oid,
+                            unsigned long long physical_offset,
+                            unsigned long long logical_offset,
+                            unsigned long long length,
+                            unsigned long long generation)
+{
+    FakeNvm *nvm = static_cast<FakeNvm *>(context);
+    if (nsid != 1 || relation_oid != 42 ||
+        physical_offset > nvm->bytes.size() ||
+        length > nvm->bytes.size() - physical_offset ||
+        logical_offset > 3 * CSD_SQL_PAGE_BYTES ||
+        length > 3 * CSD_SQL_PAGE_BYTES - logical_offset)
+        return -1;
+    ++nvm->notifications;
+    nvm->notified_bytes += length;
+    nvm->last_generation = generation;
     return 0;
 }
 
@@ -229,6 +253,7 @@ void test_chunked_nvm_scan()
     header.output_range = 3;
     header.spill_range = CSD_SQL_INVALID_RANGE;
     header.parallel_workers = 4;
+    header.plan_id = 0xfeedbeef;
     overwrite(&plan, 0, header);
     overwrite(&plan, sizeof(header), node);
 
@@ -253,6 +278,7 @@ void test_chunked_nvm_scan()
     args.cparam2 = 4;
     args.service_context = &nvm;
     args.nvm_read = fake_nvm_read;
+    args.cache_notify = fake_cache_notify;
     assert(csd_sql(&args) == 2);
 
     const CsdSqlResultHeader *result =
@@ -265,6 +291,9 @@ void test_chunked_nvm_scan()
     assert(cells[0].integer == 1 && cells[1].integer == 10);
     assert(cells[2].integer == 2 && cells[3].integer == 20);
     assert(nvm.reads == 2);
+    assert(nvm.notifications == 2);
+    assert(nvm.notified_bytes == 2 * CSD_SQL_PAGE_BYTES);
+    assert(nvm.last_generation == header.plan_id);
     assert(execution->flash_read_bytes == 2 * CSD_SQL_PAGE_BYTES);
     assert(execution->input_chunks == 1);
     assert(execution->fifo_batches == 2);

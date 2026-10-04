@@ -1724,14 +1724,22 @@ static void nvme_enable_aen(struct nvme_ctrl *ctrl)
 	u32 result, supported_aens = ctrl->oaes & NVME_AEN_SUPPORTED;
 	int status;
 
-	if (!supported_aens)
+	if (supported_aens) {
+		status = nvme_set_features(ctrl, NVME_FEAT_ASYNC_EVENT,
+				supported_aens, NULL, 0, &result);
+		if (status)
+			dev_warn(ctrl->device, "Failed to configure AEN (cfg %x)\n",
+				 supported_aens);
+	} else {
+#ifdef CONFIG_NVME_CEMU
+		/* CEMU's vendor cache-fill AER needs a standing request even when
+		 * the controller advertises no standard optional AEN classes. */
+		if (!(ctrl->quirks & NVME_QUIRK_CEMU))
+			return;
+#else
 		return;
-
-	status = nvme_set_features(ctrl, NVME_FEAT_ASYNC_EVENT, supported_aens,
-			NULL, 0, &result);
-	if (status)
-		dev_warn(ctrl->device, "Failed to configure AEN (cfg %x)\n",
-			 supported_aens);
+#endif
+	}
 
 	queue_work(nvme_wq, &ctrl->async_event_work);
 }
@@ -4394,6 +4402,10 @@ void nvme_complete_async_event(struct nvme_ctrl *ctrl, __le16 status,
 	case NVME_AER_CSS:
 	case NVME_AER_VS:
 		ctrl->aen_result = result;
+#ifdef CONFIG_NVME_CEMU
+		if (aer_type == NVME_AER_VS)
+			cemu_cache_aer(ctrl, result);
+#endif
 		break;
 	default:
 		break;

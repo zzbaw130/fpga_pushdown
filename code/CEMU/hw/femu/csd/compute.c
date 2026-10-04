@@ -74,6 +74,18 @@ static long long compute_nvm_write(void *context, unsigned int nsid,
     return compute_nvm_io(context, nsid, byte_offset, buffer, length, 1);
 }
 
+static long long compute_cache_notify(void *context, unsigned int nsid,
+                                      unsigned int relation_oid,
+                                      unsigned long long physical_offset,
+                                      unsigned long long logical_offset,
+                                      unsigned long long length,
+                                      unsigned long long generation)
+{
+    femu_csd_cache_notify(context, nsid, relation_oid, physical_offset,
+                          logical_offset, length, generation);
+    return 0;
+}
+
 struct ProgramInitArgs {
     uint32_t nsid;
     uint16_t pind;
@@ -811,6 +823,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     job->args.service_context = n;
     job->args.nvm_read = compute_nvm_read;
     job->args.nvm_write = compute_nvm_write;
+    job->args.cache_notify = compute_cache_notify;
     if (!program->is_indirect) {
         sched_enqueue_job(compute_ns(req->ns), req);
     }

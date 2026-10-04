@@ -21,6 +21,7 @@ struct CsdMemoryRegion csd_memory_region[64];
 static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
 {
     int i;
+    NvmeAsyncEvent *event;
 
     /* Coperd: pause nvme poller at earliest convenience */
     n->dataplane_started = false;
@@ -51,6 +52,22 @@ static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
             nvme_free_sq(n->sq[i], n);
         }
     }
+
+    qemu_mutex_lock(&n->aer_lock);
+    while (!QSIMPLEQ_EMPTY(&n->aer_queue)) {
+        event = QSIMPLEQ_FIRST(&n->aer_queue);
+        QSIMPLEQ_REMOVE_HEAD(&n->aer_queue, entry);
+        g_free(event);
+    }
+    for (i = 0; i < n->outstanding_aers; i++) {
+        g_free(n->aer_reqs[i]);
+        n->aer_reqs[i] = NULL;
+    }
+    n->outstanding_aers = 0;
+    n->aer_mask = 0;
+    n->csd_cache_head = 0;
+    n->csd_cache_count = 0;
+    qemu_mutex_unlock(&n->aer_lock);
     for (i = 0; i <= n->nr_io_queues; i++) {
         if (n->cq[i] != NULL) {
             nvme_free_cq(n->cq[i], n);
@@ -209,6 +226,10 @@ static void nvme_process_db_admin(FemuCtrl *n, hwaddr addr, int val)
         }
 
         cq->head = new_val;
+
+        if (qid == 0) {
+            qemu_bh_schedule(n->aer_bh);
+        }
 
         if (cq->tail != cq->head) {
             nvme_isr_notify_admin(cq);
@@ -646,6 +667,10 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     n->cq = g_malloc0(sizeof(NvmeCQueue*) * (n->nr_io_queues + 1));
     n->elpes = g_malloc0(sizeof(NvmeErrorLog) * (n->elpe + 1));
     n->aer_reqs = g_malloc0(sizeof(NvmeRequest*) * (n->aerl + 1));
+    QSIMPLEQ_INIT(&n->aer_queue);
+    qemu_mutex_init(&n->aer_lock);
+    n->aer_bh = qemu_bh_new(nvme_process_aers, n);
+    n->csd_cache_next_sequence = 1;
     n->features.int_vector_config = g_malloc0(sizeof(*n->features.int_vector_config) * (n->nr_io_queues + 1));
 
     nvme_init_namespaces(n, errp);
@@ -688,6 +713,8 @@ static void femu_exit(PCIDevice *pci_dev)
     g_free(n->namespaces);
     g_free(n->features.int_vector_config);
     g_free(n->aer_reqs);
+    qemu_bh_delete(n->aer_bh);
+    qemu_mutex_destroy(&n->aer_lock);
     g_free(n->elpes);
     g_free(n->cq);
     g_free(n->sq);

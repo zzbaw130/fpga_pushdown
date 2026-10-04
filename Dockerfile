@@ -36,6 +36,7 @@ RUN set -eu && \
     libcjson-dev \
     libcap-ng-dev \
     libattr1-dev \
+    libncurses-dev \
     # 额外所需包
     build-essential \
     bc \
@@ -45,18 +46,19 @@ RUN set -eu && \
     libicu-dev && \
     apt clean
 
-# 先复制linux-cemu, ubpf-cemu, dqib_amd64-pc, 5.3GB 
+# 分层复制，避免修改内核/驱动时使 uBPF 和 2.8GB guest 镜像缓存同时失效。
 COPY ./code/linux-cemu /workspace/code/linux-cemu/
-COPY ./code/ubpf-cemu /workspace/code/ubpf-cemu/
-COPY ./code/dqib_amd64-pc /workspace/code/dqib_amd64-pc/
-
-# 优先编译上述基本不变的项目, 利用docker缓存, 9GB
 RUN set -eu && \
     cd /workspace/code/linux-cemu && \
-    make bzImage -j$(nproc) && \
+    make bzImage -j$(nproc)
+
+COPY ./code/ubpf-cemu /workspace/code/ubpf-cemu/
+RUN set -eu && \
     cd /workspace/code/ubpf-cemu && \
     cmake -S . -B build -DUBPF_ENABLE_TESTS=true && \
     cmake --build build --config Release
+
+COPY ./code/dqib_amd64-pc /workspace/code/dqib_amd64-pc/
 
 # 最后拷贝可能频繁变动的CEMU项目, 9.9GB
 COPY ./code/CEMU /workspace/code/CEMU/
@@ -67,6 +69,8 @@ RUN set -eu && \
     mkdir -p build && cd build && \
     ../femu-scripts/femu-copy-scripts.sh . && \
     ./femu-compile.sh && \
+    ninja qemu-system-x86_64 && \
+    test -x ./qemu-system-x86_64 && \
     cd ../tests/cemu && \
     make kernel
 
@@ -113,6 +117,7 @@ RUN set -eu && \
     libcjson-dev \
     libcap-ng-dev \
     libattr1-dev \
+    libncurses-dev \
     # 额外所需包
     build-essential \
     bc \

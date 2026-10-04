@@ -885,6 +885,68 @@ static uint16_t nvme_cmd_effects(FemuCtrl *n, NvmeCmd *cmd, uint8_t csi,
     return dma_read_prp(n, ((uint8_t *)&log) + off, trans_len, prp1, prp2);
 }
 
+static uint16_t nvme_csd_cache_log(FemuCtrl *n, NvmeCmd *cmd,
+                                   uint32_t buf_len, uint64_t off)
+{
+    struct {
+        FemuCsdCacheLogHeader header;
+        FemuCsdCacheEvent events[FEMU_CSD_CACHE_EVENT_CAPACITY];
+    } QEMU_PACKED log = {};
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint32_t count;
+    uint32_t trans_len;
+    uint32_t i;
+
+    if (off >= sizeof(log)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    qemu_mutex_lock(&n->aer_lock);
+    count = n->csd_cache_count;
+    log.header.magic = cpu_to_le32(FEMU_CSD_CACHE_LOG_MAGIC);
+    log.header.version = cpu_to_le16(FEMU_CSD_CACHE_LOG_VERSION);
+    log.header.header_bytes = cpu_to_le16(sizeof(log.header));
+    log.header.entry_bytes = cpu_to_le16(sizeof(log.events[0]));
+    log.header.capacity = cpu_to_le16(FEMU_CSD_CACHE_EVENT_CAPACITY);
+    log.header.count = cpu_to_le32(count);
+    log.header.next_sequence = cpu_to_le64(n->csd_cache_next_sequence);
+    log.header.dropped = cpu_to_le64(n->csd_cache_dropped);
+
+    for (i = 0; i < count; i++) {
+        FemuCsdCacheEvent *src = &n->csd_cache_events[
+            (n->csd_cache_head + i) % FEMU_CSD_CACHE_EVENT_CAPACITY];
+        FemuCsdCacheEvent *dst = &log.events[i];
+
+        dst->sequence = cpu_to_le64(src->sequence);
+        dst->generation = cpu_to_le64(src->generation);
+        dst->physical_offset = cpu_to_le64(src->physical_offset);
+        dst->logical_offset = cpu_to_le64(src->logical_offset);
+        dst->byte_length = cpu_to_le64(src->byte_length);
+        dst->nsid = cpu_to_le32(src->nsid);
+        dst->relation_oid = cpu_to_le32(src->relation_oid);
+        dst->flags = cpu_to_le32(src->flags);
+        dst->reserved = 0;
+    }
+    if (count) {
+        log.header.first_sequence = log.events[0].sequence;
+    }
+
+    /*
+     * Reading from offset zero acknowledges one complete snapshot.  A later
+     * producer observes the empty ring and raises a fresh vendor AER.
+     */
+    if (off == 0) {
+        n->csd_cache_head = 0;
+        n->csd_cache_count = 0;
+        n->aer_mask &= ~(1 << NVME_AER_TYPE_VENDOR_SPECIFIC);
+    }
+    qemu_mutex_unlock(&n->aer_lock);
+
+    trans_len = MIN((uint64_t)buf_len, sizeof(log) - off);
+    return dma_read_prp(n, ((uint8_t *)&log) + off, trans_len, prp1, prp2);
+}
+
 static uint16_t nvme_get_log(FemuCtrl *n, NvmeCmd *cmd)
 {
     uint32_t dw10 = le32_to_cpu(cmd->cdw10);
@@ -924,6 +986,8 @@ static uint16_t nvme_get_log(FemuCtrl *n, NvmeCmd *cmd)
         return nvme_fw_log_info(n, cmd, len);
     case NVME_LOG_CMD_EFFECTS:
         return nvme_cmd_effects(n, cmd, csi, len, off);
+    case FEMU_CSD_CACHE_LOG_ID:
+        return nvme_csd_cache_log(n, cmd, len, off);
     default:
         // TODO
         // if (ns->ops->get_log) {
@@ -1059,7 +1123,11 @@ static uint16_t nvme_format(FemuCtrl *n, NvmeCmd *cmd)
 static uint16_t nvme_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
 {
     uint32_t nsid = le32_to_cpu(cmd->nsid);
-    NvmeNamespace *ns = &n->namespaces[nsid - 1];
+    NvmeNamespace *ns = NULL;
+
+    if (nsid > 0 && nsid <= n->num_namespaces) {
+        ns = &n->namespaces[nsid - 1];
+    }
 
     switch (cmd->opcode) {
     case NVME_ADM_CMD_FEMU_DEBUG:
@@ -1116,7 +1184,7 @@ static uint16_t nvme_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
     case NVME_ADM_CMD_SECURITY_RECV:
         return NVME_INVALID_OPCODE | NVME_DNR;
     default:
-        if (ns->ops->admin_cmd) {
+        if (ns && ns->ops->admin_cmd) {
             return ns->ops->admin_cmd(ns, cmd, cqe);
         }
 
@@ -1124,11 +1192,146 @@ static uint16_t nvme_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
     }
 }
 
+static void nvme_post_admin_cqe(FemuCtrl *n, NvmeCqe *cqe, uint16_t status)
+{
+    NvmeCQueue *cq = &n->admin_cq;
+    hwaddr addr;
+
+    cqe->status = cpu_to_le16((status << 1) | cq->phase);
+    if (cq->phys_contig) {
+        addr = cq->dma_addr + cq->tail * n->cqe_size;
+    } else {
+        addr = nvme_discontig(cq->prp_list, cq->tail, n->page_size,
+                              n->cqe_size);
+    }
+    nvme_addr_write(n, addr, cqe, sizeof(*cqe));
+    nvme_inc_cq_tail(cq);
+    nvme_isr_notify_admin(cq);
+}
+
+void nvme_process_aers(void *opaque)
+{
+    FemuCtrl *n = opaque;
+    NvmeAsyncEvent *event = NULL;
+    NvmeRequest *req = NULL;
+    uint32_t result;
+
+    qemu_mutex_lock(&n->aer_lock);
+    if (n->outstanding_aers && !QSIMPLEQ_EMPTY(&n->aer_queue) &&
+        !nvme_cq_full(&n->admin_cq)) {
+        event = QSIMPLEQ_FIRST(&n->aer_queue);
+        if (!(n->aer_mask & (1 << event->result.event_type))) {
+            QSIMPLEQ_REMOVE_HEAD(&n->aer_queue, entry);
+            n->aer_mask |= 1 << event->result.event_type;
+            req = n->aer_reqs[--n->outstanding_aers];
+            n->aer_reqs[n->outstanding_aers] = NULL;
+        }
+    }
+    qemu_mutex_unlock(&n->aer_lock);
+
+    if (!req) {
+        return;
+    }
+
+    result = event->result.event_type |
+             ((uint32_t)event->result.event_info << 8) |
+             ((uint32_t)event->result.log_page << 16);
+    req->cqe.n.result = cpu_to_le32(result);
+    nvme_post_admin_cqe(n, &req->cqe, NVME_SUCCESS);
+    g_free(event);
+    g_free(req);
+}
+
+static uint16_t nvme_aer(FemuCtrl *n, NvmeCmd *cmd, uint16_t sq_head)
+{
+    NvmeRequest *req;
+
+    qemu_mutex_lock(&n->aer_lock);
+    if (n->outstanding_aers > n->aerl) {
+        qemu_mutex_unlock(&n->aer_lock);
+        return NVME_AER_LIMIT_EXCEEDED;
+    }
+
+    req = g_new0(NvmeRequest, 1);
+    req->cmd = *cmd;
+    req->cqe.cid = cmd->cid;
+    req->cqe.sq_id = cpu_to_le16(0);
+    req->cqe.sq_head = cpu_to_le16(sq_head);
+    n->aer_reqs[n->outstanding_aers++] = req;
+    qemu_mutex_unlock(&n->aer_lock);
+
+    qemu_bh_schedule(n->aer_bh);
+    return NVME_NO_COMPLETE;
+}
+
+void femu_csd_cache_notify(FemuCtrl *n, uint32_t nsid, uint32_t relation_oid,
+                           uint64_t physical_offset, uint64_t logical_offset,
+                           uint64_t byte_length, uint64_t generation)
+{
+    FemuCsdCacheEvent *entry;
+    FemuCsdCacheEvent *previous = NULL;
+    NvmeAsyncEvent *event = NULL;
+    bool signal;
+
+    if (!n || !byte_length) {
+        return;
+    }
+
+    qemu_mutex_lock(&n->aer_lock);
+    signal = n->csd_cache_count == 0;
+    if (n->csd_cache_count != 0) {
+        previous = &n->csd_cache_events[
+            (n->csd_cache_head + n->csd_cache_count - 1) %
+            FEMU_CSD_CACHE_EVENT_CAPACITY];
+        if (previous->generation == generation &&
+            previous->nsid == nsid &&
+            previous->relation_oid == relation_oid &&
+            previous->logical_offset + previous->byte_length == logical_offset &&
+            previous->byte_length <= UINT64_MAX - byte_length) {
+            previous->byte_length += byte_length;
+            qemu_mutex_unlock(&n->aer_lock);
+            return;
+        }
+    }
+    if (n->csd_cache_count == FEMU_CSD_CACHE_EVENT_CAPACITY) {
+        n->csd_cache_head = (n->csd_cache_head + 1) %
+                            FEMU_CSD_CACHE_EVENT_CAPACITY;
+        n->csd_cache_count--;
+        n->csd_cache_dropped++;
+        signal = false;
+    }
+
+    entry = &n->csd_cache_events[(n->csd_cache_head + n->csd_cache_count) %
+                                 FEMU_CSD_CACHE_EVENT_CAPACITY];
+    entry->sequence = n->csd_cache_next_sequence++;
+    entry->generation = generation;
+    entry->physical_offset = physical_offset;
+    entry->logical_offset = logical_offset;
+    entry->byte_length = byte_length;
+    entry->nsid = nsid;
+    entry->relation_oid = relation_oid;
+    entry->flags = 0;
+    entry->reserved = 0;
+    n->csd_cache_count++;
+
+    if (signal) {
+        event = g_new0(NvmeAsyncEvent, 1);
+        event->result.event_type = NVME_AER_TYPE_VENDOR_SPECIFIC;
+        event->result.event_info = FEMU_CSD_CACHE_AER_INFO;
+        event->result.log_page = FEMU_CSD_CACHE_LOG_ID;
+        QSIMPLEQ_INSERT_TAIL(&n->aer_queue, event, entry);
+    }
+    qemu_mutex_unlock(&n->aer_lock);
+
+    if (event) {
+        qemu_bh_schedule(n->aer_bh);
+    }
+}
+
 void nvme_process_sq_admin(void *opaque)
 {
     NvmeSQueue *sq = opaque;
     FemuCtrl *n = sq->ctrl;
-    NvmeCQueue *cq = n->cq[sq->cqid];
 
     uint16_t status;
     hwaddr addr;
@@ -1147,20 +1350,19 @@ void nvme_process_sq_admin(void *opaque)
 
         memset(&cqe, 0, sizeof(cqe));
 
-        status = nvme_admin_cmd(n, &cmd, &cqe);
+        if (cmd.opcode == NVME_ADM_CMD_ASYNC_EV_REQ) {
+            status = nvme_aer(n, &cmd, sq->head);
+        } else {
+            status = nvme_admin_cmd(n, &cmd, &cqe);
+        }
+        if (status == NVME_NO_COMPLETE) {
+            continue;
+        }
         cqe.cid = cmd.cid;
-        cqe.status = cpu_to_le16(status << 1 | cq->phase);
         cqe.sq_id = cpu_to_le16(sq->sqid);
         cqe.sq_head = cpu_to_le16(sq->head);
 
-        if (cq->phys_contig) {
-            addr = cq->dma_addr + cq->tail * n->cqe_size;
-        } else {
-            addr = nvme_discontig(cq->prp_list, cq->tail, n->page_size, n->cqe_size);
-        }
-        nvme_addr_write(n, addr, (void *)&cqe, sizeof(cqe));
-        nvme_inc_cq_tail(cq);
-        nvme_isr_notify_admin(cq);
+        nvme_post_admin_cqe(n, &cqe, status);
     }
 }
 

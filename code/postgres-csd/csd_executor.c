@@ -123,7 +123,9 @@ int csd_nvm_nsid = 1;
 int csd_parallel_workers = 32;
 int csd_program_runtime = 0;
 int csd_device_work_mem_mb = 0;
+int csd_cache_wait_ms = 0;
 bool csd_profile = false;
+bool csd_cache_fill = true;
 
 static uint64
 csd_align_range(uint64 bytes)
@@ -410,6 +412,99 @@ csd_collect_relation_extents(Oid relation_oid, StringInfo extents)
 	pfree(relative);
 	table_close(relation, NoLock);
 	return relation_bytes;
+}
+
+static bool
+csd_register_relation_cache(int control_fd, Oid relation_oid, uint64 generation)
+{
+	Relation relation = table_open(relation_oid, NoLock);
+	char *relative = relpathbackend(relation->rd_node, relation->rd_backend,
+								 MAIN_FORKNUM);
+	char *base = psprintf("%s/%s", DataDir, relative);
+	uint64 relation_bytes = (uint64) RelationGetNumberOfBlocks(relation) * BLCKSZ;
+	uint64 logical_base = 0;
+	int segment = 0;
+	bool registered = false;
+
+	while (logical_base < relation_bytes)
+	{
+		char *path = segment == 0 ? pstrdup(base) : psprintf("%s.%d", base, segment);
+		uint64 segment_bytes = Min(relation_bytes - logical_base,
+			(uint64) RELSEG_SIZE * BLCKSZ);
+		struct ioctl_cemu_cache_register registration;
+		int fd = open(path, O_RDONLY | PG_BINARY, 0);
+
+		if (fd < 0)
+		{
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not open optional CSD cache-fill segment \"%s\": %m", path)));
+			pfree(path);
+			break;
+		}
+		MemSet(&registration, 0, sizeof(registration));
+		registration.generation = generation;
+		registration.logical_offset = logical_base;
+		registration.length = segment_bytes;
+		registration.relation_oid = relation_oid;
+		registration.fd = fd;
+		if (ioctl(control_fd, IOCTL_CEMU_CACHE_REGISTER, &registration) != 0)
+		{
+			int saved_errno = errno;
+
+			close(fd);
+			pfree(path);
+			errno = saved_errno;
+			ereport(WARNING,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("could not register relation %u for optional CSD AER cache fill: %m",
+							relation_oid)));
+			break;
+		}
+		close(fd);
+		pfree(path);
+		registered = true;
+		logical_base += segment_bytes;
+		++segment;
+	}
+	pfree(base);
+	pfree(relative);
+	table_close(relation, NoLock);
+	return registered;
+}
+
+static bool
+csd_register_cache_files(int control_fd, List *relations, uint64 generation)
+{
+	struct ioctl_cemu_cache_begin begin;
+	List *registered = NIL;
+	ListCell *cell;
+	bool any_registered = false;
+
+	if (relations == NIL)
+		return false;
+
+	MemSet(&begin, 0, sizeof(begin));
+	begin.generation = generation;
+	if (ioctl(control_fd, IOCTL_CEMU_CACHE_BEGIN, &begin) != 0)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("could not start optional CSD AER cache-fill generation: %m")));
+		return false;
+	}
+	foreach(cell, relations)
+	{
+		Oid relation_oid = lfirst_oid(cell);
+
+		if (list_member_oid(registered, relation_oid))
+			continue;
+		if (csd_register_relation_cache(control_fd, relation_oid, generation))
+			any_registered = true;
+		registered = lappend_oid(registered, relation_oid);
+	}
+	list_free(registered);
+	return any_registered;
 }
 
 /*
@@ -848,6 +943,7 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 	CsdSqlResultHeader result;
 	uint64 total_result_bytes;
 	uint32 index = 0;
+	bool cache_fill_active = false;
 
 	csd_transport_init(&transport);
 	PG_TRY();
@@ -977,6 +1073,9 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not open CEMU control/execute device: %m")));
+		if (csd_cache_fill)
+			cache_fill_active = csd_register_cache_files(transport.control_fd,
+				relations, header->plan_id);
 
 		MemSet(&transport.download, 0, sizeof(transport.download));
 		transport.download.name = "csd_sql";
@@ -1039,6 +1138,38 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 					(errcode(ERRCODE_IO_ERROR),
 					 errmsg("CEMU Program Execute failed: %m"),
 					 errhint("The PostgreSQL executable needs CAP_SYS_ADMIN in the CEMU guest.")));
+		if (cache_fill_active)
+		{
+			struct ioctl_cemu_cache_stats cache_stats;
+
+			if (csd_cache_wait_ms > 0)
+			{
+				struct ioctl_cemu_cache_wait wait;
+
+				MemSet(&wait, 0, sizeof(wait));
+				wait.generation = header->plan_id;
+				wait.timeout_ms = csd_cache_wait_ms;
+				if (ioctl(transport.control_fd, IOCTL_CEMU_CACHE_WAIT, &wait) != 0)
+					ereport(WARNING,
+							(errcode(ERRCODE_IO_ERROR),
+							 errmsg("CSD AER cache fill did not complete within %d ms: %m",
+									csd_cache_wait_ms)));
+			}
+			MemSet(&cache_stats, 0, sizeof(cache_stats));
+			if (ioctl(transport.control_fd, IOCTL_CEMU_CACHE_STATS,
+					  &cache_stats) == 0 && csd_profile)
+				ereport(NOTICE,
+						(errmsg("CSD AER cache generation=%llu completed=%llu events=%llu notified_bytes=%llu prefetch_requests=%llu prefetched_bytes=%llu unmapped_bytes=%llu controller_dropped=%llu errors=%llu",
+								(unsigned long long) cache_stats.active_generation,
+								(unsigned long long) cache_stats.completed_generation,
+								(unsigned long long) cache_stats.events,
+								(unsigned long long) cache_stats.notified_bytes,
+								(unsigned long long) cache_stats.prefetch_requests,
+								(unsigned long long) cache_stats.prefetched_bytes,
+								(unsigned long long) cache_stats.unmapped_bytes,
+								(unsigned long long) cache_stats.controller_dropped,
+								(unsigned long long) cache_stats.errors)));
+		}
 
 		csd_read_range(transport.range_fds[status_range], &status, sizeof(status),
 			"CSD execution status");

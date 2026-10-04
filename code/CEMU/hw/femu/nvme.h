@@ -483,6 +483,42 @@ enum NvmeAsyncEventRequest {
     NVME_AER_INFO_SMART_SPARE_THRESH        = 2,
 };
 
+/*
+ * CSD cache-fill notifications use an NVMe vendor-specific AER only as a
+ * doorbell.  The byte ranges themselves live in this vendor log page and are
+ * fetched by the host with Get Log Page before it issues normal reads.
+ */
+#define FEMU_CSD_CACHE_LOG_ID          0xc0
+#define FEMU_CSD_CACHE_LOG_MAGIC       0x41435343U /* "CSCA" */
+#define FEMU_CSD_CACHE_LOG_VERSION     1
+#define FEMU_CSD_CACHE_EVENT_CAPACITY  64
+#define FEMU_CSD_CACHE_AER_INFO        0x01
+
+typedef struct FemuCsdCacheEvent {
+    uint64_t sequence;
+    uint64_t generation;
+    uint64_t physical_offset;
+    uint64_t logical_offset;
+    uint64_t byte_length;
+    uint32_t nsid;
+    uint32_t relation_oid;
+    uint32_t flags;
+    uint32_t reserved;
+} QEMU_PACKED FemuCsdCacheEvent;
+
+typedef struct FemuCsdCacheLogHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_bytes;
+    uint16_t entry_bytes;
+    uint16_t capacity;
+    uint32_t count;
+    uint64_t first_sequence;
+    uint64_t next_sequence;
+    uint64_t dropped;
+    uint64_t reserved[2];
+} QEMU_PACKED FemuCsdCacheLogHeader;
+
 typedef struct NvmeAerResult {
     uint8_t event_type;
     uint8_t event_info;
@@ -1289,8 +1325,14 @@ typedef struct FemuCtrl {
     NvmeIdCtrl      id_ctrl;
 
     QSIMPLEQ_HEAD(aer_queue, NvmeAsyncEvent) aer_queue;
-    QEMUTimer       *aer_timer;
+    QEMUBH          *aer_bh;
+    QemuMutex       aer_lock;
     uint8_t         aer_mask;
+    FemuCsdCacheEvent csd_cache_events[FEMU_CSD_CACHE_EVENT_CAPACITY];
+    uint32_t        csd_cache_head;
+    uint32_t        csd_cache_count;
+    uint64_t        csd_cache_next_sequence;
+    uint64_t        csd_cache_dropped;
 
 	uint64_t		dbs_addr;
 	uint64_t		eis_addr;
@@ -1474,6 +1516,10 @@ uint16_t femu_nvme_rw_check_req(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                                 uint64_t meta_size);
 
 void nvme_process_sq_admin(void *opaque);
+void nvme_process_aers(void *opaque);
+void femu_csd_cache_notify(FemuCtrl *n, uint32_t nsid, uint32_t relation_oid,
+                           uint64_t physical_offset, uint64_t logical_offset,
+                           uint64_t byte_length, uint64_t generation);
 void nvme_post_cqes_io(void *opaque);
 void *nvme_poller(void *arg);
 void *nvme_cq_poller(void *arg);
@@ -1516,6 +1562,9 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
 
 static inline NvmeNamespace *nvme_find_namespace(FemuCtrl *n, uint32_t nsid)
 {
+    if (!n || nsid == 0 || nsid > n->num_namespaces) {
+        return NULL;
+    }
     return &n->namespaces[nsid - 1];
 }
 

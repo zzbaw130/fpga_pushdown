@@ -61,6 +61,12 @@ extern "C"
     typedef long long (*ubpf_nvm_io_fn)(void *context, unsigned int nsid,
                                         unsigned long long byte_offset,
                                         void *buffer, unsigned long long length);
+    typedef long long (*ubpf_cache_notify_fn)(void *context, unsigned int nsid,
+                                              unsigned int relation_oid,
+                                              unsigned long long physical_offset,
+                                              unsigned long long logical_offset,
+                                              unsigned long long length,
+                                              unsigned long long generation);
 
     struct ubpf_jit_args
     {
@@ -74,6 +80,7 @@ extern "C"
         void* service_context;
         ubpf_nvm_io_fn nvm_read;
         ubpf_nvm_io_fn nvm_write;
+        ubpf_cache_notify_fn cache_notify;
     } __attribute__((packed));
 
     /**

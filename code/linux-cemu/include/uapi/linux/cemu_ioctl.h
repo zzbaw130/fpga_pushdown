@@ -51,6 +51,43 @@ struct ioctl_create_mrs {
 	__u16	rsid;          /* out for CREATE_MRS / in for DELETE_MRS */
 };
 
+/* Start a new best-effort AER cache-fill generation. */
+struct ioctl_cemu_cache_begin {
+	__u64	generation;
+	__u32	flags;
+	__u32	reserved;
+};
+
+/* Associate a PostgreSQL relation byte range with an open heap-segment fd. */
+struct ioctl_cemu_cache_register {
+	__u64	generation;
+	__u64	logical_offset;
+	__u64	length;
+	__u32	relation_oid;
+	__s32	fd;
+};
+
+/* Observable counters for experiments and asynchronous completion polling. */
+struct ioctl_cemu_cache_stats {
+	__u64	active_generation;
+	__u64	completed_generation;
+	__u64	last_sequence;
+	__u64	events;
+	__u64	notified_bytes;
+	__u64	prefetch_requests;
+	__u64	prefetched_bytes;
+	__u64	unmapped_bytes;
+	__u64	controller_dropped;
+	__u64	errors;
+};
+
+/* Wait until the AER worker has completed a cache-fill batch for generation. */
+struct ioctl_cemu_cache_wait {
+	__u64	generation;
+	__u32	timeout_ms;
+	__u32	reserved;
+};
+
 #define IOCTL_CEMU_DOWNLOAD    _IOWR(CEMU_IOCTL_MAGIC, 0x00, struct ioctl_download)
 #define IOCTL_CEMU_UNLOAD      _IOW (CEMU_IOCTL_MAGIC, 0x01, struct ioctl_download)
 #define IOCTL_CEMU_ACTIVATE    _IOW (CEMU_IOCTL_MAGIC, 0x02, struct ioctl_download)
@@ -58,6 +95,10 @@ struct ioctl_create_mrs {
 #define IOCTL_CEMU_EXECUTE     _IOW (CEMU_IOCTL_MAGIC, 0x04, struct ioctl_execute)
 #define IOCTL_CEMU_CREATE_MRS  _IOWR(CEMU_IOCTL_MAGIC, 0x05, struct ioctl_create_mrs)
 #define IOCTL_CEMU_DELETE_MRS  _IOW (CEMU_IOCTL_MAGIC, 0x06, struct ioctl_create_mrs)
+#define IOCTL_CEMU_CACHE_BEGIN _IOW (CEMU_IOCTL_MAGIC, 0x07, struct ioctl_cemu_cache_begin)
+#define IOCTL_CEMU_CACHE_REGISTER _IOW(CEMU_IOCTL_MAGIC, 0x08, struct ioctl_cemu_cache_register)
+#define IOCTL_CEMU_CACHE_STATS _IOR (CEMU_IOCTL_MAGIC, 0x09, struct ioctl_cemu_cache_stats)
+#define IOCTL_CEMU_CACHE_WAIT  _IOW (CEMU_IOCTL_MAGIC, 0x0a, struct ioctl_cemu_cache_wait)
 
 #endif /* _UAPI_LINUX_CEMU_IOCTL_H */
 

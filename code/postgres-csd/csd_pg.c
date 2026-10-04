@@ -171,6 +171,14 @@ _PG_init(void)
 						"Optional cap for the query-level FDM operator arena; zero uses all remaining FDM.", NULL,
 						&csd_device_work_mem_mb, 0, 0, INT_MAX, PGC_USERSET, 0,
 						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.cache_wait_ms",
+						"Optional wait for the AER cache-fill worker after CSD execution.", NULL,
+						&csd_cache_wait_ms, 0, 0, 600000, PGC_USERSET, 0,
+						NULL, NULL, NULL);
+	DefineCustomBoolVariable("csd.cache_fill",
+						 "Use CSD scan AERs to prefetch heap segments into the host page cache.", NULL,
+						 &csd_cache_fill, true, PGC_USERSET, 0,
+						 NULL, NULL, NULL);
 	DefineCustomBoolVariable("csd.profile", "Report CSD functional-model time by operator.", NULL,
 						 &csd_profile, false, PGC_USERSET, 0,
 						 NULL, NULL, NULL);

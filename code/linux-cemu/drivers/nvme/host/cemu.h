@@ -35,6 +35,15 @@ struct cemu_bio {
 	int runtime_scale;
 };
 
+struct cemu_cache_mapping {
+	struct list_head list;
+	struct file *file;
+	u64 generation;
+	u64 logical_offset;
+	u64 length;
+	u32 relation_oid;
+};
+
 struct cemu_dev {
 	struct cdev cdev;
 	struct gendisk *disk;
@@ -61,6 +70,11 @@ struct cemu_dev {
 	int cur_rsid;
 	struct list_head prog_list;
 	struct mutex lock;
+	struct list_head cache_mappings;
+	struct mutex cache_lock;
+	struct work_struct cache_work;
+	wait_queue_head_t cache_wait;
+	struct ioctl_cemu_cache_stats cache_stats;
 };
 
 extern int cemu_bdev_major;
@@ -76,5 +90,6 @@ void cemu_dev_remove(struct pci_dev *pdev, struct nvme_ctrl *ctrl);
 size_t cemu_dev_get_size(struct block_device *bdev);
 void *cemu_dev_get_p2p_addr(struct block_device *bdev);
 void cemu_bio_end_io(struct bio *bio);
+void cemu_cache_aer(struct nvme_ctrl *ctrl, u32 result);
 
 #endif /* __LINUX_CEMU_H__ */
