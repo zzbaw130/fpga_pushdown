@@ -18,18 +18,21 @@ void _PG_init(void);
 void _PG_fini(void);
 
 int csd_exe_path = CSD_EXE_HOST;
-double csd_setup_cost = 1.0;
+double csd_setup_cost = 1000.0;
 double csd_flash_page_cost = 0.05;
 double csd_tuple_cost = 0.001;
 double csd_join_tuple_cost = 0.002;
 double csd_aggregate_tuple_cost = 0.0015;
 double csd_sort_compare_cost = 0.0005;
-double csd_result_byte_cost = 0.0000001;
-double csd_host_cache_fraction = 0.0;
+double csd_result_byte_cost = 0.001;
+double csd_host_cache_fraction = -1.0;
+double csd_host_cached_page_cost = 0.33;
+double csd_spill_page_cost = 0.10;
 
 static set_rel_pathlist_hook_type previous_rel_hook = NULL;
 static set_join_pathlist_hook_type previous_join_hook = NULL;
 static create_upper_paths_hook_type previous_upper_hook = NULL;
+static planner_hook_type previous_planner_hook = NULL;
 
 static Plan *csd_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 								  CustomPath *best_path, List *tlist,
@@ -42,6 +45,24 @@ static void csd_rescan(CustomScanState *node);
 static void csd_explain_scan(CustomScanState *node, List *ancestors,
 								ExplainState *es);
 static int csd_metadata_operator_count(List *metadata);
+
+static PlannedStmt *
+csd_planner(Query *parse, int cursor_options, ParamListInfo bound_params)
+{
+	PlannedStmt *result;
+
+	/*
+	 * Keep the device-resident DP state separate from PostgreSQL's HOST path
+	 * tournament.  The state only lives for this planner invocation.
+	 */
+	csd_cost_reset_paths();
+	if (previous_planner_hook != NULL)
+		result = previous_planner_hook(parse, cursor_options, bound_params);
+	else
+		result = standard_planner(parse, cursor_options, bound_params);
+	csd_cost_reset_paths();
+	return result;
+}
 
 const CustomPathMethods csd_path_methods = {
 	.CustomName = "CsdPath",
@@ -103,7 +124,7 @@ _PG_init(void)
 						 NULL, &csd_exe_path, CSD_EXE_HOST, path_options,
 						 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("csd.setup_cost", "CSD command launch cost.", NULL,
-						 &csd_setup_cost, 1.0, 0.0, 1.0e12,
+						 &csd_setup_cost, 1000.0, 0.0, 1.0e12,
 						 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("csd.flash_page_cost", "CSD Flash page-read cost.", NULL,
 						 &csd_flash_page_cost, 0.05, 0.0, 1.0e12,
@@ -121,11 +142,19 @@ _PG_init(void)
 						 &csd_sort_compare_cost, 0.0005, 0.0, 1.0e12,
 						 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("csd.result_byte_cost", "CSD result-return byte cost.", NULL,
-						 &csd_result_byte_cost, 0.0000001, 0.0, 1.0e12,
+						 &csd_result_byte_cost, 0.001, 0.0, 1.0e12,
 						 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("csd.host_cache_fraction",
-						 "Observed fraction of relation pages resident in host cache.", NULL,
-						 &csd_host_cache_fraction, 0.0, 0.0, 1.0,
+						 "Host page-cache fraction override; -1 samples relation residency with mincore.", NULL,
+						 &csd_host_cache_fraction, -1.0, -1.0, 1.0,
+						 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("csd.host_cached_page_cost",
+						 "Sequential host-page cost when the heap page is resident in the OS cache.", NULL,
+						 &csd_host_cached_page_cost, 0.33, 0.0, 1.0e12,
+						 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("csd.spill_page_cost",
+						 "CSD Flash spill cost per page and per read or write pass.", NULL,
+						 &csd_spill_page_cost, 0.10, 0.0, 1.0e12,
 						 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomStringVariable("csd.control_device", "CEMU control device.", NULL,
 						   &csd_control_device, "/dev/nvme0c3", PGC_USERSET, 0,
@@ -188,6 +217,8 @@ _PG_init(void)
 						 NULL, NULL, NULL);
 
 	RegisterCustomScanMethods(&csd_scan_methods);
+	previous_planner_hook = planner_hook;
+	planner_hook = csd_planner;
 	previous_rel_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = csd_rel_hook;
 	previous_join_hook = set_join_pathlist_hook;
@@ -199,6 +230,8 @@ _PG_init(void)
 void
 _PG_fini(void)
 {
+	if (planner_hook == csd_planner)
+		planner_hook = previous_planner_hook;
 	if (set_rel_pathlist_hook == csd_rel_hook)
 		set_rel_pathlist_hook = previous_rel_hook;
 	if (set_join_pathlist_hook == csd_join_hook)
@@ -302,7 +335,7 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	CustomScan *scan = (CustomScan *) node->ss.ps.plan;
 	const char *name = strVal(list_nth(scan->custom_private, 0));
-	double modeled = floatVal(list_nth(scan->custom_private, 2));
+	double device_cost = floatVal(list_nth(scan->custom_private, 2));
 	double cache_fraction = floatVal(list_nth(scan->custom_private, 3));
 	Const *wire_plan = castNode(Const, list_nth(scan->custom_private, 8));
 	bytea *wire_bytes = DatumGetByteaPP(wire_plan->constvalue);
@@ -311,7 +344,11 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	ExplainPropertyText("CSD Operator", name, es);
 	ExplainPropertyInteger("CSD Operator Count", NULL,
 						   csd_metadata_operator_count(scan->custom_private), es);
-	ExplainPropertyFloat("CSD Modeled Cost", NULL, modeled, 3, es);
+	ExplainPropertyFloat("CSD Device-State Cost", NULL, device_cost, 3, es);
+	ExplainPropertyFloat("CSD Boundary Cost", NULL,
+						 scan->scan.plan.total_cost, 3, es);
+	ExplainPropertyInteger("CSD Return Bytes", NULL,
+						   (int64) floatVal(list_nth(scan->custom_private, 6)), es);
 	ExplainPropertyFloat("Host Cache Fraction", NULL, cache_fraction, 3, es);
 	ExplainPropertyInteger("CSD Wire Nodes", NULL,
 						   intVal(list_nth(scan->custom_private, 9)), es);

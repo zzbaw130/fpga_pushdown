@@ -6,6 +6,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SF=1
+MODE=csd
 SOCKET_DIR="/tmp/csdpg_nvme_tpch_s1"
 PORT=57432
 DATABASE=""
@@ -18,6 +19,7 @@ usage() {
     cat <<'EOF'
 Usage: tests/test_csd_tpch_execution.sh [options]
   --sf N                    database suffix/scale factor (default: 1)
+  --mode csd|auto           execution path compared with HOST (default: csd)
   --socket-dir PATH         running PostgreSQL socket directory
   --port PORT               running PostgreSQL port (default: 57432)
   --database NAME           database name (default: tpch_s<SF>)
@@ -31,6 +33,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sf) SF="$2"; shift 2 ;;
+        --mode) MODE="$2"; shift 2 ;;
         --socket-dir) SOCKET_DIR="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --database) DATABASE="$2"; shift 2 ;;
@@ -44,6 +47,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "${SF}" =~ ^[1-9][0-9]*$ ]] || { echo "--sf must be positive" >&2; exit 2; }
+[[ "${MODE}" == csd || "${MODE}" == auto ]] || {
+    echo "--mode must be csd or auto" >&2; exit 2;
+}
 [[ "${PORT}" =~ ^[1-9][0-9]*$ ]] || { echo "--port must be positive" >&2; exit 2; }
 [[ "${SHARED_LIBRARY}" != *"'"* ]] || {
     echo "--shared-library cannot contain a single quote" >&2; exit 2;
@@ -86,9 +92,9 @@ for query in $(seq 1 22); do
     [[ "${query}" -ne 15 ]] || cleanup_q15_view
     if ! "${psql_base[@]}" \
         -c 'SET default_transaction_read_only=off' \
-        -c "LOAD 'csd_pg'; SET csd.shared_library='${SHARED_LIBRARY}'; SET csd.exe_path='csd';" \
+        -c "LOAD 'csd_pg'; SET csd.shared_library='${SHARED_LIBRARY}'; SET csd.exe_path='${MODE}';" \
         -f "${sql}" >"${csd_raw}" 2>&1; then
-        printf 'Q%02d CSD FAIL\n' "${query}"
+        printf 'Q%02d %s FAIL\n' "${query}" "${MODE^^}"
         tail -n 12 "${csd_raw}"
         failures=$((failures + 1))
         [[ "${query}" -ne 15 ]] || cleanup_q15_view
@@ -122,4 +128,4 @@ if [[ "${failures}" -ne 0 ]]; then
     echo "${failures} TPC-H execution comparison(s) failed" >&2
     exit 1
 fi
-echo "All 22 TPC-H queries matched HOST results in forced CSD mode."
+echo "All 22 TPC-H queries matched HOST results in ${MODE} mode."

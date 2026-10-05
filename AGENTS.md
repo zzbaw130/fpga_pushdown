@@ -22,9 +22,10 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
    arbitrary DMA。当前阶段先追求可测缓存收益，只要求 plan generation 级的陈旧
    事件过滤，不实现生产级强一致性。
 3. 动态执行位置：`csd.exe_path=host|csd|auto` 分别强制 HOST、强制 CSD、或让
-   PostgreSQL 动态规划比较两类路径。CSD cost 包含 scan/传输、算子、spill、命令
-   启动和结果返回；HOST scan cost 由实际/估计缓存率降低。现有
-   `csd.host_cache_fraction` 已进入 cost model，后续由 AER/cache 统计反馈替代纯手工值。
+   PostgreSQL 的两状态动态规划比较两类路径。CSD cost 包含 scan、算子、spill、命令
+   启动和结果返回；HOST scan cost 由实际缓存率降低。默认
+   `csd.host_cache_fraction=-1` 通过 `mincore` 自动采样每个 heap segment，`[0,1]`
+   仍可作实验覆盖。CSD 可向 HOST 切换一次，HOST 中间结果禁止重新上传到 CSD。
 
 ## 2. 分支、稳定点和提交规则
 
@@ -56,6 +57,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `3c30a101f` | grouped Aggregate radix Flash replay |
 | `9c60f0858`-`ea0554c25` | ordinal 分类、阈值 spill、直接 selection-to-Flash writer |
 | `bfbba6964` | Join probe staging-bounded 流式 replay；AER 前稳定点 |
+| `4d2573947`-`71b1cf9ae` | AER 回填、计算/缓存重叠和 no-copy pipeline |
 
 ## 3. 环境不变量
 
@@ -291,6 +293,7 @@ ASAN_OPTIONS=detect_leaks=0 /tmp/csd_sql_san
 ```bash
 cd /mnt/cemu
 ./tests/test_csd_tpch_execution.sh --sf 1 \
+  --mode auto \
   --socket-dir /tmp/csdpg_nvme_tpch_s1 --port 57432 \
   --shared-library /workspace/code/CEMU/tests/cemu/build/<version>.so \
   --output-dir /tmp/<run-name>
@@ -300,6 +303,16 @@ cd /mnt/cemu
 CSD plan 中没有 host scan/join/aggregate/sort，允许顶层 PostgreSQL `Limit` 作为控制
 编排。性能回归需固定 cache 状态、runtime、parallel workers、FDM/spill 参数，保留
 原始 result/status，不可只保存汇总图。
+
+AUTO 定向回归：
+
+```bash
+PG_CONFIG=/opt/pgsql12/bin/pg_config \
+  CSD_AUTO_SKIP_BUILD=1 \
+  CSD_AUTO_SOCKET_DIR=/tmp/csdpg_nvme_tpch_s1 \
+  CSD_AUTO_PORT=57432 \
+  ./tests/test_csd_auto_planner.sh
+```
 
 ## 11. AER 与缓存回填（2026-10-04 已实现）
 
@@ -378,7 +391,47 @@ SF=1 `count(lineitem)` 上产生约 1.218 s outstanding window。最终 no-copy/
 - 本阶段选择 host filesystem page cache，没有占用 4 GiB FDM 的 operator arena；若
   后续实现持久 FDM chunk cache，必须支持逐出并与 scan/FIFO/spill staging 共同计费。
 
-## 12. 常见陷阱
+## 12. AUTO 两状态动态规划（2026-10-05 已实现）
+
+AUTO 不再依赖 PostgreSQL pathlist 恰好保留 CSD 中间路径。每个 `RelOptInfo` 有两个
+逻辑状态：PostgreSQL 正常维护的 HOST path，以及扩展私有 registry 中最低
+device-state cost 的 CSD path。CSD parent 只接受 CSD child；HOST parent 可接受 HOST
+或已物化 CSD boundary。因此合法状态转移只有 `CSD->CSD`、`CSD->HOST`、
+`HOST->HOST`，一旦进入 HOST，所有祖先必须留在 HOST。
+
+内部 device cost 不重复收取结果回传：
+
+```text
+scan = pages * flash_page_cost + input_tuples * tuple_cost
+join = child costs + input_tuples * join_tuple_cost + spill
+agg  = child cost + input_tuples * aggregate_tuple_cost + spill
+sort = child cost + n*log2(n) * sort_compare_cost + spill
+boundary = setup_cost + device cost + output_bytes * result_byte_cost
+```
+
+默认 `setup_cost=1000`、`result_byte_cost=0.001`、
+`host_cached_page_cost=0.33`、`spill_page_cost=0.10`。FDM operator budget 从 4 GiB
+减去 output、spill staging、两个 FIFO 和每个 scan 的 chunk。输出超过
+`csd.output_mb` 时 boundary 加 `disable_cost`，但 device state 仍可继续被 CSD
+Aggregate 等缩减。
+
+主机缓存收益只计算一次：`mincore` 的实际 resident fraction 降低 HOST SeqScan cost，
+不再同时作为 penalty 重复加到 CSD。定向回归
+`tests/test_csd_auto_planner.sh` 覆盖 cold=CSD、hot=HOST、合法 CSD->HOST cut、输出容量、
+未决 SubPlan 和 SEMI/ANTI 基数边界。
+
+两个 correctness guard：含未重写 `SubPlan` 的 device state 不允许直接物化给 HOST；
+SEMI/ANTI 用 preserved-side rows 作保守边界估计，并把 risk 沿后续 CSD join 传播，直到
+Aggregate、DISTINCT 或 LIMIT 清除。后者修复了 Q21 将实际 337,680 行误估成 1 行、
+随后触发 HOST nested-loop explosion 的问题，AUTO Q21 从约 100.8 s 降到最终 20.0 s。
+
+最终 SF=1 默认结果在 `results/tpch_sf1_auto_placement_validation.md` 和 CSV：15 条完整
+CSD、7 条 mixed，Q1-Q22 为 22/22 byte-exact；AUTO 总计 90,872.251 ms，HOST 总计
+502,799.632 ms，吞吐 speedup 5.5330x，per-query geometric mean 5.1641x，18/22 单条
+更快。Q2/Q16 是仍需校准的明显 miss（partial offload 改变 join order/并行性）；Q19/Q21
+在本轮与 HOST 相差 5% 内。禁止为单条 query 编号硬编码路径。
+
+## 13. 常见陷阱
 
 - 不要启用 KVM；它破坏本项目依赖的 TCG VM-Freeze 语义。
 - 不要让 guest 执行主机编译的 PostgreSQL 或 CSD binary。

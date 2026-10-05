@@ -24,10 +24,13 @@ extern double csd_aggregate_tuple_cost;
 extern double csd_sort_compare_cost;
 extern double csd_result_byte_cost;
 extern double csd_host_cache_fraction;
+extern double csd_host_cached_page_cost;
+extern double csd_spill_page_cost;
 
 extern const CustomPathMethods csd_path_methods;
 extern const CustomScanMethods csd_scan_methods;
 
+extern void csd_cost_reset_paths(void);
 extern void csd_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 								Index rti, RangeTblEntry *rte);
 extern void csd_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,

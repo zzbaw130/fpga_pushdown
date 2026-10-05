@@ -22,6 +22,25 @@ SET csd.exe_path = 'csd';
 EXPLAIN SELECT ...;
 ```
 
+In `auto` mode the planner retains independent HOST and device-resident CSD
+states for every relation.  CSD parents can consume only CSD states; HOST may
+consume a materialized CSD boundary, so the plan can switch from CSD to HOST
+at most once and can never upload a HOST intermediate back to CSD.  Internal
+CSD edges accumulate scan/join/aggregate/sort and spill cost.  A materialized
+boundary additionally pays `csd.setup_cost` (default 1000) and returned bytes
+times `csd.result_byte_cost` (default 0.001).  Boundaries larger than
+`csd.output_mb` are not selectable in AUTO, although their internal device
+states remain available to a reducing CSD parent.
+
+`csd.host_cache_fraction=-1` samples heap-file page residency with `mincore`;
+set a value in `[0,1]` for a deterministic experiment.  Resident pages reduce
+HOST sequential-scan cost toward `csd.host_cached_page_cost` (default 0.33).
+`csd.spill_page_cost` (default 0.10) charges estimated Flash write/read passes
+after output, spill staging, both FIFOs, and scan windows are deducted from
+the configured FDM capacity.  An unresolved `SubPlan`, or a path-specific
+SEMI/ANTI cardinality risk, cannot cross to HOST and silently lose its
+predicate or row estimate.
+
 The executor serializes a selected path into a structurally validated ABI-v8
 header/node table;
 every scan contains the real heap page count and physical PostgreSQL column
@@ -84,10 +103,13 @@ Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a
 `CsdScan`, but rejects host scan, join, aggregate, or sort nodes.
 
-Run `tests/test_csd_tpch_execution.sh` inside CEMU against a running,
-NVMe-staged guest cluster to compare all 22 forced-CSD results exactly with the
-HOST path. The PostgreSQL executable must retain `CAP_SYS_ADMIN` because the
-Linux NVMe passthrough ioctl checks it before reaching CEMU.
+Run `tests/test_csd_tpch_execution.sh --mode csd|auto` inside CEMU against a
+running, NVMe-staged guest cluster to compare all 22 selected results exactly
+with the HOST path.  `tests/test_csd_auto_planner.sh` separately asserts cold
+and hot cache switching, a legal CSD-to-HOST cut, output-capacity pruning, and
+safe SubPlan/SEMI/ANTI boundaries.  The PostgreSQL executable must retain
+`CAP_SYS_ADMIN` because the Linux NVMe passthrough ioctl checks it before
+reaching CEMU.
 
 Host-cache fill is enabled by default with `csd.cache_fill=on`.  Each CSD scan
 publishes relation ranges through a vendor AER/log-page control plane; the

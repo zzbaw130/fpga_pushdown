@@ -258,21 +258,56 @@ or drop invalidates stale prefetch work.
 
 ## PostgreSQL placement
 
-The planned GUC is `csd.exe_path` with values `host`, `csd`, and `auto` (documented
-command spelling: `SET csd.exe_path = 'auto'`).  `host` suppresses CSD paths;
-`csd` requires a CSD alternative for every selected candidate and otherwise
-returns an explicit planning error; `auto` adds both paths to normal PostgreSQL
-dynamic-programming path selection.
+The GUC `csd.exe_path` accepts `host`, `csd`, and `auto` (for example,
+`SET csd.exe_path = 'auto'`).  `host` suppresses CSD paths; `csd` requires a CSD
+alternative for every selected candidate and otherwise returns an explicit
+planning error; `auto` compares HOST and CSD states with a one-way placement
+dynamic program.
 
 The out-of-tree PostgreSQL 12 extension in `code/postgres-csd` now installs
 planner hooks for base relations, joins, and upper relations.  It creates
-`CustomPath` alternatives whose modeled cost includes Flash pages, streamed
-tuples, hash build/probe, aggregate state, sort comparisons, command setup,
-and result bytes.  `host` suppresses these paths; `csd` prunes host compute
-alternatives and rejects unsupported expressions; `auto` leaves both choices
-to PostgreSQL's dynamic-programming search.  A configurable
-`csd.host_cache_fraction` is already a cost-model input, but is still a manual
-value until the AER feedback control plane supplies per-relation observations.
+`CustomPath` alternatives whose modeled device-state cost includes Flash
+pages, streamed tuples, hash build/probe, aggregate state, sort comparisons,
+and spill passes.  PCIe result return and command setup are charged only when a
+device state is materialized as a CSD-to-HOST boundary, not at every internal
+CSD edge.
+
+AUTO keeps a private best device-resident path for every `RelOptInfo`, in
+addition to PostgreSQL's ordinary HOST path tournament.  A CSD parent can use
+only device-resident children; a HOST parent may consume a CSD boundary.  The
+valid transitions are therefore `CSD -> CSD`, `CSD -> HOST`, and
+`HOST -> HOST`.  `HOST -> CSD` is impossible, so once a low operator is placed
+on HOST every ancestor remains on HOST.  Keeping the private device state also
+prevents PostgreSQL from prematurely pruning a CSD scan/join that a later CSD
+Aggregate can reduce before returning data.
+
+The cost formulas are:
+
+```text
+scan = pages * flash_page_cost + input_tuples * tuple_cost
+join = child_device_costs + input_tuples * join_tuple_cost + spill_cost
+agg  = child_device_cost + input_tuples * aggregate_tuple_cost + spill_cost
+sort = child_device_cost + n * log2(n) * sort_compare_cost + spill_cost
+cut  = setup_cost + device_cost + output_bytes * result_byte_cost
+```
+
+The spill estimator uses FDM capacity after the output range, spill staging,
+two FIFOs, and one scan chunk per relation have been reserved.  A boundary
+larger than `csd.output_mb` receives `disable_cost`, although its device state
+can still feed a later CSD reducer.
+
+`csd.host_cache_fraction=-1` samples every heap segment with Linux `mincore`;
+a value in `[0,1]` is a deterministic override.  Resident pages reduce HOST
+sequential-scan cost from `seq_page_cost` toward
+`csd.host_cached_page_cost`.  The benefit is counted once and reflects the
+host page cache populated by the implemented AER worker.
+
+An unresolved `SubPlan` cannot cross a CSD-to-HOST boundary because its
+predicate is only valid after whole-DAG CSD rewriting.  SEMI/ANTI joins use a
+conservative preserved-side row count; this path-specific estimate propagates
+through subsequent CSD joins, and the boundary remains disabled until
+Aggregate, DISTINCT, or LIMIT removes the cardinality risk.  This prevents a
+severely underestimated boundary from creating a HOST nested-loop explosion.
 
 The chosen CSD subtree is represented as one `CustomScan` plus a recursive,
 copy-safe operator metadata tree.  Projection and unflattened subquery paths
@@ -319,5 +354,9 @@ patches these relocations lazily, maps heap files to physical NVM extents,
 creates bounded FDM scan windows and an MRS, submits `NVME_IOCTL_IO_CMD`, checks
 the status range, and decodes result cells into PostgreSQL tuples. SF=1 execution
 of all 22 supplied queries matches HOST results exactly. Per-relation AER cache
-return and compute/cache overlap are implemented; feeding observed cache
-residency back into automatic placement remains a later control-loop milestone.
+return, compute/cache overlap, automatic cache-residency sampling, and one-way
+AUTO placement are implemented.  The validated default run selected 15
+complete CSD plans and 7 mixed plans, produced 22/22 exact results, and took
+90.872 s versus 502.800 s for HOST (5.533x throughput speedup).  See
+`results/tpch_sf1_auto_placement_validation.md` for the full method, per-query
+numbers, and remaining calibration misses.
