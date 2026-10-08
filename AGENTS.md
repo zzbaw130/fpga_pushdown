@@ -58,6 +58,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `9c60f0858`-`ea0554c25` | ordinal 分类、阈值 spill、直接 selection-to-Flash writer |
 | `bfbba6964` | Join probe staging-bounded 流式 replay；AER 前稳定点 |
 | `4d2573947`-`71b1cf9ae` | AER 回填、计算/缓存重叠和 no-copy pipeline |
+| `acd9213b2` | AUTO Pareto 候选搜索、expected/resource bound 分离、Q2/Q16 纯 HOST 修复 |
 
 ## 3. 环境不变量
 
@@ -249,14 +250,19 @@ FPGA frequency、lanes、II、SRAM/FDM budget、Flash bandwidth、command launch
 必须和每组实验一同记录。不得把 C++ wall time 当作真实 FPGA latency；现阶段 wall
 time 是“CEMU functional implementation + TCG/VM-Freeze”的系统结果。
 
-已验证 SF=1 cold-start 基线位于 `results/tpch_sf1_csd_performance.*`：
+历史 SF=1 forced-CSD cold-start 原型基线位于
+`results/tpch_sf1_csd_performance.*`：
 
 - CSD/HOST 每次样本前重启 PostgreSQL 并 drop guest page cache；外部 host wall clock
-  计时，因为 VM-Freeze 会暂停 guest clock。
+  计时，因此包含 TCG/VM-Freeze 功能 C++ 开销。它只能作为原型系统 wall-time 记录，
+  不能用作 FPGA/Flash 模型时延或与第 12 节 `guest_ms` 混算。
 - Q1-Q22 全部 byte-for-byte exact，22/22 都快于 HOST。
 - CSD 总时间 210,090 ms；HOST 总时间 951,977 ms。
 - 汇总吞吐 speedup 4.531x；per-query geometric mean 4.249x。
 - 最小 1.476x（Q22），最大 15.880x（Q1）。
+
+论文中的 AUTO/FPGA device-time 性能应优先使用第 12 节双时钟实验；旧 forced-CSD
+wall-time 数字保留只为历史可追溯。
 
 关键低内存实验：
 
@@ -391,13 +397,17 @@ SF=1 `count(lineitem)` 上产生约 1.218 s outstanding window。最终 no-copy/
 - 本阶段选择 host filesystem page cache，没有占用 4 GiB FDM 的 operator arena；若
   后续实现持久 FDM chunk cache，必须支持逐出并与 scan/FIFO/spill staging 共同计费。
 
-## 12. AUTO 两状态动态规划（2026-10-05 已实现）
+## 12. AUTO 全候选动态规划（2026-10-09 已实现）
 
-AUTO 不再依赖 PostgreSQL pathlist 恰好保留 CSD 中间路径。每个 `RelOptInfo` 有两个
-逻辑状态：PostgreSQL 正常维护的 HOST path，以及扩展私有 registry 中最低
-device-state cost 的 CSD path。CSD parent 只接受 CSD child；HOST parent 可接受 HOST
-或已物化 CSD boundary。因此合法状态转移只有 `CSD->CSD`、`CSD->HOST`、
-`HOST->HOST`，一旦进入 HOST，所有祖先必须留在 HOST。
+AUTO 不再依赖 PostgreSQL pathlist 恰好保留 CSD 中间路径。PostgreSQL 正常维护 HOST
+paths，扩展私有 registry 则为每个 `RelOptInfo` 保存 CSD 候选 Pareto frontier，而不是
+只保存 device cost 最小的一条。Join 枚举左右 frontier 的笛卡尔积，upper operator
+枚举全部输入候选。只有 pathkeys、未决 SubPlan、selectivity risk、scan count 和 expected
+rows 相同的状态才允许比较；device cost、resource-bound rows、resource-bound bytes 均
+不大的候选才能支配另一候选。这避免了 naive 全枚举在 Q5 上的候选爆炸，同时不会按
+单一局部 cost 过早剪枝。CSD parent 只接受 CSD child；HOST parent 可接受 HOST 或已物化
+CSD boundary。因此合法状态转移只有 `CSD->CSD`、`CSD->HOST`、`HOST->HOST`，一旦
+进入 HOST，所有祖先必须留在 HOST。
 
 内部 device cost 不重复收取结果回传：
 
@@ -411,25 +421,36 @@ boundary = setup_cost + device cost + output_bytes * result_byte_cost
 
 默认 `setup_cost=1000`、`result_byte_cost=0.001`、
 `host_cached_page_cost=0.33`、`spill_page_cost=0.10`。FDM operator budget 从 4 GiB
-减去 output、spill staging、两个 FIFO 和每个 scan 的 chunk。输出超过
-`csd.output_mb` 时 boundary 加 `disable_cost`，但 device state 仍可继续被 CSD
-Aggregate 等缩减。
+减去 output、spill staging、两个 FIFO 和每个 scan 的 chunk。正常时延 cost 使用
+PostgreSQL/ANALYZE 的 expected rows；容量准入另用 resource bound：Scan 采用物理页可容纳
+tuple 上界，Join 采用笛卡尔积或 preserved-side 结构上界，Sort 继承输入上界，LIMIT 截断，
+Group/DISTINCT 使用 `min(input_bound, expected_rows * csd.stats_safety_factor)`，默认 factor=8。
+结果容量包含 ABI header、每列 result cell 和有界 varlena payload。resource-bound 输出超过
+`csd.output_mb` 时 boundary 加 `disable_cost`，但 device state 仍可继续被 CSD Aggregate
+等缩减。Group/DISTINCT 的统计倍数是保守准入估计而非数学硬上界；runtime capacity/spill
+检查仍是最终保护，低估必须显式失败，不能静默改走 HOST。
 
 主机缓存收益只计算一次：`mincore` 的实际 resident fraction 降低 HOST SeqScan cost，
 不再同时作为 penalty 重复加到 CSD。定向回归
 `tests/test_csd_auto_planner.sh` 覆盖 cold=CSD、hot=HOST、合法 CSD->HOST cut、输出容量、
-未决 SubPlan 和 SEMI/ANTI 基数边界。
+未决 SubPlan、SEMI/ANTI 基数边界，以及冷缓存下 Q2/Q16 必须选择纯 HOST。
 
 两个 correctness guard：含未重写 `SubPlan` 的 device state 不允许直接物化给 HOST；
 SEMI/ANTI 用 preserved-side rows 作保守边界估计，并把 risk 沿后续 CSD join 传播，直到
 Aggregate、DISTINCT 或 LIMIT 清除。后者修复了 Q21 将实际 337,680 行误估成 1 行、
 随后触发 HOST nested-loop explosion 的问题，AUTO Q21 从约 100.8 s 降到最终 20.0 s。
 
-最终 SF=1 默认结果在 `results/tpch_sf1_auto_placement_validation.md` 和 CSV：15 条完整
-CSD、7 条 mixed，Q1-Q22 为 22/22 byte-exact；AUTO 总计 90,872.251 ms，HOST 总计
-502,799.632 ms，吞吐 speedup 5.5330x，per-query geometric mean 5.1641x，18/22 单条
-更快。Q2/Q16 是仍需校准的明显 miss（partial offload 改变 join order/并行性）；Q19/Q21
-在本轮与 HOST 相差 5% 内。禁止为单条 query 编号硬编码路径。
+旧的 2026-10-05 单候选结果仍在 `results/tpch_sf1_auto_placement_validation.md` 和 CSV，
+用于追溯，不代表当前 frontier 实现。它的 Q2/Q16 mixed miss 已由一般化容量准入修复，
+没有在 planner 中按 query 编号硬编码。当前阶段的双时钟完整冷启动结果写入新的
+`tpch_sf1_auto_global_search*` 文件；`guest_ms` 才是排除 VM-Freeze C++ wall time 后的
+FPGA/Flash 模型指标，`wall_ms` 只诊断 TCG 原型开销，禁止把后者写成设备时延。
+最终默认布局为 18 条完整 CSD、2 条 mixed（Q17/Q20）、2 条纯 HOST（Q2/Q16），22/22
+byte-exact。每个样本独立 restart PostgreSQL 并 drop guest page cache 后，AUTO guest 总计
+183,019.742 ms，HOST 825,114.403 ms，吞吐 speedup 4.5083x，per-query geometric mean
+6.9207x，20/22 单条更快。Q2/Q16 的单次差异是同一纯 HOST 计划的冷 I/O/TCG 方差；独立
+Q2 复测为 19,176.669/19,218.811 ms。Q20 是 1.024x 的剩余 near-tie。详细方法和数据见
+`results/tpch_sf1_auto_global_search_validation.md` 与 CSV。
 
 ## 13. 常见陷阱
 

@@ -272,14 +272,22 @@ and spill passes.  PCIe result return and command setup are charged only when a
 device state is materialized as a CSD-to-HOST boundary, not at every internal
 CSD edge.
 
-AUTO keeps a private best device-resident path for every `RelOptInfo`, in
-addition to PostgreSQL's ordinary HOST path tournament.  A CSD parent can use
-only device-resident children; a HOST parent may consume a CSD boundary.  The
-valid transitions are therefore `CSD -> CSD`, `CSD -> HOST`, and
-`HOST -> HOST`.  `HOST -> CSD` is impossible, so once a low operator is placed
-on HOST every ancestor remains on HOST.  Keeping the private device state also
-prevents PostgreSQL from prematurely pruning a CSD scan/join that a later CSD
-Aggregate can reduce before returning data.
+AUTO keeps a private Pareto frontier of device-resident paths for every
+`RelOptInfo`, in addition to PostgreSQL's ordinary HOST path tournament.  Join
+planning evaluates the cross product of the two device frontiers and each upper
+operator evaluates every surviving input state.  Two candidates are comparable
+for pruning only when pathkeys, unresolved-SubPlan state, selectivity-risk
+state, scan-window count, and expected rows agree; one then dominates only if
+its device cost, resource-bound rows, and resource-bound bytes are all no
+larger.  This retains alternatives needed by later operators without the
+unbounded duplicate explosion seen in naive enumeration.
+
+A CSD parent can use only device-resident children; a HOST parent may consume a
+CSD boundary.  The valid transitions are therefore `CSD -> CSD`,
+`CSD -> HOST`, and `HOST -> HOST`.  `HOST -> CSD` is impossible, so once a low
+operator is placed on HOST every ancestor remains on HOST.  Keeping the private
+device states also prevents PostgreSQL from prematurely pruning a CSD scan/join
+that a later CSD Aggregate can reduce before returning data.
 
 The cost formulas are:
 
@@ -292,9 +300,17 @@ cut  = setup_cost + device_cost + output_bytes * result_byte_cost
 ```
 
 The spill estimator uses FDM capacity after the output range, spill staging,
-two FIFOs, and one scan chunk per relation have been reserved.  A boundary
-larger than `csd.output_mb` receives `disable_cost`, although its device state
-can still feed a later CSD reducer.
+two FIFOs, and one scan chunk per relation have been reserved.  Latency and
+capacity use separate cardinalities.  PostgreSQL/ANALYZE expected rows drive
+normal device, spill, and PCIe costs.  Capacity admission uses physical Scan
+page bounds, structural Join bounds, propagated Sort bounds, LIMIT clamps, and
+an ANALYZE estimate multiplied by `csd.stats_safety_factor` (default 8) for
+Group/DISTINCT, capped by the input bound.  The serialized result bound includes
+ABI header/cell overhead and bounded varlena payload.  A boundary larger than
+`csd.output_mb` receives `disable_cost`, although its device state can still
+feed a later CSD reducer.  The grouped statistical bound is intentionally
+conservative but not a formal maximum; runtime checks/spill remain authoritative
+and fail explicitly on an underestimate.
 
 `csd.host_cache_fraction=-1` samples every heap segment with Linux `mincore`;
 a value in `[0,1]` is a deterministic override.  Resident pages reduce HOST
@@ -355,8 +371,10 @@ creates bounded FDM scan windows and an MRS, submits `NVME_IOCTL_IO_CMD`, checks
 the status range, and decodes result cells into PostgreSQL tuples. SF=1 execution
 of all 22 supplied queries matches HOST results exactly. Per-relation AER cache
 return, compute/cache overlap, automatic cache-residency sampling, and one-way
-AUTO placement are implemented.  The validated default run selected 15
-complete CSD plans and 7 mixed plans, produced 22/22 exact results, and took
-90.872 s versus 502.800 s for HOST (5.533x throughput speedup).  See
-`results/tpch_sf1_auto_placement_validation.md` for the full method, per-query
-numbers, and remaining calibration misses.
+AUTO placement are implemented.  The 2026-10-09 global-candidate run selected
+18 complete CSD, 2 mixed, and 2 pure HOST plans and produced 22/22 exact
+results.  With PostgreSQL restarted and the guest page cache dropped before
+every sample, modeled guest time was 183.020 s versus 825.114 s for HOST
+(4.508x throughput speedup; 6.921x per-query geometric mean).  See
+`results/tpch_sf1_auto_global_search_validation.md` for the dual-clock method,
+per-query values, and remaining Q20 near-tie.

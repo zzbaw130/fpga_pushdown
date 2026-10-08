@@ -22,15 +22,30 @@ SET csd.exe_path = 'csd';
 EXPLAIN SELECT ...;
 ```
 
-In `auto` mode the planner retains independent HOST and device-resident CSD
-states for every relation.  CSD parents can consume only CSD states; HOST may
-consume a materialized CSD boundary, so the plan can switch from CSD to HOST
-at most once and can never upload a HOST intermediate back to CSD.  Internal
-CSD edges accumulate scan/join/aggregate/sort and spill cost.  A materialized
-boundary additionally pays `csd.setup_cost` (default 1000) and returned bytes
-times `csd.result_byte_cost` (default 0.001).  Boundaries larger than
-`csd.output_mb` are not selectable in AUTO, although their internal device
-states remain available to a reducing CSD parent.
+In `auto` mode PostgreSQL keeps its ordinary HOST paths while the extension
+retains a Pareto frontier of device-resident CSD candidates for every relation.
+Join planning enumerates every pair of device children and every upper operator
+considers every surviving input candidate; candidates are pruned only when an
+equivalent state is no better in device cost, resource-bound rows, or
+resource-bound bytes.  CSD parents can consume only CSD states; HOST may consume
+a materialized CSD boundary, so the plan can switch from CSD to HOST at most
+once and can never upload a HOST intermediate back to CSD.  Internal CSD edges
+accumulate scan/join/aggregate/sort and spill cost.  A materialized boundary
+additionally pays `csd.setup_cost` (default 1000) and expected returned bytes
+times `csd.result_byte_cost` (default 0.001).
+
+Expected cardinality remains PostgreSQL's ANALYZE-based estimate and is used
+for latency costing.  Capacity admission is separate: Scan uses a physical-page
+tuple upper bound, Join uses its structural Cartesian or preserved-side bound,
+Sort propagates its input bound, and LIMIT clamps it.  Group/DISTINCT uses the
+input bound capped by the estimate times `csd.stats_safety_factor` (default 8),
+so this last case is a conservative statistical resource bound rather than a
+mathematical maximum.  Result size includes the ABI-v8 header, one result cell
+per target, and bounded varlena payload.  A boundary whose resource-bound result
+exceeds `csd.output_mb` is not selectable in AUTO, although its internal device
+state remains available to a reducing CSD parent.  Runtime capacity checks and
+spill remain authoritative; an underestimate fails explicitly rather than
+silently changing execution location.
 
 `csd.host_cache_fraction=-1` samples heap-file page residency with `mincore`;
 set a value in `[0,1]` for a deterministic experiment.  Resident pages reduce
@@ -107,7 +122,11 @@ Run `tests/test_csd_tpch_execution.sh --mode csd|auto` inside CEMU against a
 running, NVMe-staged guest cluster to compare all 22 selected results exactly
 with the HOST path.  `tests/test_csd_auto_planner.sh` separately asserts cold
 and hot cache switching, a legal CSD-to-HOST cut, output-capacity pruning, and
-safe SubPlan/SEMI/ANTI boundaries.  The PostgreSQL executable must retain
+safe SubPlan/SEMI/ANTI boundaries, plus pure-HOST Q2/Q16 choices under a cold
+cache.  `tests/benchmark_csd_tpch.exp` restarts PostgreSQL and drops the guest
+page cache before every sample.  Its `guest_ms` is the FPGA/Flash model metric;
+`wall_ms` deliberately records TCG functional-prototype overhead separately and
+must not be presented as device latency.  The PostgreSQL executable must retain
 `CAP_SYS_ADMIN` because the Linux NVMe passthrough ioctl checks it before
 reaching CEMU.
 

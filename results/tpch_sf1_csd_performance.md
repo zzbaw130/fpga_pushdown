@@ -1,5 +1,11 @@
 # TPC-H SF=1 forced-CSD performance
 
+> Historical prototype-wall-time result.  These measurements include the
+> functional C++ kernel running under TCG/VM-Freeze and therefore must not be
+> presented as FPGA/Flash device latency.  Use
+> `tpch_sf1_auto_global_search_validation.md` and its `guest_ms` column for the
+> current modeled-device timing method.
+
 Configuration: CEMU TCG/VM-Freeze, guest-built PostgreSQL 12, forced
 `csd.exe_path=csd`, `csd.parallel_workers=32`, and `csd.program_runtime=0`.
 Elapsed time is measured outside the VM because VM-Freeze pauses the guest
