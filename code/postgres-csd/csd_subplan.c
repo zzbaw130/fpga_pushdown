@@ -71,9 +71,9 @@ csd_subplan_metadata(PlannerInfo *root, SubPlan *subplan, Plan **subplan_plan)
 		return NIL;
 	scan = (CustomScan *) plan;
 	if (scan->methods != &csd_scan_methods ||
-		list_length(scan->custom_private) < 8)
+		list_length(scan->custom_private) < CSD_META_FIELD_COUNT)
 		return NIL;
-	for (index = 0; index < 8; ++index)
+	for (index = 0; index < CSD_META_FIELD_COUNT; ++index)
 		metadata = lappend(metadata,
 			copyObject(list_nth(scan->custom_private, index)));
 	if (subplan_plan != NULL)
@@ -148,6 +148,12 @@ csd_make_join_metadata(const char *name, JoinType jointype, List *left,
 	metadata = lappend(metadata, copyObject(list_nth(left, 6)));
 	metadata = lappend(metadata, list_make3(makeInteger((int) jointype),
 		clauses, NIL));
+	/* Both rewrites are filters of the left stream, so they cannot emit more
+	 * rows or bytes than the original left metadata. */
+	metadata = lappend(metadata, copyObject(list_nth(left,
+		CSD_META_SAFE_ROWS)));
+	metadata = lappend(metadata, copyObject(list_nth(left,
+		CSD_META_SAFE_BYTES)));
 	return metadata;
 }
 

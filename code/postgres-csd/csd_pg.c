@@ -28,6 +28,7 @@ double csd_result_byte_cost = 0.001;
 double csd_host_cache_fraction = -1.0;
 double csd_host_cached_page_cost = 0.33;
 double csd_spill_page_cost = 0.10;
+double csd_stats_safety_factor = 8.0;
 
 static set_rel_pathlist_hook_type previous_rel_hook = NULL;
 static set_join_pathlist_hook_type previous_join_hook = NULL;
@@ -155,6 +156,10 @@ _PG_init(void)
 	DefineCustomRealVariable("csd.spill_page_cost",
 						 "CSD Flash spill cost per page and per read or write pass.", NULL,
 						 &csd_spill_page_cost, 0.10, 0.0, 1.0e12,
+						 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("csd.stats_safety_factor",
+						 "Conservative multiplier for ANALYZE-derived group cardinality capacity bounds.", NULL,
+						 &csd_stats_safety_factor, 8.0, 1.0, 1.0e6,
 						 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomStringVariable("csd.control_device", "CEMU control device.", NULL,
 						   &csd_control_device, "/dev/nvme0c3", PGC_USERSET, 0,
@@ -337,7 +342,8 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	const char *name = strVal(list_nth(scan->custom_private, 0));
 	double device_cost = floatVal(list_nth(scan->custom_private, 2));
 	double cache_fraction = floatVal(list_nth(scan->custom_private, 3));
-	Const *wire_plan = castNode(Const, list_nth(scan->custom_private, 8));
+	Const *wire_plan = castNode(Const, list_nth(scan->custom_private,
+		CSD_SCAN_WIRE_PLAN_INDEX));
 	bytea *wire_bytes = DatumGetByteaPP(wire_plan->constvalue);
 
 	(void) ancestors;
@@ -348,19 +354,28 @@ csd_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	ExplainPropertyFloat("CSD Boundary Cost", NULL,
 						 scan->scan.plan.total_cost, 3, es);
 	ExplainPropertyInteger("CSD Return Bytes", NULL,
-						   (int64) floatVal(list_nth(scan->custom_private, 6)), es);
+						   (int64) floatVal(list_nth(scan->custom_private,
+							   CSD_META_EXPECTED_BYTES)), es);
+	ExplainPropertyInteger("CSD Safe Return Bytes", NULL,
+						   (int64) Min(floatVal(list_nth(scan->custom_private,
+							   CSD_META_SAFE_BYTES)), (double) PG_INT64_MAX), es);
 	ExplainPropertyFloat("Host Cache Fraction", NULL, cache_fraction, 3, es);
 	ExplainPropertyInteger("CSD Wire Nodes", NULL,
-						   intVal(list_nth(scan->custom_private, 9)), es);
+						   intVal(list_nth(scan->custom_private,
+							   CSD_SCAN_WIRE_NODES_INDEX)), es);
 	ExplainPropertyInteger("CSD Wire Bytes", NULL, VARSIZE_ANY_EXHDR(wire_bytes), es);
 	ExplainPropertyInteger("CSD Expression Programs", NULL,
-						   intVal(list_nth(scan->custom_private, 10)), es);
+						   intVal(list_nth(scan->custom_private,
+							   CSD_SCAN_WIRE_EXPRESSIONS_INDEX)), es);
 	ExplainPropertyInteger("CSD Parameter Relocations", NULL,
-						   intVal(list_nth(scan->custom_private, 11)), es);
+						   intVal(list_nth(scan->custom_private,
+							   CSD_SCAN_WIRE_PARAMETERS_INDEX)), es);
 	ExplainPropertyInteger("CSD Pending Expressions", NULL,
-						   intVal(list_nth(scan->custom_private, 12)), es);
+						   intVal(list_nth(scan->custom_private,
+							   CSD_SCAN_PENDING_EXPRESSIONS_INDEX)), es);
 	ExplainPropertyInteger("CSD SubPlan Rewrites", NULL,
-						   intVal(list_nth(scan->custom_private, 13)), es);
+						   intVal(list_nth(scan->custom_private,
+							   CSD_SCAN_SUBPLAN_REWRITES_INDEX)), es);
 	ExplainPropertyText("CSD Wire Status",
 		"ABI v8 FDM-arena/FDM-FIFO/chunked-scan/Flash-spill operator descriptors", es);
 	ExplainPropertyText("CSD Transport", "NVMe Program Execute", es);

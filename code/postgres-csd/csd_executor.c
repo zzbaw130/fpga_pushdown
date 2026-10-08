@@ -43,6 +43,7 @@
 #include "cemu_ioctl.h"
 #include "csd_plan.h"
 #include "csd_executor.h"
+#include "csd_pg.h"
 
 typedef struct CsdSqlPlanHeader CsdSqlPlanHeader;
 typedef struct CsdSqlPlanNode CsdSqlPlanNode;
@@ -1352,7 +1353,8 @@ csd_executor_begin(CustomScanState *node, EState *estate, int eflags)
 	state->explain_only = (eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0;
 	if (state->explain_only)
 		return;
-	wire_plan = castNode(Const, list_nth(scan->custom_private, 8));
+	wire_plan = castNode(Const, list_nth(scan->custom_private,
+		CSD_SCAN_WIRE_PLAN_INDEX));
 	wire_bytes = DatumGetByteaPP(wire_plan->constvalue);
 	plan_length = VARSIZE_ANY_EXHDR(wire_bytes);
 	state->plan_data = palloc(plan_length);

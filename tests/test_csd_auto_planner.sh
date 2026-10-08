@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate the two-state AUTO dynamic program and its one-way CSD->HOST cut.
+# Validate the AUTO CSD-candidate frontier and its one-way CSD->HOST cut.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -79,7 +79,7 @@ if grep -q 'Custom Scan (CsdScan)' "${OUTPUT_DIR}/output_capacity.txt"; then
 fi
 
 "${psql_base[@]}" \
-    -c "LOAD 'csd_pg'; SET csd.exe_path='auto'; SET csd.host_cache_fraction=0;" \
+    -c "LOAD 'csd_pg'; SET csd.exe_path='auto'; SET csd.host_cache_fraction=0; SET csd.output_mb=1024;" \
     -f "${ROOT}/scripts/gen_data/queries/2.explain.sql" \
     >"${OUTPUT_DIR}/subplan_boundary.txt"
 grep -q 'Custom Scan (CsdScan)' "${OUTPUT_DIR}/subplan_boundary.txt" || {
@@ -102,5 +102,21 @@ if grep -Eq 'CSD Operator: .* (Semi|Anti) Join' \
     exit 1
 fi
 
-echo "PASS cold=CSD hot=HOST mixed=CSD->HOST oversized-boundary=HOST subplan-boundary=safe selectivity-boundary=safe"
+# Q2 and Q16 previously selected a cheap-looking Scan boundary whose actual
+# result disabled PostgreSQL's faster parallel HOST plan.  Even with an
+# explicitly cold HOST cache, the safe output-capacity bound must now retain
+# the all-HOST alternative instead of admitting that partial-offload cut.
+for query in 2 16; do
+    output="${OUTPUT_DIR}/q${query}_cold_default.txt"
+
+    "${psql_base[@]}" \
+        -c "LOAD 'csd_pg'; SET csd.exe_path='auto'; SET csd.host_cache_fraction=0;" \
+        -f "${ROOT}/scripts/gen_data/queries/${query}.explain.sql" >"${output}"
+    if grep -q 'Custom Scan (CsdScan)' "${output}"; then
+        echo "Cold-cache AUTO still partially offloads TPC-H Q${query}." >&2
+        exit 1
+    fi
+done
+
+echo "PASS cold=CSD hot=HOST mixed=CSD->HOST oversized-boundary=HOST subplan-boundary=safe selectivity-boundary=safe q2=HOST q16=HOST"
 echo "Raw plans: ${OUTPUT_DIR}"
