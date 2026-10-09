@@ -62,6 +62,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `7418e0ac2` | spill 写/回读设备时延、Sort ordered-target schema boundary、SF=1 校准与 22/22 回归 |
 | `601b25fdb` | Scan/FIFO batch 直连 external Sort、有界 run generation、SF=1 22/22 回归 |
 | `923166681` | external Sort 有界 spill cursor/writer merge、1 MiB staging 验证与 SF=1 22/22 回归 |
+| `20a83f89a` | 保守准入的 Scan/FIFO 直连 Aggregate、Q1/Q6 profile 与 SF=1 22/22 回归 |
 
 ## 3. 环境不变量
 
