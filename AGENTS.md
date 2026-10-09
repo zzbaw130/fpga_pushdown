@@ -59,6 +59,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `bfbba6964` | Join probe staging-bounded 流式 replay；AER 前稳定点 |
 | `4d2573947`-`71b1cf9ae` | AER 回填、计算/缓存重叠和 no-copy pipeline |
 | `acd9213b2` | AUTO Pareto 候选搜索、expected/resource bound 分离、Q2/Q16 纯 HOST 修复 |
+| `7418e0ac2` | spill 写/回读设备时延、Sort ordered-target schema boundary、SF=1 校准与 22/22 回归 |
 
 ## 3. 环境不变量
 
@@ -285,6 +286,9 @@ wall-time 数字保留只为历史可追溯。
 
 详细报告分别位于 `results/tpch_sf1_{sort,join,aggregate}_spill_replay_validation.md`、
 `results/tpch_sf1_fdm_arena_validation.md` 和 `results/tpch_sf1_fdm_fifo_validation.md`。
+新增时延校准与完整回归位于 `results/tpch_sf1_spill_timing_validation.md`：1 MiB Join
+replay 的模型增量为 460.718 ms，两轮 guest executor 实测均值增量为 454.376 ms
+（差异 1.38%），修复 Sort 输出 schema boundary 后 forced-CSD Q1-Q22 为 22/22 exact。
 
 ## 10. 回归命令与通过标准
 
