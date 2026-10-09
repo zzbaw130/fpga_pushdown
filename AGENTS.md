@@ -166,6 +166,9 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
 - Q2 的 correlated scalar `MIN` 被解相关为 grouped Aggregate + two-key Join；Q16
   的 `NOT IN` 仅在两侧列都证明 NOT NULL 时转为 hash anti-join。22 条查询均为零
   pending non-scalar expression。
+- `SORT` 保持输入物理行布局，因此 upper-relation lowering 在其后显式追加保持顺序的
+  `PROJECT`，把 Join 内部列裁剪/重排为 ordered `PathTarget`。否则 Q2 会把第三个
+  numeric cell 按 `n_name BPCHAR` 解码；此规则是通用 schema boundary，不按查询编号特判。
 - 表达式 IR 是有界 postfix VM，无 jump、递归、间接内存和 UDF。覆盖定点算术、
   comparison、SQL 三值逻辑、NULL、`LIKE`、`CASE` mux、`substring`、date year、
   常量数组 `IN`。`BETWEEN`/`IN` 展开为 comparison tree。
@@ -228,17 +231,23 @@ DISTINCT 仍保留 compatibility/protection-copy 路径。
 ## 9. 时延模型和已测性能
 
 每个 node 当前计 `64-cycle launch + rows * arg1`，`arg1` 是 II，默认 1；总计写入
-`modeled_cycles`。CSD kernel 同时返回本次真实 scan/replay 的 `flash_read_bytes`。
+`modeled_cycles`。CSD kernel 通过追加字段的 `cemu_args` 同时返回总 Flash 读、总 Flash
+写、spill replay 读和逻辑 spill 写字节；基础表读由总读减去 spill 读得到。
 当 PostgreSQL 的 `csd.program_runtime=0` 时，CEMU 自动使用下式决定解冻 guest 后
 Program Execute 仍保持 outstanding 的设备时延；正数 `program_runtime` 仍可显式覆盖：
 
 ```text
-T_device = max(modeled_cycles / fpga_clock,
-               flash_read_bytes / flash_read_bandwidth)
+T_stream = max(modeled_cycles / fpga_clock,
+               base_read_bytes / flash_read_bandwidth)
+T_device = T_stream
+         + spill_read_bytes / flash_read_bandwidth
+         + flash_write_bytes / flash_write_bandwidth
 ```
 
-当前 `config_example.json` 默认 `fpga_clock_mhz=250`、`flash_read_mb_s=1000`。功能性
-C++ kernel 仍在 TCG VM-Freeze 中运行，其 host wall time 不计入 `T_device`。论文
+基础扫描可与FPGA流水重叠；依赖有序的spill写和replay读不再被一个全局`max`隐藏。模型
+在完成逐算子重叠校准前有意采用保守累加。当前 `config_example.json` 默认
+`fpga_clock_mhz=250`、`flash_read_mb_s=1000`、`flash_write_mb_s=1000`。功能性C++ kernel
+仍在TCG VM-Freeze中运行，其host wall time不计入 `T_device`。论文
 校准目标公式：
 
 ```text

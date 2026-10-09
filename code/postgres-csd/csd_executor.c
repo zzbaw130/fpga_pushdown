@@ -1325,8 +1325,10 @@ csd_decode_cell(const CsdSqlResultCell *cell, const CsdSqlResultHeader *result,
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot decode CSD result into PostgreSQL type %u",
-							attribute->atttypid)));
+					 errmsg("cannot decode CSD result cell type %u into PostgreSQL type %u",
+							cell->datum_type, attribute->atttypid),
+					 errdetail("Output attribute \"%s\" has typmod %d.",
+							 NameStr(attribute->attname), attribute->atttypmod)));
 	}
 	pg_unreachable();
 }

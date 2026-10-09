@@ -937,17 +937,39 @@ static uint64_t sql_modeled_runtime_ns(ComputeJob *job)
 {
     ComputeParams *params = compute_ns(job->req->ns)->params;
     uint64_t cycle_ns = 0;
-    uint64_t flash_ns = 0;
+    uint64_t base_read_ns = 0;
+    uint64_t spill_read_ns = 0;
+    uint64_t spill_write_ns = 0;
+    uint64_t base_read_bytes;
+    uint64_t stream_ns;
+    __uint128_t total_ns;
 
     if (job->args.modeled_cycles && params->fpga_clock_mhz)
         cycle_ns = div_round_up_u128(
             (__uint128_t)job->args.modeled_cycles * 1000,
             params->fpga_clock_mhz);
-    if (job->args.flash_read_bytes && params->flash_read_mb_s)
-        flash_ns = div_round_up_u128(
-            (__uint128_t)job->args.flash_read_bytes * 1000000000ULL,
+
+    /* Base-table reads feed the FPGA pipeline and can overlap its work.  Spill
+     * replay and writes are dependency-ordered blocking phases, so charge them
+     * after the streaming phase instead of hiding them behind one global max. */
+    base_read_bytes = job->args.flash_read_bytes >= job->args.spill_read_bytes ?
+        job->args.flash_read_bytes - job->args.spill_read_bytes : 0;
+    if (base_read_bytes && params->flash_read_mb_s)
+        base_read_ns = div_round_up_u128(
+            (__uint128_t)base_read_bytes * 1000000000ULL,
             (uint64_t)params->flash_read_mb_s * 1024 * 1024);
-    return MAX(cycle_ns, flash_ns);
+    if (job->args.spill_read_bytes && params->flash_read_mb_s)
+        spill_read_ns = div_round_up_u128(
+            (__uint128_t)job->args.spill_read_bytes * 1000000000ULL,
+            (uint64_t)params->flash_read_mb_s * 1024 * 1024);
+    if (job->args.flash_write_bytes && params->flash_write_mb_s)
+        spill_write_ns = div_round_up_u128(
+            (__uint128_t)job->args.flash_write_bytes * 1000000000ULL,
+            (uint64_t)params->flash_write_mb_s * 1024 * 1024);
+
+    stream_ns = MAX(cycle_ns, base_read_ns);
+    total_ns = (__uint128_t)stream_ns + spill_read_ns + spill_write_ns;
+    return total_ns > UINT64_MAX ? UINT64_MAX : (uint64_t)total_ns;
 }
 
 static uint64_t run_functional_modeling(ComputeJob *job)
@@ -1394,6 +1416,7 @@ static int compute_decode_params(const cJSON *json, NvmeNamespace *ns)
     DECODE_PARAM(json, "nr_thread", Number, params->nr_thread, 4);
     DECODE_PARAM(json, "fpga_clock_mhz", Number, params->fpga_clock_mhz, 250);
     DECODE_PARAM(json, "flash_read_mb_s", Number, params->flash_read_mb_s, 1000);
+    DECODE_PARAM(json, "flash_write_mb_s", Number, params->flash_write_mb_s, 1000);
     DECODE_PARAM(json, "time_slice", Number, params->csf_sched_option.time_slice, 200000);
     DECODE_PARAM(json, "context_switch_time", Number, params->csf_sched_option.context_switch_time, 200);
     DECODE_PARAM(json, "csf_runtime_scale", Number, params->csf_runtime_scale, 3);
@@ -1411,6 +1434,9 @@ static int compute_encode_params(cJSON *json, NvmeNamespace *ns)
 
     ENCODE_PARAM(json, "nr_cu", Number, params->nr_cu);
     ENCODE_PARAM(json, "nr_thread", Number, params->nr_thread);
+    ENCODE_PARAM(json, "fpga_clock_mhz", Number, params->fpga_clock_mhz);
+    ENCODE_PARAM(json, "flash_read_mb_s", Number, params->flash_read_mb_s);
+    ENCODE_PARAM(json, "flash_write_mb_s", Number, params->flash_write_mb_s);
     ENCODE_PARAM(json, "time_slice", Number, params->csf_sched_option.time_slice);
     ENCODE_PARAM(json, "context_switch_time", Number, params->csf_sched_option.context_switch_time);
     ENCODE_PARAM(json, "csf_runtime_scale", Number, params->csf_runtime_scale);

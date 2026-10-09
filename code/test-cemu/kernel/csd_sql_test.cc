@@ -307,6 +307,9 @@ void test_chunked_nvm_scan()
     assert(nvm.last_generation == header.plan_id);
     assert(execution->flash_read_bytes == 2 * CSD_SQL_PAGE_BYTES);
     assert(args.flash_read_bytes == execution->flash_read_bytes);
+    assert(args.flash_write_bytes == 0);
+    assert(args.spill_read_bytes == 0);
+    assert(args.spill_write_bytes == 0);
     assert(args.modeled_cycles == execution->modeled_cycles);
     assert(execution->input_chunks == 1);
     assert(execution->fifo_batches == 2);
@@ -553,6 +556,10 @@ void test_heap_pipeline_memory_policy(bool use_fdm_arena)
     const CsdSqlExecutionStatus *status =
         reinterpret_cast<const CsdSqlExecutionStatus *>(status_buffer.data());
     assert(status->status_code == CSD_SQL_STATUS_OK);
+    assert(args.flash_read_bytes == status->flash_read_bytes);
+    assert(args.flash_write_bytes == status->flash_write_bytes);
+    assert(args.spill_read_bytes == status->spill_read_bytes);
+    assert(args.spill_write_bytes == status->spill_write_bytes);
     assert(status->validated_nodes == 7);
     assert(status->executed_nodes == 7);
     if (use_fdm_arena) {
@@ -772,6 +779,10 @@ void test_tpch_expression_and_multikey_pipeline()
         reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
     assert(execution->spill_write_bytes > 0);
     assert(execution->spill_read_bytes > 0);
+    assert(args.flash_read_bytes == execution->flash_read_bytes);
+    assert(args.flash_write_bytes == execution->flash_write_bytes);
+    assert(args.spill_read_bytes == execution->spill_read_bytes);
+    assert(args.spill_write_bytes == execution->spill_write_bytes);
     assert(execution->operator_allocations > 0);
 }
 

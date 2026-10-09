@@ -34,6 +34,11 @@ accumulate scan/join/aggregate/sort and spill cost.  A materialized boundary
 additionally pays `csd.setup_cost` (default 1000) and expected returned bytes
 times `csd.result_byte_cost` (default 0.001).
 
+An ordered upper relation has an explicit wire-schema boundary: CSD lowering
+places an order-preserving Project after Sort so the returned cell order and
+types match PostgreSQL's advertised ordered `PathTarget`, rather than leaking a
+wider Join-internal row layout through the CustomScan boundary.
+
 Expected cardinality remains PostgreSQL's ANALYZE-based estimate and is used
 for latency costing.  Capacity admission is separate: Scan uses a physical-page
 tuple upper bound, Join uses its structural Cartesian or preserved-side bound,

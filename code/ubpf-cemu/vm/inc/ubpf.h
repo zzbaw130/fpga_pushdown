@@ -86,6 +86,9 @@ extern "C"
         ubpf_cache_complete_fn cache_complete;
         unsigned long long modeled_cycles;
         unsigned long long flash_read_bytes;
+        unsigned long long flash_write_bytes;
+        unsigned long long spill_read_bytes;
+        unsigned long long spill_write_bytes;
     } __attribute__((packed));
 
     /**

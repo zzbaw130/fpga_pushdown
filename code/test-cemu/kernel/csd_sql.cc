@@ -166,11 +166,17 @@ public:
         return header_ != NULL ? header_->plan_id : 0;
     }
 
-    void execution_model(uint64_t *modeled_cycles, uint64_t *flash_read_bytes)
+    void execution_model(uint64_t *modeled_cycles, uint64_t *flash_read_bytes,
+                         uint64_t *flash_write_bytes,
+                         uint64_t *spill_read_bytes,
+                         uint64_t *spill_write_bytes)
     {
         std::lock_guard<std::mutex> guard(status_mutex_);
         *modeled_cycles = status_.modeled_cycles;
         *flash_read_bytes = status_.flash_read_bytes;
+        *flash_write_bytes = status_.flash_write_bytes;
+        *spill_read_bytes = status_.spill_read_bytes;
+        *spill_write_bytes = status_.spill_write_bytes;
     }
 
     long long run()
@@ -806,9 +812,17 @@ extern "C" long long csd_sql(struct cemu_args *args)
     if (args != NULL) {
         uint64_t modeled_cycles = 0;
         uint64_t flash_read_bytes = 0;
-        engine.execution_model(&modeled_cycles, &flash_read_bytes);
+        uint64_t flash_write_bytes = 0;
+        uint64_t spill_read_bytes = 0;
+        uint64_t spill_write_bytes = 0;
+        engine.execution_model(&modeled_cycles, &flash_read_bytes,
+                               &flash_write_bytes, &spill_read_bytes,
+                               &spill_write_bytes);
         args->modeled_cycles = modeled_cycles;
         args->flash_read_bytes = flash_read_bytes;
+        args->flash_write_bytes = flash_write_bytes;
+        args->spill_read_bytes = spill_read_bytes;
+        args->spill_write_bytes = spill_write_bytes;
     }
     if (args != NULL && args->cache_complete != NULL &&
         engine.cache_generation() != 0)

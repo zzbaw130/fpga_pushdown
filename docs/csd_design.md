@@ -43,6 +43,13 @@ use the fallback only when no bounded transform exists. The complete operator
 inventory derived from the 22 supplied query plans is
 documented in [TPC-H operator coverage](tpch_operator_coverage.md).
 
+PostgreSQL upper-relation targets are also an ABI boundary. `SORT` preserves
+its input row layout while ordering it, so wire lowering emits an
+order-preserving `PROJECT` immediately afterward to trim join-internal/resjunk
+columns and restore the exact ordered `PathTarget` column order. The CSD result
+schema therefore matches the CustomScan tuple descriptor even when a complex
+Join child exposes a wider internal layout.
+
 `FILTER`, `PROJECT`, and join residuals share a bounded postfix expression
 program. It has no branches, jumps, indirect memory access, or user-defined
 calls. Its fixed operators cover TPC-H arithmetic, comparisons, SQL
@@ -194,22 +201,30 @@ and Hash Join replay increment both `flash_read_bytes` and
 
 ## Timing model
 
-The present functional timing model is deliberately simple and inspectable:
+The functional timing model is deliberately simple and inspectable:
 each node charges a fixed 64-cycle launch plus `rows × arg1`, where `arg1` is
 the node initiation interval (default 1).  It is accumulated in
-`CsdSqlExecutionStatus::modeled_cycles`; the kernel also reports actual base
-relation and spill replay bytes as `flash_read_bytes`.  Unless PostgreSQL sets
-an explicit Program Execute runtime, CEMU automatically keeps the request
-outstanding for
+`CsdSqlExecutionStatus::modeled_cycles`.  The kernel separately exports total
+Flash reads, total Flash writes, spill replay reads, and logical spill writes
+through the append-only `cemu_args` ABI.  CEMU derives base relation reads as
+`flash_read_bytes - spill_read_bytes`.  Unless PostgreSQL sets an explicit
+Program Execute runtime, CEMU automatically keeps the request outstanding for
 
 ```
 max(ceil(modeled_cycles / fpga_clock),
-    ceil(flash_read_bytes / flash_read_bandwidth))
+    ceil(base_read_bytes / flash_read_bandwidth))
++ ceil(spill_read_bytes / flash_read_bandwidth)
++ ceil(flash_write_bytes / flash_write_bandwidth)
 ```
 
-after the VM-Freeze functional callback returns and the guest resumes.  The
-defaults are 250 MHz and 1000 MiB/s in `config_example.json`.  The intended
-calibrated model for each streaming stage is
+Base scans feed the FPGA stream and may overlap its compute cycles.  Spill
+writes and replay reads are dependency-ordered blocking phases and therefore
+are not hidden behind the base-stream maximum.  The formula is deliberately
+conservative until per-operator overlap is calibrated.  It also saturates on
+counter overflow and never counts functional C++ wall time.  The defaults are
+250 MHz and symmetric 1000 MiB/s read/write bandwidth in
+`config_example.json`; experiments must record or calibrate both bandwidths.
+The intended calibrated model for each streaming stage is
 
 ```
 T = T_launch + ceil(rows / lanes) * II / f_clk + bytes_in / BW_in

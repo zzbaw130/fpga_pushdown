@@ -386,6 +386,17 @@ csd_wire_count_nodes(List *metadata)
 		if (!equal(shape.targets, shape.outputs))
 			++count;
 	}
+	else if (strcmp(name, "Sort") == 0)
+	{
+		List *payload = (List *) list_nth(metadata, 7);
+		List *targets = (List *) list_nth(payload, 1);
+
+		/* Sort preserves its child's physical row layout, while PostgreSQL's
+		 * ordered upper relation may advertise a trimmed/reordered PathTarget.
+		 * Materialize that boundary layout explicitly after the stable sort. */
+		if (targets != NIL)
+			++count;
+	}
 
 	foreach(cell, children)
 	{
@@ -969,6 +980,18 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 		MemSet(&child_results[0].schema, 0, sizeof(child_results[0].schema));
 	}
 	result.node_id = node_id;
+	if (node.opcode == CSD_SQL_OP_SORT)
+	{
+		List *payload = (List *) list_nth(metadata, 7);
+		List *targets = (List *) list_nth(payload, 1);
+
+		/* Projection does not disturb row order.  Besides trimming resjunk and
+		 * join-internal columns, this makes the wire root schema agree exactly
+		 * with the CustomScan tuple descriptor consumed by PostgreSQL. */
+		if (targets != NIL)
+			result = csd_wire_emit_expression_node(builder, CSD_SQL_OP_PROJECT,
+				result, targets, metadata);
+	}
 	return result;
 }
 

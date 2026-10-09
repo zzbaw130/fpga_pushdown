@@ -22,6 +22,16 @@ struct cemu_args {
     long long cparam2;           // parameter 2
     void *data_buffer;           // additional data buffer
     long long buffer_len;        // data buffer length
+    void *service_context;       // controller-owned callback context
+    cemu_nvm_io_fn nvm_read;     // optional internal NVM read service
+    cemu_nvm_io_fn nvm_write;    // optional internal NVM write service
+    cemu_cache_notify_fn cache_notify;
+    cemu_cache_complete_fn cache_complete;
+    unsigned long long modeled_cycles;    // CSF-provided timing counters
+    unsigned long long flash_read_bytes;
+    unsigned long long flash_write_bytes;
+    unsigned long long spill_read_bytes;
+    unsigned long long spill_write_bytes;
 };
 
 // CSF function signature
@@ -29,6 +39,10 @@ long long your_csf_function(struct cemu_args *args);
 ```
 
 The CSF function returns the number of output bytes or blocks processed.
+The controller initializes the callback fields.  A functional SQL CSF writes
+the append-only timing counters before it returns; CEMU uses them only when the
+command does not provide an explicit runtime.  Any change to this structure
+must be made in both `tests/cemu/kernel/cemu_def.h` and the uBPF runtime ABI.
 
 ## Developing Shared Library CSFs
 
