@@ -384,6 +384,10 @@ struct CsdSqlExecutionStatus {
     uint64_t operator_calls[CSD_SQL_PROFILE_SLOTS];
     uint64_t operator_rows[CSD_SQL_PROFILE_SLOTS];
     uint64_t operator_ns[CSD_SQL_PROFILE_SLOTS];
+    /* Append-only diagnostics for bounded Scan batch consumers. */
+    uint64_t stream_input_batches;
+    uint64_t stream_input_rows;
+    uint64_t stream_input_peak_bytes;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

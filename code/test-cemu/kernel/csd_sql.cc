@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -475,6 +476,19 @@ private:
         return true;
     }
 
+    bool try_grow_operator_memory(uint64_t bytes)
+    {
+        std::lock_guard<std::mutex> memory_guard(operator_memory_mutex_);
+        if (bytes > operator_memory_capacity_ - operator_memory_used_) return false;
+        operator_memory_used_ += bytes;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            status_.operator_peak_bytes = std::max<uint64_t>(
+                status_.operator_peak_bytes, operator_memory_used_);
+        }
+        return true;
+    }
+
     bool wait_acquire_operator_memory(uint64_t bytes)
     {
         std::unique_lock<std::mutex> memory_guard(operator_memory_mutex_);
@@ -572,11 +586,20 @@ private:
         case CSD_SQL_OP_SCAN: {
             const std::vector<uint32_t> pipeline = stateless_pipeline(index, consumers,
                                                                       sole_consumer);
-            const bool succeeded = execute_scan(index, node, output, &pipeline);
-            if (succeeded)
+            const uint32_t tail = pipeline.empty() ? index : pipeline.back();
+            const uint32_t next = consumers[tail] == 1 ? sole_consumer[tail] :
+                                  CSD_SQL_INVALID_NODE;
+            const bool stream_sort = next != CSD_SQL_INVALID_NODE &&
+                                     nodes_[next].opcode == CSD_SQL_OP_SORT;
+            const bool succeeded = stream_sort ?
+                execute_scan_to_sort(index, node, pipeline, next, nodes_[next], output) :
+                execute_scan(index, node, output, &pipeline);
+            if (succeeded) {
                 for (std::vector<uint32_t>::const_iterator stage = pipeline.begin();
                      stage != pipeline.end(); ++stage)
                     precomputed[*stage] = 1;
+                if (stream_sort) precomputed[next] = 1;
+            }
             return succeeded;
         }
         case CSD_SQL_OP_INDEX_SCAN:

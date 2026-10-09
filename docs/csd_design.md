@@ -66,9 +66,14 @@ page-header, line-pointer, tuple-header, NULL bitmap, fixed-width datum,
 varlena and restricted `numeric` decoding inside CEMU. It emits an internal
 column batch, never a guest pointer. Each decoded scan window crosses one of two
 alternating, fixed-capacity FDM tuple FIFOs; an oversized window is split into
-multiple FIFO batches. The current executor then appends decoded FIFO output to
-the downstream C++ `Batch`, so this transport boundary is bounded but the full
-operator pipeline is not yet hard-bounded. The visibility contract is
+multiple FIFO batches. When the sole downstream blocking node is `SORT`, the
+FIFO hands each batch directly to the Sort consumer after any fused
+Filter/Project stages. Sort moves rows into its current arena-accounted run and
+flushes that run to Flash before accepting more rows when the arena is full;
+the complete decoded relation is therefore no longer materialized as a
+separate Scan `Batch` on this path. Other blocking consumers still receive an
+accumulated C++ `Batch`, so the full operator pipeline is not yet hard-bounded.
+The visibility contract is
 intentionally strict: only planner-proven frozen/all-visible pages may use
 this path.  External/TOASTed or compressed varlena values and unsupported
 numeric encodings fail visibly rather than returning a partial answer.
@@ -99,7 +104,7 @@ CEMU:
 | Filter, project | SIMD-like lanes executing bounded expression bytecode | Never blocks; output compacts valid lanes |
 | Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state | Oversized grouped state radix-partitions input rows by the complete group key and replays each partition |
 | Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE | An intrinsically oversized build side radix-partitions both inputs to Flash and replays one matching pair at a time |
-| Sort | multi-key bounded run generation followed by stable merge passes | Input takes an arena lease; failed allocation writes runs to Flash, retains only handles, and reads pairs back for stable merge |
+| Sort | multi-key bounded run generation followed by stable merge passes | A direct Scan pipeline grows one arena-accounted run row by row, flushes before exceeding the lease, retains only Flash handles, and reads pairs back for stable merge |
 
 The choices follow the streaming filter/project and hash GQE direction in the
 [Xilinx Vitis Database Library](https://github.com/Xilinx/Vitis_Libraries/tree/master/database).
@@ -125,13 +130,13 @@ threads are FPGA hardware.
 `HASH_JOIN`, hash/group aggregate and external-style sort remain blocking operators:
 they use their own operator file and the shared Flash spill allocator is
 serialized. Scan input is now chunked and reusable and its decoded windows
-cross the FDM FIFOs, but each scan still accumulates the FIFO output `Batch`
-before a blocking consumer. The current task
-layer is DAG-level concurrency, not yet the full FIFO/double-buffer,
-per-batch streaming pipeline shown in Trinity. That
-requires a bounded batch-queue protocol between compatible operators and is
-kept as a distinct next step rather than being conflated with thread-level
-parallelism.
+cross the FDM FIFOs. A sole-consumer `Scan -> [Filter/Project] -> Sort` chain
+now executes as a per-batch consumer pipeline: the Scan result slot remains
+empty and only the current FIFO batch plus Sort run is live. Other blocking
+consumers still accumulate the FIFO output before execution. The task layer is
+DAG-level concurrency; extending the same consumer protocol to Join and
+Aggregate, and double-buffering decode against consumption, remain separate
+steps rather than being conflated with thread-level parallelism.
 
 CEMU currently retains a shared-library mapping after its unload control
 command even when the CSD kernel itself has no TLS segment. Normal repeated
@@ -149,12 +154,17 @@ page cache. Spill records contain operator/run identity, tuple and column
 counts, cell descriptors, and byte payloads.
 
 `SORT` emits bounded runs and merge intermediates to the designated spill
-range. Once a run is written, the sort keeps only its offset/length handle;
-merge passes read two records back through the same bounded FDM staging window,
-perform a stable merge, and write the next run. A final read reconstructs the
-operator output. Top-N sorts truncate every run and merge result to N rows,
-which bounds their Flash traffic without changing the global top-N result.
-Spill records and every read are range-checked before deserialization.
+range. For a direct Scan pipeline, rows are charged to the operator arena as
+they arrive; failure to grow the lease closes and sorts the current run before
+writing it. Once a run is written, the sort keeps only its offset/length
+handle. Merge-pass Flash transfers use the bounded FDM staging window, perform
+a stable merge, and write the next run. A final read reconstructs the operator
+output. Top-N sorts truncate every run and merge result to N rows, which bounds
+their Flash traffic without changing the global top-N result. Spill records
+and every read are range-checked before deserialization. The functional C++
+merge still reconstructs both input runs and its merged output on the host
+heap; replacing it with cursor-based streaming merge is required before the
+merge phase itself is a physical controller-memory bound.
 
 An oversized equi-join uses power-of-two radix partitions. Both build and probe
 rows are serialized to Flash, only partition handles survive the write phase,
@@ -186,14 +196,16 @@ table is discarded immediately and the complete size is projected from build
 progress to choose the radix fan-out. Per-lane partial maps are freed directly
 after merge. Global aggregates currently retain the protection-copy path.
 
-The implementation is still not a proof of a hard controller-memory bound:
-scans still accumulate complete decoded input `Batch` objects. Aggregate and
-Hash Join no longer copy partition rows: their selection writer serializes
-source ordinals directly through the bounded FDM staging range, and Join probe
-replay is chunked by that same limit. The aggregate threshold bounds its
-modeled state, but the table still uses ordinary C++ containers rather than an
-allocator carved from the FDM arena. Streaming scan consumers, chunked
-Aggregate replay and an arena allocator are needed for a physical bound.
+The implementation is still not a proof of a hard controller-memory bound.
+Direct Scan-to-Sort plans no longer accumulate a complete decoded Scan
+`Batch`, but Scan inputs feeding Join or Aggregate still do. Sort merge passes
+reconstruct run pairs on the C++ heap. Aggregate and Hash Join no longer copy
+partition rows: their selection writer serializes source ordinals directly
+through the bounded FDM staging range, and Join probe replay is chunked by that
+same limit. The aggregate threshold bounds its modeled state, but the table
+still uses ordinary C++ containers rather than an allocator carved from the
+FDM arena. Streaming Join/Aggregate consumers, cursor-based Sort merge and an
+arena allocator are needed for a physical bound.
 Serialized spill records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and

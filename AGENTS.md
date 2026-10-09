@@ -210,8 +210,10 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
 
 阻塞算子内存机制：
 
-- Sort：申请 arena 失败后生成有界 sorted runs，Flash 上只保留 handle；两两读回、
-  stable merge、写下一层，最终读结果。Top-N 在每个 run/merge 后截断。
+- Sort：`Scan -> [Filter/Project] -> Sort` 单消费者链由 FIFO batch 直接驱动，不再先
+  累积完整 Scan `Batch`；current run 逐行增长 arena lease，无法增长时排序并写 Flash，
+  Flash 上只保留 handle。两两读回、stable merge、写下一层，最终读结果。Top-N 在每个
+  run/merge 后截断。
 - Hash Join：完整 canonical key 做 power-of-two radix partition；build/probe selection
   直接从 source row ordinal 两遍序列化到 Flash，不创建 partition `Batch`。一次只
   restore 一个 build partition 并申请 arena lease；probe record 按 staging capacity
@@ -223,11 +225,13 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
 - 单行/单 group/极端 skew 无法落入 arena 时显式拒绝。并行 branch 暂占 arena 时，
   replay 等待 lease，而不是误报 OOM。
 
-必须诚实保留的当前边界：完整 decoded Scan 输入仍会累计到 C++ `Batch`；hash state
-仍是普通 STL container，而非真实 FDM arena allocator。虽然 scan window、FIFO、spill
-I/O 和 blocking lease 已有界，但在实现 streaming Scan consumer 与 arena-backed
-container 前，不能声称 SF=32 端到端物理内存已严格有界。global Aggregate 的大型
-DISTINCT 仍保留 compatibility/protection-copy 路径。
+必须诚实保留的当前边界：直接 Scan-to-Sort 已消除完整 Scan `Batch`，但 Join/Aggregate
+输入仍会累计；Sort merge 仍在 C++ heap 中同时恢复两个 run 和 merge output；hash
+state 仍是普通 STL container，而非真实 FDM arena allocator。虽然 scan window、FIFO、
+run generation、spill I/O 和 blocking lease 已有界，但在实现 Join/Aggregate streaming
+consumer、cursor-based Sort merge 与 arena-backed container 前，不能声称 SF=32 端到端
+物理内存已严格有界。global Aggregate 的大型 DISTINCT 仍保留
+compatibility/protection-copy 路径。
 
 ## 9. 时延模型和已测性能
 
@@ -283,12 +287,16 @@ wall-time 数字保留只为历史可追溯。
 | Aggregate replay | 1 MiB arena；5,996,736 B 写/读；16 records；peak 796,876 B；74,999 groups exact |
 | FDMFS reuse | fragmented free 后重新申请完整 4,294,967,296 B 成功 |
 | Q8 normal | 3.594 GiB arena；peak 572.320 MiB；0 spill |
+| Scan-to-Sort stream | 32 MiB FIFO；1 MiB arena；30,209 rows exact；peak 1,048,560 B；2,416,828 B spill write/read |
 
 详细报告分别位于 `results/tpch_sf1_{sort,join,aggregate}_spill_replay_validation.md`、
 `results/tpch_sf1_fdm_arena_validation.md` 和 `results/tpch_sf1_fdm_fifo_validation.md`。
 新增时延校准与完整回归位于 `results/tpch_sf1_spill_timing_validation.md`：1 MiB Join
 replay 的模型增量为 460.718 ms，两轮 guest executor 实测均值增量为 454.376 ms
 （差异 1.38%），修复 Sort 输出 schema boundary 后 forced-CSD Q1-Q22 为 22/22 exact。
+直接 Scan-to-Sort 的批次消费验证位于
+`results/tpch_sf1_streaming_sort_validation.md`；版本化 kernel 下 forced-CSD Q1-Q22
+再次 22/22 exact，forced planner 22/22 与 AUTO 定向回归同时通过。
 
 ## 10. 回归命令与通过标准
 

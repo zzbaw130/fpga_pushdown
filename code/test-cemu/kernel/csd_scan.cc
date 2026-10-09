@@ -5,7 +5,8 @@
      * inside a page without nested software thread pools.
      */
     bool execute_scan(uint32_t index, const CsdSqlPlanNode &node, Batch *output,
-                      const std::vector<uint32_t> *pipeline = NULL)
+                      const std::vector<uint32_t> *pipeline = NULL,
+                      const std::function<bool(Batch &)> *consumer = NULL)
     {
         const CsdSqlScanSpec *spec = NULL;
         uint64_t descriptors_bytes = 0;
@@ -93,7 +94,10 @@
                                     output_columns, pipeline, &input_rows, &window_output))
                 return false;
             if (header_->flags & CSD_SQL_PLAN_FDM_FIFO) {
-                if (!fifo_forward_batch(index, window_output, output)) return false;
+                if (!fifo_forward_batch(index, window_output, output, consumer)) return false;
+            } else if (consumer != NULL) {
+                note_stream_input(window_output);
+                if (!(*consumer)(window_output)) return false;
             } else {
                 output->rows.insert(output->rows.end(),
                     std::make_move_iterator(window_output.rows.begin()),

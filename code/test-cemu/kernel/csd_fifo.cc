@@ -4,23 +4,39 @@
      * identical to result cells: fixed descriptors followed by compact byte
      * data.  A batch is split when it would exceed one FIFO range.
      *
-     * This is the transport boundary for the next streaming milestone.  The
-     * current DAG executor still appends decoded rows to its output Batch, but
-     * every scan-to-operator transfer is now capacity checked against, written
-     * to, and read from real FDMFS storage rather than an unaccounted queue.
+     * A bounded consumer may take ownership of each decoded FIFO batch.  This
+     * lets a blocking operator build bounded state without first materializing
+     * the complete Scan output in the DAG result vector.
      */
-    bool fifo_forward_batch(uint32_t index, const Batch &input, Batch *output)
+    void note_stream_input(const Batch &batch)
+    {
+        const uint64_t bytes = batch_bytes(batch);
+        std::lock_guard<std::mutex> status_guard(status_mutex_);
+        ++status_.stream_input_batches;
+        status_.stream_input_rows += batch.rows.size();
+        status_.stream_input_peak_bytes = std::max<uint64_t>(
+            status_.stream_input_peak_bytes, bytes);
+    }
+
+    bool fifo_forward_batch(uint32_t index, Batch &input, Batch *output,
+                            const std::function<bool(Batch &)> *consumer = NULL)
     {
         output->columns = input.columns;
         if (input.rows.empty()) return true;
         if (!(header_->flags & CSD_SQL_PLAN_FDM_FIFO)) {
-            output->rows.insert(output->rows.end(), input.rows.begin(), input.rows.end());
+            if (consumer != NULL) {
+                note_stream_input(input);
+                return (*consumer)(input);
+            }
+            output->rows.insert(output->rows.end(),
+                std::make_move_iterator(input.rows.begin()),
+                std::make_move_iterator(input.rows.end()));
             return true;
         }
 
-        std::lock_guard<std::mutex> fifo_guard(fifo_mutex_);
         size_t first_row = 0;
         while (first_row < input.rows.size()) {
+            std::unique_lock<std::mutex> fifo_guard(fifo_mutex_);
             const uint32_t range = (fifo_generation_ & 1U) == 0 ?
                 header_->fifo_range_a : header_->fifo_range_b;
             unsigned char *buffer = static_cast<unsigned char *>(args_->mr_addr[range]);
@@ -104,7 +120,9 @@
             const CsdSqlResultCell *read_cells = reinterpret_cast<const CsdSqlResultCell *>(
                 buffer + ready->cells_offset);
             const unsigned char *read_payload = buffer + ready->bytes_offset;
-            output->rows.reserve(output->rows.size() + row_count);
+            Batch forwarded;
+            forwarded.columns = ready->column_count;
+            forwarded.rows.reserve(row_count);
             for (uint32_t row_index = 0; row_index < ready->row_count; ++row_index) {
                 Row row;
                 row.reserve(ready->column_count);
@@ -125,7 +143,7 @@
                             read_payload + cell.bytes_offset), cell.bytes_length);
                     row.push_back(std::move(value));
                 }
-                output->rows.push_back(std::move(row));
+                forwarded.rows.push_back(std::move(row));
             }
             {
                 std::lock_guard<std::mutex> status_guard(status_mutex_);
@@ -134,6 +152,19 @@
                 status_.fifo_read_bytes += total_bytes;
             }
             ++fifo_generation_;
+            /* The reconstructed batch owns its bytes.  Release the shared FDM
+             * FIFO before a blocking consumer waits for arena capacity, or an
+             * independent branch holding that capacity could be prevented
+             * from advancing its own FIFO and releasing its lease. */
+            fifo_guard.unlock();
+            if (consumer != NULL) {
+                note_stream_input(forwarded);
+                if (!(*consumer)(forwarded)) return false;
+            } else {
+                output->rows.insert(output->rows.end(),
+                    std::make_move_iterator(forwarded.rows.begin()),
+                    std::make_move_iterator(forwarded.rows.end()));
+            }
             first_row = end_row;
         }
         return true;
