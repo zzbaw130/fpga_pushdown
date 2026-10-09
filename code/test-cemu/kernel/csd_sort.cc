@@ -44,40 +44,93 @@
                     merged_runs.push_back((*runs)[run]);
                     continue;
                 }
-                Batch left, right, merged;
-                if (!read_spill_batch(index, (*runs)[run], &left) ||
-                    !read_spill_batch(index, (*runs)[run + 1], &right))
-                    return false;
-                merged.columns = columns;
-                const size_t merged_limit = spec->top_n == 0 ?
-                    left.rows.size() + right.rows.size() :
-                    std::min<size_t>(spec->top_n,
-                        left.rows.size() + right.rows.size());
-                merged.rows.reserve(merged_limit);
-                size_t left_index = 0, right_index = 0;
-                while (merged.rows.size() < merged_limit &&
-                       left_index < left.rows.size() &&
-                       right_index < right.rows.size()) {
-                    if (sort_less(right.rows[right_index], left.rows[left_index],
-                                  keys, spec->key_count))
-                        merged.rows.push_back(std::move(right.rows[right_index++]));
-                    else
-                        merged.rows.push_back(std::move(left.rows[left_index++]));
-                }
-                while (merged.rows.size() < merged_limit &&
-                       left_index < left.rows.size())
-                    merged.rows.push_back(std::move(left.rows[left_index++]));
-                while (merged.rows.size() < merged_limit &&
-                       right_index < right.rows.size())
-                    merged.rows.push_back(std::move(right.rows[right_index++]));
                 SpillHandle handle;
-                if (!spill_batch(index, merged, &handle)) return false;
+                if (!merge_spill_runs(index, columns, spec, keys,
+                                      (*runs)[run], (*runs)[run + 1],
+                                      &handle))
+                    return false;
                 merged_runs.push_back(handle);
             }
             runs->swap(merged_runs);
         }
         output->columns = columns;
         return runs->empty() || read_spill_batch(index, (*runs)[0], output);
+    }
+
+    bool merge_spill_runs(uint32_t index, uint16_t columns,
+                          const CsdSqlSortSpec *spec,
+                          const CsdSqlSortKey *keys,
+                          const SpillHandle &left_handle,
+                          const SpillHandle &right_handle,
+                          SpillHandle *output_handle)
+    {
+        SpillRowCursor left, right;
+        if (!init_spill_cursor(index, left_handle, &left)) {
+            finish_spill_cursor(&left);
+            return false;
+        }
+        if (!init_spill_cursor(index, right_handle, &right)) {
+            finish_spill_cursor(&left);
+            finish_spill_cursor(&right);
+            return false;
+        }
+        uint64_t input_rows = 0, output_rows = 0, max_payload = 0;
+        if (left.record.column_count != columns ||
+            right.record.column_count != columns ||
+            !checked_add(left.record.row_count, right.record.row_count,
+                         &input_rows) ||
+            !checked_add(left.record.bytes_length,
+                         right.record.bytes_length, &max_payload)) {
+            finish_spill_cursor(&left);
+            finish_spill_cursor(&right);
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x240);
+        }
+        output_rows = spec->top_n == 0 ? input_rows :
+            std::min<uint64_t>(spec->top_n, input_rows);
+        SpillRowWriter writer;
+        if (!init_spill_writer(index, columns, output_rows,
+                               max_payload, &writer)) {
+            finish_spill_cursor(&left);
+            finish_spill_cursor(&right);
+            return false;
+        }
+        bool left_has = false, right_has = false;
+        uint64_t emitted = 0;
+        while (emitted < output_rows) {
+            if (!ensure_spill_cursor_row(index, &left, &left_has) ||
+                !ensure_spill_cursor_row(index, &right, &right_has)) {
+                finish_spill_cursor(&left);
+                finish_spill_cursor(&right);
+                return false;
+            }
+            if (!left_has && !right_has) {
+                finish_spill_cursor(&left);
+                finish_spill_cursor(&right);
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x241);
+            }
+            const bool take_right = right_has &&
+                (!left_has || sort_less(spill_cursor_row(right),
+                                        spill_cursor_row(left), keys,
+                                        spec->key_count));
+            const Row &selected = take_right ? spill_cursor_row(right) :
+                                               spill_cursor_row(left);
+            if (!append_spill_writer_row(index, &writer, selected)) {
+                finish_spill_cursor(&left);
+                finish_spill_cursor(&right);
+                return false;
+            }
+            if (take_right) advance_spill_cursor(&right);
+            else advance_spill_cursor(&left);
+            ++emitted;
+        }
+        finish_spill_cursor(&left);
+        finish_spill_cursor(&right);
+        if (!finish_spill_writer(index, &writer, output_handle)) return false;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            status_.sort_merge_rows += emitted;
+        }
+        return true;
     }
 
     struct StreamingSortState {

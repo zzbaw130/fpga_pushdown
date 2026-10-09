@@ -87,6 +87,19 @@ void add_right_tuple(unsigned char *page, uint16_t item, uint16_t offset,
     put_i32(tuple + 28, value);
 }
 
+void add_int_text_tuple(unsigned char *page, uint16_t item, uint16_t offset,
+                        int32_t key, const char text[8])
+{
+    const uint16_t tuple_length = 36;
+    put_u32(page + 24 + item * 4,
+            static_cast<uint32_t>(offset) | (static_cast<uint32_t>(1) << 15) |
+            (static_cast<uint32_t>(tuple_length) << 17));
+    unsigned char *tuple = page + offset;
+    tuple[22] = 24;
+    put_i32(tuple + 24, key);
+    memcpy(tuple + 28, text, 8);
+}
+
 void add_feature_tuple(unsigned char *page, uint16_t item, uint16_t offset,
                        int32_t group1, int32_t group2, int32_t value,
                        int32_t date, const char text[8])
@@ -318,14 +331,18 @@ void test_chunked_nvm_scan()
     assert(execution->fdm_reserved_bytes == header.fdm_reserved_bytes);
 }
 
-void test_streaming_scan_sort_batches()
+void test_streaming_scan_sort_batches(uint32_t top_n)
 {
     std::vector<unsigned char> page(CSD_SQL_PAGE_BYTES, 0);
-    put_u16(page.data() + 12, 24 + 4 * 4);
-    add_right_tuple(page.data(), 0, 128, 4, 40);
-    add_right_tuple(page.data(), 1, 192, 1, 10);
-    add_right_tuple(page.data(), 2, 256, 3, 30);
-    add_right_tuple(page.data(), 3, 320, 2, 20);
+    put_u16(page.data() + 12, 24 + 8 * 4);
+    add_int_text_tuple(page.data(), 0, 128, 8, "eight___");
+    add_int_text_tuple(page.data(), 1, 192, 1, "one_____");
+    add_int_text_tuple(page.data(), 2, 256, 7, "seven___");
+    add_int_text_tuple(page.data(), 3, 320, 2, "two_____");
+    add_int_text_tuple(page.data(), 4, 384, 6, "six_____");
+    add_int_text_tuple(page.data(), 5, 448, 3, "three___");
+    add_int_text_tuple(page.data(), 6, 512, 5, "five____");
+    add_int_text_tuple(page.data(), 7, 576, 4, "four____");
 
     std::vector<unsigned char> plan(
         sizeof(CsdSqlPlanHeader) + 2 * sizeof(CsdSqlPlanNode), 0);
@@ -337,16 +354,22 @@ void test_streaming_scan_sort_batches()
     scan.output_count = 2;
     scan.flags = CSD_SQL_SCAN_FROZEN_PAGES;
     scan_node.expression_offset = append(&plan, scan);
-    for (uint16_t attribute = 0; attribute < 2; ++attribute) {
-        CsdSqlColumnSpec column = {};
-        column.attnum = attribute + 1;
-        column.output_column = attribute;
-        column.attlen = 4;
-        column.alignment = 4;
-        column.datum_type = CSD_SQL_TYPE_INT32;
-        column.flags = CSD_SQL_COLUMN_OUTPUT;
-        append(&plan, column);
-    }
+    CsdSqlColumnSpec integer = {};
+    integer.attnum = 1;
+    integer.output_column = 0;
+    integer.attlen = 4;
+    integer.alignment = 4;
+    integer.datum_type = CSD_SQL_TYPE_INT32;
+    integer.flags = CSD_SQL_COLUMN_OUTPUT;
+    append(&plan, integer);
+    CsdSqlColumnSpec text = {};
+    text.attnum = 2;
+    text.output_column = 1;
+    text.attlen = 8;
+    text.alignment = 1;
+    text.datum_type = CSD_SQL_TYPE_BYTES;
+    text.flags = CSD_SQL_COLUMN_OUTPUT;
+    append(&plan, text);
     scan_node.expression_length = sizeof(scan) +
         2 * sizeof(CsdSqlColumnSpec);
 
@@ -355,6 +378,7 @@ void test_streaming_scan_sort_batches()
     sort_node.flags = CSD_SQL_NODE_BLOCKING | CSD_SQL_NODE_SPILLABLE;
     CsdSqlSortSpec sort = {};
     sort.key_count = 1;
+    sort.top_n = top_n;
     sort_node.expression_offset = append(&plan, sort);
     CsdSqlSortKey key = {};
     key.key_column = 0;
@@ -379,7 +403,7 @@ void test_streaming_scan_sort_batches()
     /* Header plus one two-column row fits; a second row does not. */
     header.fifo_bytes = 96;
     header.operator_range = 5;
-    /* One two-column row is 40 modeled bytes, two exceed the arena. */
+    /* One two-column row is 48 modeled bytes, two exceed the arena. */
     header.operator_bytes = 64;
     header.work_mem_bytes = 1;
     header.parallel_workers = 1;
@@ -411,7 +435,8 @@ void test_streaming_scan_sort_batches()
     args.mr_len = lengths;
     args.data_buffer = plan.data();
     args.buffer_len = plan.size();
-    assert(csd_sql(&args) == 4);
+    const uint32_t expected_rows = top_n == 0 ? 8 : top_n;
+    assert(csd_sql(&args) == expected_rows);
 
     const CsdSqlResultHeader *result =
         reinterpret_cast<const CsdSqlResultHeader *>(output.data());
@@ -419,22 +444,31 @@ void test_streaming_scan_sort_batches()
         output.data() + result->cells_offset);
     const CsdSqlExecutionStatus *execution =
         reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
-    assert(result->row_count == 4 && result->column_count == 2);
+    const unsigned char *payload = output.data() + result->bytes_offset;
+    const char *expected_text[] = {"one_____", "two_____", "three___", "four____",
+                                   "five____", "six_____", "seven___", "eight___"};
+    assert(result->row_count == expected_rows && result->column_count == 2);
     for (uint32_t row = 0; row < result->row_count; ++row) {
         assert(cells[row * 2].integer == static_cast<int64_t>(row + 1));
-        assert(cells[row * 2 + 1].integer ==
-               static_cast<int64_t>((row + 1) * 10));
+        assert(cells[row * 2 + 1].bytes_length == 8);
+        assert(memcmp(payload + cells[row * 2 + 1].bytes_offset,
+                      expected_text[row], 8) == 0);
     }
     assert(execution->status_code == CSD_SQL_STATUS_OK);
     assert(execution->validated_nodes == 2 && execution->executed_nodes == 2);
-    assert(execution->stream_input_batches == 4);
-    assert(execution->stream_input_rows == 4);
-    assert(execution->stream_input_peak_bytes == 40);
+    assert(execution->stream_input_batches == 8);
+    assert(execution->stream_input_rows == 8);
+    assert(execution->stream_input_peak_bytes == 48);
     assert(execution->operator_peak_bytes <= header.operator_bytes);
-    assert(execution->operator_allocations >= 4);
+    assert(execution->operator_allocations >= 8);
     assert(execution->operator_spill_count > 0);
     assert(execution->spill_write_bytes > 0);
     assert(execution->spill_read_bytes > 0);
+    assert(execution->spill_cursor_peak_bytes > 0);
+    assert(execution->spill_cursor_peak_bytes <= spill.size());
+    assert(execution->spill_writer_peak_bytes > 0);
+    assert(execution->spill_writer_peak_bytes <= spill.size());
+    assert(execution->sort_merge_rows == (top_n == 0 ? 24 : 17));
 }
 
 void test_heap_pipeline_memory_policy(bool use_fdm_arena)
@@ -1306,7 +1340,8 @@ void test_postgres_numeric_division_scale()
 int main()
 {
     test_chunked_nvm_scan();
-    test_streaming_scan_sort_batches();
+    test_streaming_scan_sort_batches(0);
+    test_streaming_scan_sort_batches(3);
     test_heap_pipeline_memory_policy(false);
     test_heap_pipeline_memory_policy(true);
     test_tpch_expression_and_multikey_pipeline();

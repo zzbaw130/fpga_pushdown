@@ -468,6 +468,456 @@
         return true;
     }
 
+    bool spill_cursor_read(uint32_t index, SpillRowCursor *cursor,
+                           uint64_t logical_offset, void *target,
+                           uint64_t length)
+    {
+        std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+        if (!read_spill_bytes(index, logical_offset, target, length))
+            return false;
+        uint64_t total = 0;
+        cursor->bytes_read = checked_add(cursor->bytes_read, length, &total) ?
+            total : std::numeric_limits<uint64_t>::max();
+        return true;
+    }
+
+    bool init_spill_cursor(uint32_t index, const SpillHandle &handle,
+                           SpillRowCursor *cursor)
+    {
+        cursor->handle = handle;
+        cursor->initialized = true;
+        {
+            std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+            if (handle.length < sizeof(SpillRecordHeader) ||
+                handle.offset > spill_offset_ ||
+                handle.length > spill_offset_ - handle.offset)
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x220);
+            if (!read_spill_bytes(index, handle.offset,
+                                  &cursor->record, sizeof(cursor->record)))
+                return false;
+            cursor->bytes_read = sizeof(cursor->record);
+        }
+        uint64_t expected_cells = 0, expected_length = sizeof(cursor->record);
+        if (cursor->record.magic != kSpillMagic ||
+            cursor->record.node_id != index ||
+            cursor->record.row_count != handle.row_count ||
+            cursor->record.column_count != handle.column_count ||
+            (cursor->record.row_count != 0 &&
+             cursor->record.column_count == 0) ||
+            !checked_mul(cursor->record.row_count,
+                         cursor->record.column_count, &expected_cells) ||
+            cursor->record.cell_count != expected_cells ||
+            !checked_mul(expected_cells, sizeof(CsdSqlResultCell),
+                         &cursor->cells_bytes) ||
+            !checked_add(expected_length, cursor->cells_bytes,
+                         &expected_length) ||
+            !checked_add(expected_length, cursor->record.bytes_length,
+                         &expected_length) ||
+            expected_length != handle.length ||
+            !checked_mul(cursor->record.column_count,
+                         sizeof(CsdSqlResultCell),
+                         &cursor->row_cells_bytes))
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x221);
+        const uint64_t stage_capacity = static_cast<uint64_t>(
+            args_->mr_len[header_->spill_range]);
+        if (cursor->record.row_count != 0 &&
+            (cursor->row_cells_bytes == 0 ||
+             cursor->row_cells_bytes > stage_capacity))
+            return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x322);
+        cursor->payload_start = handle.offset + sizeof(cursor->record) +
+                                cursor->cells_bytes;
+        const uint64_t quarter_stage = std::max<uint64_t>(
+            1, stage_capacity / 4);
+        cursor->chunk_capacity = std::min<uint64_t>(stage_capacity,
+            std::max<uint64_t>(cursor->row_cells_bytes, quarter_stage));
+        cursor->chunk.columns = cursor->record.column_count;
+        return true;
+    }
+
+    bool load_spill_cursor_descriptors(uint32_t index,
+                                       SpillRowCursor *cursor)
+    {
+        if (cursor->descriptor_position < cursor->descriptor_rows)
+            return true;
+        cursor->descriptors.clear();
+        cursor->descriptor_rows = 0;
+        cursor->descriptor_position = 0;
+        if (cursor->next_row >= cursor->record.row_count) return true;
+        const uint64_t remaining = cursor->record.row_count - cursor->next_row;
+        const uint64_t rows = std::min<uint64_t>(remaining,
+            std::max<uint64_t>(1,
+                cursor->chunk_capacity / cursor->row_cells_bytes));
+        uint64_t cell_count = 0, bytes = 0, row_offset = 0;
+        if (!checked_mul(rows, cursor->record.column_count, &cell_count) ||
+            cell_count > std::numeric_limits<size_t>::max() ||
+            !checked_mul(cell_count, sizeof(CsdSqlResultCell), &bytes) ||
+            !checked_mul(cursor->next_row, cursor->row_cells_bytes,
+                         &row_offset))
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x223);
+        cursor->descriptors.resize(static_cast<size_t>(cell_count));
+        if (!spill_cursor_read(index, cursor,
+                cursor->handle.offset + sizeof(SpillRecordHeader) + row_offset,
+                cursor->descriptors.data(), bytes))
+            return false;
+        for (size_t cell_index = 0;
+             cell_index < cursor->descriptors.size(); ++cell_index) {
+            const CsdSqlResultCell &cell = cursor->descriptors[cell_index];
+            uint64_t payload_end = 0;
+            if (!is_supported_type(cell.datum_type) ||
+                cell.bytes_offset != cursor->validated_payload_offset ||
+                !checked_add(cell.bytes_offset, cell.bytes_length,
+                             &payload_end) ||
+                payload_end > cursor->record.bytes_length)
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x224);
+            cursor->validated_payload_offset = payload_end;
+        }
+        cursor->descriptor_rows = rows;
+        return true;
+    }
+
+    bool load_spill_cursor_chunk(uint32_t index, SpillRowCursor *cursor)
+    {
+        if (!load_spill_cursor_descriptors(index, cursor)) return false;
+        if (cursor->next_row >= cursor->record.row_count) return true;
+        const uint64_t available = cursor->descriptor_rows -
+                                   cursor->descriptor_position;
+        const size_t first_cell = static_cast<size_t>(
+            cursor->descriptor_position * cursor->record.column_count);
+        const uint64_t payload_begin =
+            cursor->descriptors[first_cell].bytes_offset;
+        uint64_t chunk_rows = 0, payload_end = payload_begin;
+        while (chunk_rows < available) {
+            const size_t last_cell = static_cast<size_t>(
+                (cursor->descriptor_position + chunk_rows + 1) *
+                    cursor->record.column_count - 1);
+            uint64_t candidate_end = 0;
+            if (!checked_add(cursor->descriptors[last_cell].bytes_offset,
+                             cursor->descriptors[last_cell].bytes_length,
+                             &candidate_end))
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x225);
+            const uint64_t candidate_bytes = candidate_end - payload_begin;
+            if (chunk_rows != 0 && candidate_bytes > cursor->chunk_capacity)
+                break;
+            if (chunk_rows == 0 && candidate_bytes >
+                static_cast<uint64_t>(args_->mr_len[header_->spill_range]))
+                return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x326);
+            payload_end = candidate_end;
+            ++chunk_rows;
+        }
+        if (chunk_rows == 0)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x227);
+        const uint64_t payload_bytes = payload_end - payload_begin;
+        if (payload_bytes > std::numeric_limits<size_t>::max())
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x228);
+        std::vector<unsigned char> payload(
+            static_cast<size_t>(payload_bytes));
+        if (payload_bytes != 0 &&
+            !spill_cursor_read(index, cursor,
+                cursor->payload_start + payload_begin,
+                payload.data(), payload_bytes))
+            return false;
+
+        cursor->chunk.rows.clear();
+        cursor->chunk.rows.resize(static_cast<size_t>(chunk_rows));
+        for (size_t row = 0; row < cursor->chunk.rows.size(); ++row) {
+            cursor->chunk.rows[row].resize(cursor->record.column_count);
+            for (uint16_t column = 0;
+                 column < cursor->record.column_count; ++column) {
+                const CsdSqlResultCell &cell = cursor->descriptors[
+                    static_cast<size_t>((cursor->descriptor_position + row) *
+                        cursor->record.column_count + column)];
+                Value &value = cursor->chunk.rows[row][column];
+                value.is_null = (cell.flags & kResultNull) != 0;
+                value.type = cell.datum_type;
+                value.integer = cell.integer;
+                value.numeric_scale = cell.numeric_scale;
+                if (cell.bytes_length != 0) {
+                    const uint64_t within = cell.bytes_offset - payload_begin;
+                    if (within > payload_bytes ||
+                        cell.bytes_length > payload_bytes - within)
+                        return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x229);
+                    value.bytes.assign(reinterpret_cast<const char *>(
+                        payload.data() + within), cell.bytes_length);
+                }
+            }
+        }
+        uint64_t peak = cursor->descriptors.size() *
+                        sizeof(CsdSqlResultCell);
+        if (!checked_add(peak, payload_bytes, &peak) ||
+            !checked_add(peak, batch_bytes(cursor->chunk), &peak))
+            peak = std::numeric_limits<uint64_t>::max();
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            status_.spill_cursor_peak_bytes = std::max<uint64_t>(
+                status_.spill_cursor_peak_bytes, peak);
+        }
+        cursor->descriptor_position += chunk_rows;
+        cursor->next_row += chunk_rows;
+        cursor->chunk_position = 0;
+        if (cursor->descriptor_position == cursor->descriptor_rows) {
+            std::vector<CsdSqlResultCell>().swap(cursor->descriptors);
+            cursor->descriptor_rows = 0;
+            cursor->descriptor_position = 0;
+        }
+        if (cursor->next_row == cursor->record.row_count &&
+            cursor->validated_payload_offset != cursor->record.bytes_length)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x22a);
+        return true;
+    }
+
+    bool ensure_spill_cursor_row(uint32_t index, SpillRowCursor *cursor,
+                                 bool *has_row)
+    {
+        if (cursor->chunk_position < cursor->chunk.rows.size()) {
+            *has_row = true;
+            return true;
+        }
+        std::vector<Row>().swap(cursor->chunk.rows);
+        cursor->chunk_position = 0;
+        if (cursor->next_row >= cursor->record.row_count) {
+            *has_row = false;
+            return true;
+        }
+        if (!load_spill_cursor_chunk(index, cursor)) return false;
+        *has_row = !cursor->chunk.rows.empty();
+        if (!*has_row && cursor->next_row != cursor->record.row_count)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x23a);
+        return true;
+    }
+
+    const Row &spill_cursor_row(const SpillRowCursor &cursor) const
+    {
+        return cursor.chunk.rows[cursor.chunk_position];
+    }
+
+    void advance_spill_cursor(SpillRowCursor *cursor)
+    {
+        ++cursor->chunk_position;
+    }
+
+    void finish_spill_cursor(SpillRowCursor *cursor)
+    {
+        if (!cursor->initialized || cursor->accounted) return;
+        {
+            uint64_t total = 0;
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            if (checked_add(status_.spill_read_bytes, cursor->bytes_read,
+                            &total))
+                status_.spill_read_bytes = total;
+            else
+                status_.spill_read_bytes =
+                    std::numeric_limits<uint64_t>::max();
+        }
+        cursor->accounted = true;
+        std::vector<CsdSqlResultCell>().swap(cursor->descriptors);
+        std::vector<Row>().swap(cursor->chunk.rows);
+    }
+
+    bool write_spill_storage_unlocked(uint32_t index, uint64_t logical_offset,
+                                      const void *source, uint64_t length)
+    {
+        if (header_->spill_range == CSD_SQL_INVALID_RANGE ||
+            header_->spill_range >= static_cast<uint32_t>(args_->numr) ||
+            args_->mr_addr[header_->spill_range] == NULL ||
+            args_->mr_len[header_->spill_range] <= 0)
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x22b);
+        const unsigned char *bytes = static_cast<const unsigned char *>(source);
+        if (!(header_->flags & CSD_SQL_PLAN_FLASH_SPILL)) {
+            const uint64_t capacity = static_cast<uint64_t>(
+                args_->mr_len[header_->spill_range]);
+            if (logical_offset > capacity || length > capacity - logical_offset)
+                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x22c);
+            std::memcpy(static_cast<unsigned char *>(
+                args_->mr_addr[header_->spill_range]) + logical_offset,
+                bytes, length);
+            return true;
+        }
+        unsigned char *stage = static_cast<unsigned char *>(
+            args_->mr_addr[header_->spill_range]);
+        const uint64_t capacity = static_cast<uint64_t>(
+            args_->mr_len[header_->spill_range]);
+        uint64_t written = 0;
+        while (written < length) {
+            const uint64_t transfer = std::min<uint64_t>(
+                capacity, length - written);
+            std::memcpy(stage, bytes + written, transfer);
+            if (!write_flash_spill(index, logical_offset + written,
+                                   stage, transfer))
+                return false;
+            written += transfer;
+        }
+        return true;
+    }
+
+    bool init_spill_writer(uint32_t index, uint16_t columns,
+                           uint64_t row_count, uint64_t max_payload_bytes,
+                           SpillRowWriter *writer)
+    {
+        if (columns == 0 || row_count > std::numeric_limits<uint32_t>::max() ||
+            max_payload_bytes > std::numeric_limits<uint32_t>::max())
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x22d);
+        uint64_t cell_count = 0, reserved = sizeof(SpillRecordHeader);
+        if (!checked_mul(row_count, columns, &cell_count) ||
+            !checked_mul(cell_count, sizeof(CsdSqlResultCell),
+                         &writer->cells_bytes) ||
+            !checked_add(reserved, writer->cells_bytes, &reserved) ||
+            !checked_add(reserved, max_payload_bytes, &reserved))
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x22e);
+        if (header_->spill_range == CSD_SQL_INVALID_RANGE ||
+            header_->spill_range >= static_cast<uint32_t>(args_->numr) ||
+            args_->mr_addr[header_->spill_range] == NULL ||
+            args_->mr_len[header_->spill_range] <= 0)
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x22f);
+        const uint64_t storage_capacity =
+            (header_->flags & CSD_SQL_PLAN_FLASH_SPILL) ?
+                header_->spill_bytes : static_cast<uint64_t>(
+                    args_->mr_len[header_->spill_range]);
+        {
+            std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+            if (spill_offset_ > storage_capacity ||
+                reserved > storage_capacity - spill_offset_)
+                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x230);
+            writer->offset = spill_offset_;
+            spill_offset_ += reserved;
+            writer->run_id = spill_run_id_++;
+        }
+        writer->node_id = index;
+        writer->row_count = static_cast<uint32_t>(row_count);
+        writer->columns = columns;
+        writer->reserved_length = reserved;
+        writer->chunk_capacity = static_cast<uint64_t>(
+            args_->mr_len[header_->spill_range]);
+        writer->initialized = true;
+        return true;
+    }
+
+    bool flush_spill_writer(uint32_t index, SpillRowWriter *writer)
+    {
+        if (writer->cells.empty()) return true;
+        const uint64_t buffered_rows = writer->cells.size() / writer->columns;
+        const uint64_t first_row = writer->written_rows - buffered_rows;
+        const uint64_t buffered_payload_start = writer->payload_bytes -
+                                                writer->payload.size();
+        uint64_t descriptor_offset = 0, row_bytes = 0, payload_offset = 0;
+        if (!checked_mul(first_row, writer->columns, &descriptor_offset) ||
+            !checked_mul(descriptor_offset, sizeof(CsdSqlResultCell),
+                         &descriptor_offset) ||
+            !checked_add(writer->offset + sizeof(SpillRecordHeader),
+                         descriptor_offset, &descriptor_offset) ||
+            !checked_mul(writer->cells.size(), sizeof(CsdSqlResultCell),
+                         &row_bytes) ||
+            !checked_add(writer->offset + sizeof(SpillRecordHeader),
+                         writer->cells_bytes, &payload_offset) ||
+            !checked_add(payload_offset, buffered_payload_start,
+                         &payload_offset))
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x231);
+        std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+        if (!write_spill_storage_unlocked(index, descriptor_offset,
+                                          writer->cells.data(), row_bytes) ||
+            (!writer->payload.empty() &&
+             !write_spill_storage_unlocked(index, payload_offset,
+                                           writer->payload.data(),
+                                           writer->payload.size())))
+            return false;
+        writer->cells.clear();
+        writer->payload.clear();
+        return true;
+    }
+
+    bool append_spill_writer_row(uint32_t index, SpillRowWriter *writer,
+                                 const Row &row)
+    {
+        if (!writer->initialized || row.size() != writer->columns ||
+            writer->written_rows >= writer->row_count)
+            return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x232);
+        uint64_t row_payload = 0, row_cells_bytes = 0, row_bytes = 0;
+        if (!checked_mul(writer->columns, sizeof(CsdSqlResultCell),
+                         &row_cells_bytes))
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x233);
+        for (Row::const_iterator value = row.begin(); value != row.end(); ++value)
+            if (value->bytes.size() > std::numeric_limits<uint16_t>::max() ||
+                !checked_add(row_payload, value->bytes.size(), &row_payload))
+                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x234);
+        if (!checked_add(row_cells_bytes, row_payload, &row_bytes) ||
+            row_bytes > writer->chunk_capacity)
+            return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x335);
+        uint64_t buffered_bytes = 0;
+        if (!checked_mul(writer->cells.size(), sizeof(CsdSqlResultCell),
+                         &buffered_bytes) ||
+            !checked_add(buffered_bytes, writer->payload.size(),
+                         &buffered_bytes))
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x236);
+        if (!writer->cells.empty() &&
+            row_bytes > writer->chunk_capacity - buffered_bytes &&
+            !flush_spill_writer(index, writer))
+            return false;
+        uint64_t payload_offset = writer->payload_bytes;
+        for (Row::const_iterator value = row.begin(); value != row.end(); ++value) {
+            if (payload_offset > std::numeric_limits<uint32_t>::max())
+                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x237);
+            CsdSqlResultCell cell = {};
+            cell.integer = value->integer;
+            cell.bytes_offset = static_cast<uint32_t>(payload_offset);
+            cell.bytes_length = value->bytes.size();
+            cell.datum_type = value->type;
+            cell.flags = value->is_null ? kResultNull : 0;
+            cell.numeric_scale = value->numeric_scale;
+            writer->cells.push_back(cell);
+            writer->payload.insert(writer->payload.end(),
+                value->bytes.begin(), value->bytes.end());
+            payload_offset += value->bytes.size();
+        }
+        writer->payload_bytes = payload_offset;
+        ++writer->written_rows;
+        uint64_t peak = writer->cells.size() * sizeof(CsdSqlResultCell);
+        if (!checked_add(peak, writer->payload.size(), &peak))
+            peak = std::numeric_limits<uint64_t>::max();
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            status_.spill_writer_peak_bytes = std::max<uint64_t>(
+                status_.spill_writer_peak_bytes, peak);
+        }
+        return true;
+    }
+
+    bool finish_spill_writer(uint32_t index, SpillRowWriter *writer,
+                             SpillHandle *handle)
+    {
+        if (!writer->initialized || writer->written_rows != writer->row_count)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x23b);
+        if (!flush_spill_writer(index, writer))
+            return false;
+        SpillRecordHeader record = {};
+        record.magic = kSpillMagic;
+        record.node_id = writer->node_id;
+        record.run_id = writer->run_id;
+        record.row_count = writer->row_count;
+        record.column_count = writer->columns;
+        record.cell_count = static_cast<uint64_t>(writer->row_count) *
+                            writer->columns;
+        record.bytes_length = writer->payload_bytes;
+        uint64_t actual_length = sizeof(record);
+        if (!checked_add(actual_length, writer->cells_bytes, &actual_length) ||
+            !checked_add(actual_length, writer->payload_bytes, &actual_length))
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x238);
+        {
+            std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+            if (!write_spill_storage_unlocked(index, writer->offset,
+                                              &record, sizeof(record)))
+                return false;
+        }
+        handle->offset = writer->offset;
+        handle->length = actual_length;
+        handle->row_count = writer->row_count;
+        handle->column_count = writer->columns;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            status_.spill_write_bytes += actual_length;
+            ++status_.operator_spill_count;
+        }
+        return true;
+    }
+
     /* Decode a spill record in bounded row chunks. Cell descriptors and byte
      * payload retain the existing on-Flash layout; the consumer never sees a
      * partially decoded row. */

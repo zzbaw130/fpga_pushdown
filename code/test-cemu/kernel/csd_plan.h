@@ -388,6 +388,10 @@ struct CsdSqlExecutionStatus {
     uint64_t stream_input_batches;
     uint64_t stream_input_rows;
     uint64_t stream_input_peak_bytes;
+    /* Append-only diagnostics for cursor-based external Sort merge. */
+    uint64_t spill_cursor_peak_bytes;
+    uint64_t spill_writer_peak_bytes;
+    uint64_t sort_merge_rows;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

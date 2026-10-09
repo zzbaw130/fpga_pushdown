@@ -157,14 +157,17 @@ counts, cell descriptors, and byte payloads.
 range. For a direct Scan pipeline, rows are charged to the operator arena as
 they arrive; failure to grow the lease closes and sorts the current run before
 writing it. Once a run is written, the sort keeps only its offset/length
-handle. Merge-pass Flash transfers use the bounded FDM staging window, perform
-a stable merge, and write the next run. A final read reconstructs the operator
-output. Top-N sorts truncate every run and merge result to N rows, which bounds
-their Flash traffic without changing the global top-N result. Spill records
-and every read are range-checked before deserialization. The functional C++
-merge still reconstructs both input runs and its merged output on the host
-heap; replacing it with cursor-based streaming merge is required before the
-merge phase itself is a physical controller-memory bound.
+handle. Each merge pass opens two row cursors. A cursor reads descriptor and
+payload blocks on demand through the bounded FDM staging window; the stable
+comparison retains only the two current decoded chunks. A bounded row writer
+reserves the next record, buffers at most one staging-window-sized descriptor
+plus payload block, and writes descriptors and variable payload directly to
+their final Flash offsets. It never constructs a merged `Batch`. A final read
+reconstructs the operator output. Top-N sorts stop the cursor merge after N
+rows and reserve conservatively for the two input payloads, which bounds their
+actual Flash traffic without changing the global top-N result. Spill records
+and every read are range-checked before deserialization. Status exposes cursor
+and writer peak bytes plus total rows emitted by merge passes.
 
 An oversized equi-join uses power-of-two radix partitions. Both build and probe
 rows are serialized to Flash, only partition handles survive the write phase,
@@ -198,14 +201,15 @@ after merge. Global aggregates currently retain the protection-copy path.
 
 The implementation is still not a proof of a hard controller-memory bound.
 Direct Scan-to-Sort plans no longer accumulate a complete decoded Scan
-`Batch`, but Scan inputs feeding Join or Aggregate still do. Sort merge passes
-reconstruct run pairs on the C++ heap. Aggregate and Hash Join no longer copy
-partition rows: their selection writer serializes source ordinals directly
-through the bounded FDM staging range, and Join probe replay is chunked by that
-same limit. The aggregate threshold bounds its modeled state, but the table
-still uses ordinary C++ containers rather than an allocator carved from the
-FDM arena. Streaming Join/Aggregate consumers, cursor-based Sort merge and an
-arena allocator are needed for a physical bound.
+`Batch`, and Sort merge memory is bounded by two cursor chunks plus one writer
+chunk. The final Sort output is still reconstructed as a C++ `Batch`, and Scan
+inputs feeding Join or Aggregate still accumulate. Aggregate and Hash Join no
+longer copy partition rows: their selection writer serializes source ordinals
+directly through the bounded FDM staging range, and Join probe replay is
+chunked by that same limit. The aggregate threshold bounds its modeled state,
+but the table and cursor chunks still use ordinary C++ containers rather than
+allocators carved from the FDM arena. Streaming Join/Aggregate consumers and
+arena-backed containers are needed for a strict physical FDM-only bound.
 Serialized spill records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and

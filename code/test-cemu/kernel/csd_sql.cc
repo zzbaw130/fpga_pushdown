@@ -65,6 +65,51 @@ struct SpillHandle {
     uint16_t reserved16;
     SpillHandle() : offset(0), length(0), row_count(0), column_count(0), reserved16(0) {}
 };
+struct SpillRowCursor {
+    SpillHandle handle;
+    SpillRecordHeader record;
+    uint64_t cells_bytes;
+    uint64_t row_cells_bytes;
+    uint64_t payload_start;
+    uint64_t next_row;
+    uint64_t validated_payload_offset;
+    uint64_t bytes_read;
+    uint64_t chunk_capacity;
+    uint64_t descriptor_rows;
+    uint64_t descriptor_position;
+    size_t chunk_position;
+    std::vector<CsdSqlResultCell> descriptors;
+    Batch chunk;
+    bool initialized;
+    bool accounted;
+    SpillRowCursor()
+        : cells_bytes(0), row_cells_bytes(0), payload_start(0), next_row(0),
+          validated_payload_offset(0), bytes_read(0), chunk_capacity(0),
+          descriptor_rows(0), descriptor_position(0), chunk_position(0),
+          initialized(false), accounted(false)
+    {
+        std::memset(&record, 0, sizeof(record));
+    }
+};
+struct SpillRowWriter {
+    uint32_t node_id;
+    uint32_t run_id;
+    uint32_t row_count;
+    uint32_t written_rows;
+    uint16_t columns;
+    uint64_t offset;
+    uint64_t reserved_length;
+    uint64_t cells_bytes;
+    uint64_t payload_bytes;
+    uint64_t chunk_capacity;
+    std::vector<CsdSqlResultCell> cells;
+    std::vector<unsigned char> payload;
+    bool initialized;
+    SpillRowWriter()
+        : node_id(0), run_id(0), row_count(0), written_rows(0), columns(0),
+          offset(0), reserved_length(0), cells_bytes(0), payload_bytes(0),
+          chunk_capacity(0), initialized(false) {}
+};
 struct FifoBatchHeader {
     uint32_t magic;
     uint32_t generation;
