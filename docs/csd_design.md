@@ -69,10 +69,14 @@ alternating, fixed-capacity FDM tuple FIFOs; an oversized window is split into
 multiple FIFO batches. When the sole downstream blocking node is `SORT`, the
 FIFO hands each batch directly to the Sort consumer after any fused
 Filter/Project stages. Sort moves rows into its current arena-accounted run and
-flushes that run to Flash before accepting more rows when the arena is full;
-the complete decoded relation is therefore no longer materialized as a
-separate Scan `Batch` on this path. Other blocking consumers still receive an
-accumulated C++ `Batch`, so the full operator pipeline is not yet hard-bounded.
+flushes that run to Flash before accepting more rows when the arena is full.
+The same consumer protocol drives a non-DISTINCT global Aggregate, or a
+grouped Aggregate whose planner resource bound plus eightfold hash-state
+overhead fits the arena. Those plans update their banked hash state per FIFO
+batch and never materialize a separate complete Scan `Batch`. Join and
+uncertain, DISTINCT, or oversized grouped Aggregate inputs still use the
+accumulating compatibility path, so the full operator pipeline is not yet
+hard-bounded.
 The visibility contract is
 intentionally strict: only planner-proven frozen/all-visible pages may use
 this path.  External/TOASTed or compressed varlena values and unsupported
@@ -102,7 +106,7 @@ CEMU:
 | Operator | Functional model | Blocking / spill rule |
 | --- | --- | --- |
 | Filter, project | SIMD-like lanes executing bounded expression bytecode | Never blocks; output compacts valid lanes |
-| Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state | Oversized grouped state radix-partitions input rows by the complete group key and replays each partition |
+| Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state; eligible direct Scan chains update state per FIFO batch | Oversized or uncertain grouped state radix-partitions input rows by the complete group key and replays each partition |
 | Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE | An intrinsically oversized build side radix-partitions both inputs to Flash and replays one matching pair at a time |
 | Sort | multi-key bounded run generation followed by stable merge passes | A direct Scan pipeline grows one arena-accounted run row by row, flushes before exceeding the lease, retains only Flash handles, and reads pairs back for stable merge |
 
@@ -130,13 +134,14 @@ threads are FPGA hardware.
 `HASH_JOIN`, hash/group aggregate and external-style sort remain blocking operators:
 they use their own operator file and the shared Flash spill allocator is
 serialized. Scan input is now chunked and reusable and its decoded windows
-cross the FDM FIFOs. A sole-consumer `Scan -> [Filter/Project] -> Sort` chain
-now executes as a per-batch consumer pipeline: the Scan result slot remains
-empty and only the current FIFO batch plus Sort run is live. Other blocking
-consumers still accumulate the FIFO output before execution. The task layer is
-DAG-level concurrency; extending the same consumer protocol to Join and
-Aggregate, and double-buffering decode against consumption, remain separate
-steps rather than being conflated with thread-level parallelism.
+cross the FDM FIFOs. Sole-consumer `Scan -> [Filter/Project] -> Sort` and
+eligible `Scan -> [Filter/Project] -> Aggregate` chains execute as per-batch
+consumer pipelines: the Scan result slot remains empty and only the current
+FIFO batch plus bounded operator state is live. Other blocking consumers still
+accumulate FIFO output before execution. The task layer is DAG-level
+concurrency; streaming Join, direct-to-Flash streaming Aggregate partitions,
+and double-buffering decode against consumption remain separate steps rather
+than being conflated with thread-level parallelism.
 
 CEMU currently retains a shared-library mapping after its unload control
 command even when the CSD kernel itself has no TLS segment. Normal repeated
@@ -197,19 +202,29 @@ New groups and grouped `DISTINCT` entries are charged atomically during the
 initial build. If the modeled state crosses the arena threshold, the partial
 table is discarded immediately and the complete size is projected from build
 progress to choose the radix fan-out. Per-lane partial maps are freed directly
-after merge. Global aggregates currently retain the protection-copy path.
+after merge. For a direct sole-consumer Scan branch, non-DISTINCT global
+Aggregate always consumes FIFO batches directly because its state size is
+fixed. A non-DISTINCT grouped Aggregate uses the same path only when PostgreSQL
+places its conservative output-capacity estimate in `arg0` and eight times
+that value fits the operator arena. The extra factor covers hash buckets, key
+copies and accumulator state. A zero, overflowing, or oversized bound retains
+the existing complete-input/radix path; runtime arena accounting remains the
+final guard. Large global DISTINCT state retains the protection-copy path.
 
 The implementation is still not a proof of a hard controller-memory bound.
 Direct Scan-to-Sort plans no longer accumulate a complete decoded Scan
 `Batch`, and Sort merge memory is bounded by two cursor chunks plus one writer
-chunk. The final Sort output is still reconstructed as a C++ `Batch`, and Scan
-inputs feeding Join or Aggregate still accumulate. Aggregate and Hash Join no
+chunk. Eligible direct Scan-to-Aggregate plans likewise keep only the current
+FIFO batch and the modeled hash state. The final Sort/Aggregate output is still
+reconstructed as a C++ `Batch`, and Scan inputs feeding Join or ineligible
+Aggregate plans still accumulate. Aggregate and Hash Join no
 longer copy partition rows: their selection writer serializes source ordinals
 directly through the bounded FDM staging range, and Join probe replay is
 chunked by that same limit. The aggregate threshold bounds its modeled state,
 but the table and cursor chunks still use ordinary C++ containers rather than
-allocators carved from the FDM arena. Streaming Join/Aggregate consumers and
-arena-backed containers are needed for a strict physical FDM-only bound.
+allocators carved from the FDM arena. Streaming Join, streaming Aggregate
+partition writers, and arena-backed containers are needed for a strict
+physical FDM-only bound.
 Serialized spill records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and

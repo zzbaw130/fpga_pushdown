@@ -675,6 +675,10 @@ csd_wire_emit_aggregate(CsdWireBuilder *builder, List *metadata,
 	node.aux_input = CSD_SQL_INVALID_NODE;
 	node.estimated_rows = csd_wire_estimate(metadata, 5);
 	node.estimated_bytes = csd_wire_estimate(metadata, 6);
+	/* Aggregate uses arg0 as the planner's conservative output-capacity
+	 * estimate.  The CSD kernel applies additional state overhead before
+	 * selecting an in-arena streaming hash table. */
+	node.arg0 = csd_wire_estimate(metadata, 9);
 	node.arg1 = 1;
 	node.expression_offset = builder->bytes.len;
 	spec.group_count = list_length(shape.groups);

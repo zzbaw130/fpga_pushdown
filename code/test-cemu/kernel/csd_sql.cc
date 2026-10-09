@@ -636,14 +636,47 @@ private:
                                   CSD_SQL_INVALID_NODE;
             const bool stream_sort = next != CSD_SQL_INVALID_NODE &&
                                      nodes_[next].opcode == CSD_SQL_OP_SORT;
-            const bool succeeded = stream_sort ?
-                execute_scan_to_sort(index, node, pipeline, next, nodes_[next], output) :
-                execute_scan(index, node, output, &pipeline);
+            uint32_t aggregate_index = CSD_SQL_INVALID_NODE;
+            uint32_t aggregate_project = CSD_SQL_INVALID_NODE;
+            if (!stream_sort && next != CSD_SQL_INVALID_NODE &&
+                (nodes_[next].opcode == CSD_SQL_OP_HASH_AGG ||
+                 nodes_[next].opcode == CSD_SQL_OP_GROUP_AGG)) {
+                aggregate_index = next;
+            } else if (!stream_sort && next != CSD_SQL_INVALID_NODE &&
+                       nodes_[next].opcode == CSD_SQL_OP_PROJECT &&
+                       consumers[next] == 1 &&
+                       sole_consumer[next] != CSD_SQL_INVALID_NODE &&
+                       (nodes_[sole_consumer[next]].opcode ==
+                            CSD_SQL_OP_HASH_AGG ||
+                        nodes_[sole_consumer[next]].opcode ==
+                            CSD_SQL_OP_GROUP_AGG)) {
+                aggregate_project = next;
+                aggregate_index = sole_consumer[next];
+            }
+            const bool stream_aggregate =
+                aggregate_index != CSD_SQL_INVALID_NODE &&
+                can_stream_aggregate(nodes_[aggregate_index]);
+            bool succeeded = false;
+            if (stream_sort)
+                succeeded = execute_scan_to_sort(index, node, pipeline, next,
+                                                  nodes_[next], output);
+            else if (stream_aggregate)
+                succeeded = execute_scan_to_aggregate(index, node, pipeline,
+                    aggregate_index, nodes_[aggregate_index],
+                    aggregate_project == CSD_SQL_INVALID_NODE ? NULL :
+                        &nodes_[aggregate_project], output);
+            else
+                succeeded = execute_scan(index, node, output, &pipeline);
             if (succeeded) {
                 for (std::vector<uint32_t>::const_iterator stage = pipeline.begin();
                      stage != pipeline.end(); ++stage)
                     precomputed[*stage] = 1;
                 if (stream_sort) precomputed[next] = 1;
+                if (stream_aggregate) {
+                    if (aggregate_project != CSD_SQL_INVALID_NODE)
+                        precomputed[aggregate_project] = 1;
+                    precomputed[aggregate_index] = 1;
+                }
             }
             return succeeded;
         }

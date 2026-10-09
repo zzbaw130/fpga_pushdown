@@ -225,15 +225,20 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   sum/count 语义；collision partition 使用更高 hash bits 递归 partition。新 group 和
   DISTINCT item 在插入前原子计费，一旦过 arena threshold 就丢弃 partial table 并按
   已处理比例估计 fan-out。
+- Aggregate 流式快路径：直接 `Scan -> [Filter/Project] -> Aggregate` 的无 DISTINCT
+  global state 固定，始终逐 FIFO batch 更新；grouped state 仅当 PostgreSQL 通过
+  `arg0` 下发的保守输出容量再乘 8 仍可放入 arena 时启用。零/溢出/超限估计继续走
+  完整输入与 radix replay，runtime arena accounting 是最终保护。
 - 单行/单 group/极端 skew 无法落入 arena 时显式拒绝。并行 branch 暂占 arena 时，
   replay 等待 lease，而不是误报 OOM。
 
-必须诚实保留的当前边界：直接 Scan-to-Sort 已消除完整 Scan `Batch`，但 Join/Aggregate
-输入与最终 Sort 输出仍会累计；cursor chunk、hash state 仍是普通 STL container，而非
-真实 FDM arena allocator。虽然 scan window、FIFO、run generation、cursor merge、spill
-I/O 和 blocking lease 已有界，但在实现 Join/Aggregate streaming consumer 与
-arena-backed container 前，不能声称 SF=32 端到端物理内存已严格有界。global
-Aggregate 的大型 DISTINCT 仍保留 compatibility/protection-copy 路径。
+必须诚实保留的当前边界：直接 Scan-to-Sort 与符合准入条件的 Scan-to-Aggregate 已消除
+完整 Scan `Batch`，但 Join、超大/不确定/含 DISTINCT Aggregate 输入以及最终阻塞输出仍会
+累计；cursor chunk、hash state 仍是普通 STL container，而非真实 FDM arena allocator。
+虽然 scan window、FIFO、run generation、cursor merge、部分 Aggregate state、spill I/O
+和 blocking lease 已有界，但在实现 Join streaming consumer、Aggregate streaming
+partition writer 与 arena-backed container 前，不能声称 SF=32 端到端物理内存已严格
+有界。global Aggregate 的大型 DISTINCT 仍保留 compatibility/protection-copy 路径。
 
 ## 9. 时延模型和已测性能
 
@@ -291,6 +296,7 @@ wall-time 数字保留只为历史可追溯。
 | Q8 normal | 3.594 GiB arena；peak 572.320 MiB；0 spill |
 | Scan-to-Sort stream | 32 MiB FIFO；1 MiB arena；30,209 rows exact；peak 1,048,560 B；2,416,828 B spill write/read |
 | Cursor Sort merge | 1 MiB arena/staging；30,209 varlena rows exact；3 runs/2 merges；cursor peak 757,278 B；writer peak 1,048,566 B |
+| Scan-to-Aggregate stream | Q1 5,884,033 rows / 29 batches / 2,528 B query peak；Q6 119,810 rows / 29 batches / 134 B；均 0 spill |
 
 详细报告分别位于 `results/tpch_sf1_{sort,join,aggregate}_spill_replay_validation.md`、
 `results/tpch_sf1_fdm_arena_validation.md` 和 `results/tpch_sf1_fdm_fifo_validation.md`。
@@ -303,6 +309,9 @@ replay 的模型增量为 460.718 ms，两轮 guest executor 实测均值增量�
 cursor-based merge 验证位于 `results/tpch_sf1_cursor_merge_validation.md`；整数与
 varlena 两组低内存 Flash spill 均 exact，最终 kernel 的 forced-CSD Q1-Q22、planner
 22/22 与 AUTO 定向回归全部通过。
+Scan-to-Aggregate 流式驻留验证位于
+`results/tpch_sf1_streaming_aggregate_validation.md`；最终 v3 kernel 的 Q1/Q6 profile、
+forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归与 ASan/UBSan 均通过。
 
 ## 10. 回归命令与通过标准
 

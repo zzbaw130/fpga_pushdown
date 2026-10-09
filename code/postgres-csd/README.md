@@ -112,9 +112,13 @@ Hash Join build sides radix-partition both inputs, lease one restored build
 partition, and stream the matching probe record in staging-bounded chunks;
 probe ordinals preserve deterministic output order. Join and
 Aggregate partition classification store row ordinals; a two-pass writer emits
-each selection directly to Flash without a copied partition Batch. Scan inputs
-to Join/Aggregate and the final Sort output still accumulate in C++ `Batch`
-objects, while merge intermediates are cursor-bounded.
+each selection directly to Flash without a copied partition Batch. A direct
+non-DISTINCT global Aggregate consumes FIFO batches immediately. A grouped
+non-DISTINCT Aggregate does the same only when eight times PostgreSQL's
+resource-bound output estimate (carried in node `arg0`) fits the operator
+arena; unknown or larger states retain radix replay. Scan inputs to Join and
+ineligible Aggregate plans, plus final blocking outputs, still accumulate in
+C++ `Batch` objects, while Sort merge intermediates are cursor-bounded.
 Oversized grouped Aggregate state now
 radix-partitions input by the complete group key and replays each partition,
 including grouped DISTINCT and AVG; global Aggregate retains its protection
@@ -122,8 +126,8 @@ copy. Grouped state is accounted during construction and switches to radix
 spill as soon as it crosses the modeled arena threshold; per-lane partial state
 is released immediately after merge. Arena leases enforce the modeled CSD
 capacity, but end-to-end physical memory becomes hard-bounded only after
-Join/Aggregate consume Scan batches directly and real arena-backed container
-allocators replace the remaining C++ heap objects.
+Join and spill-bound Aggregate paths consume Scan batches directly and real
+arena-backed container allocators replace the remaining C++ heap objects.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

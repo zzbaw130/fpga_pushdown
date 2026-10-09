@@ -220,7 +220,7 @@ struct CsdSqlPlanNode {
     uint32_t output_schema_id;
     uint64_t estimated_rows;
     uint64_t estimated_bytes;
-    uint64_t arg0;
+    uint64_t arg0; /* LIMIT count; Aggregate conservative output bytes */
     uint64_t arg1;
     uint32_t reserved;
 } __attribute__((packed));

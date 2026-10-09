@@ -37,6 +37,418 @@
 		return scale <= 36 ? static_cast<int16_t>(scale) : -1;
 	}
 
+    struct StreamingAggregateGroup {
+        std::string key;
+        Row groups;
+        std::vector<int64_t> count;
+        std::vector<__int128> sum;
+        std::vector<int16_t> scale;
+        std::vector<Value> minimum;
+        std::vector<Value> maximum;
+        std::vector<bool> has_value;
+    };
+
+    struct StreamingAggregateState {
+        const CsdSqlAggregateSpec *spec;
+        const CsdSqlAggregateColumn *aggregates;
+        const CsdSqlPlanNode *project_node;
+        const CsdSqlExpressionSpec *project_spec;
+        std::vector<uint16_t> group_columns;
+        std::unordered_map<std::string, size_t> group_map;
+        std::vector<StreamingAggregateGroup> groups;
+        uint16_t input_columns;
+        uint64_t held_bytes;
+        uint64_t input_rows;
+        bool configured;
+        StreamingAggregateState()
+            : spec(NULL), aggregates(NULL), project_node(NULL),
+              project_spec(NULL), input_columns(0), held_bytes(0),
+              input_rows(0), configured(false) {}
+    };
+
+    /* A streaming aggregate cannot reconstruct already-consumed raw rows if
+     * its hash state unexpectedly outgrows the arena.  Select this path only
+     * for fixed-size global state or for a non-DISTINCT grouped state whose
+     * planner estimate has eightfold headroom.  Larger/uncertain grouped state
+     * retains the existing raw-row radix replay until direct streaming
+     * partition writers are installed. */
+    bool can_stream_aggregate(const CsdSqlPlanNode &node)
+    {
+        const CsdSqlAggregateSpec *spec = NULL;
+        if (!expression_as(node, sizeof(CsdSqlAggregateSpec), &spec) ||
+            (spec->group_count == 0 && spec->aggregate_count == 0))
+            return false;
+        uint64_t group_bytes = 0, aggregate_bytes = 0, descriptor_bytes = 0;
+        if (!checked_mul(spec->group_count, sizeof(uint16_t), &group_bytes) ||
+            !checked_mul(spec->aggregate_count,
+                         sizeof(CsdSqlAggregateColumn), &aggregate_bytes) ||
+            !checked_add(sizeof(CsdSqlAggregateSpec), group_bytes,
+                         &descriptor_bytes) ||
+            !checked_add(descriptor_bytes, aggregate_bytes,
+                         &descriptor_bytes) ||
+            node.expression_length < descriptor_bytes)
+            return false;
+        const unsigned char *group_begin =
+            reinterpret_cast<const unsigned char *>(spec + 1);
+        const CsdSqlAggregateColumn *aggregates =
+            reinterpret_cast<const CsdSqlAggregateColumn *>(
+                group_begin + group_bytes);
+        for (uint16_t aggregate = 0; aggregate < spec->aggregate_count;
+             ++aggregate)
+            if (aggregates[aggregate].flags & CSD_SQL_AGG_DISTINCT)
+                return false;
+        if (spec->group_count == 0) return true;
+        uint64_t protected_estimate = 0;
+        return node.arg0 != 0 &&
+               checked_mul(node.arg0, UINT64_C(8),
+                           &protected_estimate) &&
+               protected_estimate <= operator_memory_capacity_;
+    }
+
+    bool configure_streaming_aggregate(uint32_t index,
+                                       const CsdSqlPlanNode &node,
+                                       uint16_t input_columns,
+                                       const CsdSqlPlanNode *project_node,
+                                       StreamingAggregateState *state)
+    {
+        if (state->configured)
+            return state->input_columns == input_columns ? true :
+                fail(CSD_SQL_STATUS_BAD_NODE, index, 0x510);
+        const CsdSqlAggregateSpec *spec = NULL;
+        if (!expression_as(node, sizeof(CsdSqlAggregateSpec), &spec) ||
+            (spec->group_count == 0 && spec->aggregate_count == 0))
+            return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+        const CsdSqlExpressionSpec *project_spec = NULL;
+        const CsdSqlExpressionInstruction *project_instructions = NULL;
+        if (project_node != NULL &&
+            !expression_program(project_node->node_id,
+                                project_node->expression_offset,
+                                project_node->expression_length,
+                                &project_spec, &project_instructions))
+            return false;
+        (void) project_instructions;
+        const uint16_t aggregate_input_columns = project_spec == NULL ?
+            input_columns : project_spec->output_count;
+        uint64_t group_bytes = 0, aggregate_bytes = 0, descriptor_bytes = 0;
+        if (!checked_mul(spec->group_count, sizeof(uint16_t), &group_bytes) ||
+            !checked_mul(spec->aggregate_count,
+                         sizeof(CsdSqlAggregateColumn), &aggregate_bytes) ||
+            !checked_add(sizeof(CsdSqlAggregateSpec), group_bytes,
+                         &descriptor_bytes) ||
+            !checked_add(descriptor_bytes, aggregate_bytes,
+                         &descriptor_bytes) ||
+            node.expression_length < descriptor_bytes)
+            return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+        const unsigned char *group_begin =
+            reinterpret_cast<const unsigned char *>(spec + 1);
+        state->group_columns.resize(spec->group_count);
+        for (uint16_t group = 0; group < spec->group_count; ++group) {
+            state->group_columns[group] = read_u16(
+                group_begin + group * sizeof(uint16_t));
+            if (state->group_columns[group] >= aggregate_input_columns)
+                return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
+        }
+        const CsdSqlAggregateColumn *aggregates =
+            reinterpret_cast<const CsdSqlAggregateColumn *>(
+                group_begin + group_bytes);
+        for (uint16_t aggregate_index = 0;
+             aggregate_index < spec->aggregate_count; ++aggregate_index) {
+            const CsdSqlAggregateColumn &aggregate = aggregates[aggregate_index];
+            if ((aggregate.input_column != CSD_SQL_NO_COLUMN &&
+                 aggregate.input_column >= aggregate_input_columns) ||
+                !is_supported_type(aggregate.datum_type) ||
+                aggregate.operation < CSD_SQL_AGG_COUNT ||
+                aggregate.operation > CSD_SQL_AGG_AVG ||
+                aggregate.output_scale < -1 || aggregate.output_scale > 18 ||
+                (aggregate.flags & CSD_SQL_AGG_DISTINCT))
+                return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index, 0x511);
+        }
+        state->spec = spec;
+        state->aggregates = aggregates;
+        state->project_node = project_node;
+        state->project_spec = project_spec;
+        state->input_columns = input_columns;
+        state->configured = true;
+        return true;
+    }
+
+    void release_streaming_aggregate_memory(StreamingAggregateState *state)
+    {
+        if (state->held_bytes != 0) {
+            release_operator_memory(state->held_bytes);
+            state->held_bytes = 0;
+        }
+    }
+
+    bool consume_streaming_aggregate_batch(uint32_t index,
+                                           const CsdSqlPlanNode &node,
+                                           Batch &input,
+                                           const CsdSqlPlanNode *project_node,
+                                           StreamingAggregateState *state)
+    {
+        if (!configure_streaming_aggregate(index, node, input.columns,
+                                            project_node, state))
+            return false;
+        Row projected_row;
+        std::vector<EvalValue> expression_stack;
+        if (state->project_spec != NULL)
+            projected_row.reserve(state->project_spec->output_count);
+        for (std::vector<Row>::const_iterator source = input.rows.begin();
+             source != input.rows.end(); ++source) {
+            const Row *row = &*source;
+            if (state->project_spec != NULL) {
+                if (!evaluate_expression(state->project_node->node_id,
+                        state->project_node->expression_offset,
+                        state->project_node->expression_length, *source, NULL,
+                        &projected_row, &expression_stack))
+                    return false;
+                row = &projected_row;
+            }
+            const std::string key = state->spec->group_count == 0 ?
+                std::string("global") : group_key(*row,
+                    state->group_columns.data(), state->spec->group_count);
+            size_t state_index = 0;
+            std::unordered_map<std::string, size_t>::iterator found =
+                state->group_map.find(key);
+            if (found == state->group_map.end()) {
+                StreamingAggregateGroup group;
+                group.key = key;
+                for (uint16_t column = 0;
+                     column < state->spec->group_count; ++column)
+                    group.groups.push_back((*row)[state->group_columns[column]]);
+                uint64_t modeled_bytes = 0;
+                if (!checked_add(UINT64_C(64), group.key.size(),
+                                 &modeled_bytes))
+                    return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x512);
+                for (Row::const_iterator value = group.groups.begin();
+                     value != group.groups.end(); ++value)
+                    if (!checked_add(modeled_bytes,
+                            sizeof(CsdSqlResultCell) + value->bytes.size(),
+                            &modeled_bytes))
+                        return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index,
+                                    0x513);
+                uint64_t accumulators = 0;
+                if (!checked_mul(state->spec->aggregate_count, UINT64_C(64),
+                                 &accumulators) ||
+                    !checked_add(modeled_bytes, accumulators,
+                                 &modeled_bytes))
+                    return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x514);
+                if (modeled_bytes > operator_memory_capacity_ -
+                                    state->held_bytes ||
+                    !wait_acquire_operator_memory(modeled_bytes))
+                    return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x515);
+                state->held_bytes += modeled_bytes;
+                group.count.assign(state->spec->aggregate_count, 0);
+                group.sum.assign(state->spec->aggregate_count, 0);
+                group.scale.assign(state->spec->aggregate_count, -1);
+                group.minimum.assign(state->spec->aggregate_count, Value());
+                group.maximum.assign(state->spec->aggregate_count, Value());
+                group.has_value.assign(state->spec->aggregate_count, false);
+                state_index = state->groups.size();
+                state->group_map[key] = state_index;
+                state->groups.push_back(std::move(group));
+            } else {
+                state_index = found->second;
+            }
+            StreamingAggregateGroup &group = state->groups[state_index];
+            for (uint16_t aggregate_index = 0;
+                 aggregate_index < state->spec->aggregate_count;
+                 ++aggregate_index) {
+                const CsdSqlAggregateColumn &aggregate =
+                    state->aggregates[aggregate_index];
+                const Value *value = aggregate.input_column ==
+                    CSD_SQL_NO_COLUMN ? NULL :
+                    &(*row)[aggregate.input_column];
+                if (value != NULL && value->is_null) continue;
+                if (aggregate.operation == CSD_SQL_AGG_COUNT) {
+                    ++group.count[aggregate_index];
+                    group.has_value[aggregate_index] = true;
+                    continue;
+                }
+                if (value == NULL || value->type == CSD_SQL_TYPE_BYTES)
+                    return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x516);
+                ++group.count[aggregate_index];
+                if (aggregate.operation == CSD_SQL_AGG_SUM ||
+                    aggregate.operation == CSD_SQL_AGG_AVG) {
+                    const int16_t value_scale =
+                        value->type == CSD_SQL_TYPE_NUMERIC ?
+                        value->numeric_scale : 0;
+                    int16_t target_scale = aggregate.output_scale;
+                    if (target_scale < 0) {
+                        target_scale = std::max<int16_t>(
+                            group.scale[aggregate_index], value_scale);
+                        if (group.scale[aggregate_index] >= 0 &&
+                            target_scale > group.scale[aggregate_index] &&
+                            !multiply_power10(&group.sum[aggregate_index],
+                                target_scale - group.scale[aggregate_index]))
+                            return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
+                                        0x517);
+                    }
+                    __int128 scaled = 0;
+                    if (!scaled_integer(*value, target_scale, &scaled))
+                        return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index,
+                                    0x518);
+                    group.scale[aggregate_index] = target_scale;
+                    group.sum[aggregate_index] += scaled;
+                }
+                if (!group.has_value[aggregate_index] ||
+                    compare_value(*value,
+                                  group.minimum[aggregate_index]) < 0)
+                    group.minimum[aggregate_index] = *value;
+                if (!group.has_value[aggregate_index] ||
+                    compare_value(*value,
+                                  group.maximum[aggregate_index]) > 0)
+                    group.maximum[aggregate_index] = *value;
+                group.has_value[aggregate_index] = true;
+            }
+            ++state->input_rows;
+        }
+        return true;
+    }
+
+    bool finish_streaming_aggregate(uint32_t index,
+                                    const CsdSqlPlanNode &node,
+                                    StreamingAggregateState *state,
+                                    Batch *output)
+    {
+        if (!state->configured)
+            return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x519);
+        StreamingAggregateGroup empty_global;
+        if (state->groups.empty() && state->spec->group_count == 0) {
+            empty_global.count.assign(state->spec->aggregate_count, 0);
+            empty_global.sum.assign(state->spec->aggregate_count, 0);
+            empty_global.scale.assign(state->spec->aggregate_count, -1);
+            empty_global.minimum.assign(state->spec->aggregate_count, Value());
+            empty_global.maximum.assign(state->spec->aggregate_count, Value());
+            empty_global.has_value.assign(state->spec->aggregate_count, false);
+            state->groups.push_back(std::move(empty_global));
+        }
+        output->columns = state->spec->group_count +
+                          state->spec->aggregate_count;
+        for (std::vector<StreamingAggregateGroup>::const_iterator group =
+                 state->groups.begin(); group != state->groups.end(); ++group) {
+            Row result = group->groups;
+            for (uint16_t aggregate_index = 0;
+                 aggregate_index < state->spec->aggregate_count;
+                 ++aggregate_index) {
+                const CsdSqlAggregateColumn &aggregate =
+                    state->aggregates[aggregate_index];
+                Value value;
+                value.type = aggregate.operation == CSD_SQL_AGG_COUNT ?
+                    static_cast<uint8_t>(CSD_SQL_TYPE_INT64) :
+                    aggregate.datum_type;
+                value.numeric_scale = value.type == CSD_SQL_TYPE_NUMERIC ?
+                    (group->scale[aggregate_index] >= 0 ?
+                        group->scale[aggregate_index] :
+                        (aggregate.output_scale >= 0 ?
+                            aggregate.output_scale : 0)) : 0;
+                switch (aggregate.operation) {
+                case CSD_SQL_AGG_COUNT:
+                    value.is_null = false;
+                    value.integer = group->count[aggregate_index];
+                    break;
+                case CSD_SQL_AGG_SUM:
+                    if (!group->has_value[aggregate_index]) break;
+                    if (!fits_i64(group->sum[aggregate_index]))
+                        return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x51a);
+                    value.is_null = false;
+                    value.integer = static_cast<int64_t>(
+                        group->sum[aggregate_index]);
+                    break;
+                case CSD_SQL_AGG_AVG:
+                    if (!group->has_value[aggregate_index]) break;
+                    {
+                        const int16_t source_scale =
+                            group->scale[aggregate_index];
+                        int16_t result_scale = aggregate.output_scale >= 0 ?
+                            aggregate.output_scale : average_scale(
+                                group->sum[aggregate_index],
+                                group->count[aggregate_index], source_scale);
+                        if (result_scale < 0)
+                            return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
+                                        0x51b);
+                        __int128 quotient = 0;
+                        for (;;) {
+                            __int128 numerator = group->sum[aggregate_index];
+                            __int128 denominator =
+                                group->count[aggregate_index];
+                            bool scaled = true;
+                            if (result_scale >= source_scale)
+                                scaled = multiply_power10(&numerator,
+                                    result_scale - source_scale);
+                            else
+                                scaled = multiply_power10(&denominator,
+                                    source_scale - result_scale);
+                            if (scaled) {
+                                quotient = numerator / denominator;
+                                __int128 remainder = numerator % denominator;
+                                if (remainder < 0) remainder = -remainder;
+                                if (remainder * 2 >= denominator)
+                                    quotient += numerator < 0 ? -1 : 1;
+                                if (fits_i64(quotient)) break;
+                            }
+                            if (aggregate.output_scale >= 0 ||
+                                result_scale <= source_scale)
+                                return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
+                                            0x51c);
+                            --result_scale;
+                        }
+                        value.is_null = false;
+                        value.integer = static_cast<int64_t>(quotient);
+                        value.numeric_scale = result_scale;
+                    }
+                    break;
+                case CSD_SQL_AGG_MIN:
+                    value = group->minimum[aggregate_index];
+                    break;
+                case CSD_SQL_AGG_MAX:
+                    value = group->maximum[aggregate_index];
+                    break;
+                default:
+                    return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index, 0x51d);
+                }
+                result.push_back(std::move(value));
+            }
+            output->rows.push_back(std::move(result));
+        }
+        if (state->project_node != NULL)
+            add_cycles(state->input_rows, *state->project_node);
+        add_cycles(state->input_rows * 2 + output->rows.size(), node);
+        return true;
+    }
+
+    bool execute_scan_to_aggregate(uint32_t scan_index,
+                                   const CsdSqlPlanNode &scan_node,
+                                   const std::vector<uint32_t> &pipeline,
+                                   uint32_t aggregate_index,
+                                   const CsdSqlPlanNode &aggregate_node,
+                                   const CsdSqlPlanNode *project_node,
+                                   Batch *output)
+    {
+        StreamingAggregateState state;
+        Batch discarded;
+        std::function<bool(Batch &)> consumer = [&](Batch &batch) {
+            return consume_streaming_aggregate_batch(aggregate_index,
+                aggregate_node, batch, project_node, &state);
+        };
+        if (!execute_scan(scan_index, scan_node, &discarded, &pipeline,
+                          &consumer)) {
+            release_streaming_aggregate_memory(&state);
+            return false;
+        }
+        if (!state.configured &&
+            !configure_streaming_aggregate(aggregate_index, aggregate_node,
+                                            discarded.columns, project_node,
+                                            &state)) {
+            release_streaming_aggregate_memory(&state);
+            return false;
+        }
+        const bool succeeded = finish_streaming_aggregate(aggregate_index,
+            aggregate_node, &state, output);
+        release_streaming_aggregate_memory(&state);
+        return succeeded;
+    }
+
     /* Partition complete groups by their canonical key. Every row for one
      * group lands in exactly one record, so DISTINCT and AVG remain local to
      * a replay partition and partial-state combination is unnecessary. */

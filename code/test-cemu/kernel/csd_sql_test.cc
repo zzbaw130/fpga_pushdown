@@ -471,6 +471,168 @@ void test_streaming_scan_sort_batches(uint32_t top_n)
     assert(execution->sort_merge_rows == (top_n == 0 ? 24 : 17));
 }
 
+void test_streaming_scan_aggregate_batches()
+{
+    std::vector<unsigned char> page(CSD_SQL_PAGE_BYTES, 0);
+    put_u16(page.data() + 12, 24 + 5 * 4);
+    add_right_tuple(page.data(), 0, 128, 1, 10);
+    add_right_tuple(page.data(), 1, 192, 2, 5);
+    add_right_tuple(page.data(), 2, 256, 1, 20);
+    add_right_tuple(page.data(), 3, 320, 2, 15);
+    add_right_tuple(page.data(), 4, 384, 1, 30);
+
+    std::vector<unsigned char> plan(
+        sizeof(CsdSqlPlanHeader) + 3 * sizeof(CsdSqlPlanNode), 0);
+    CsdSqlPlanNode scan_node = make_node(0, CSD_SQL_OP_SCAN);
+    CsdSqlScanSpec scan = {};
+    scan.input_range = 0;
+    scan.page_count = 1;
+    scan.attr_count = 2;
+    scan.output_count = 2;
+    scan.flags = CSD_SQL_SCAN_FROZEN_PAGES;
+    scan_node.expression_offset = append(&plan, scan);
+    for (uint16_t attribute = 0; attribute < 2; ++attribute) {
+        CsdSqlColumnSpec column = {};
+        column.attnum = attribute + 1;
+        column.output_column = attribute;
+        column.attlen = 4;
+        column.alignment = 4;
+        column.datum_type = CSD_SQL_TYPE_INT32;
+        column.flags = CSD_SQL_COLUMN_OUTPUT;
+        append(&plan, column);
+    }
+    scan_node.expression_length = sizeof(scan) +
+        2 * sizeof(CsdSqlColumnSpec);
+
+    CsdSqlPlanNode project_node = make_node(1, CSD_SQL_OP_PROJECT);
+    project_node.left_input = 0;
+    CsdSqlExpressionSpec project = {};
+    project.output_count = 2;
+    project.instruction_count = 6;
+    project.max_stack = 2;
+    project_node.expression_offset = append(&plan, project);
+    append(&plan, expression(CSD_SQL_EXPR_PUSH_COLUMN,
+                             CSD_SQL_TYPE_INVALID, 0));
+    append(&plan, expression(CSD_SQL_EXPR_EMIT));
+    append(&plan, expression(CSD_SQL_EXPR_PUSH_COLUMN,
+                             CSD_SQL_TYPE_INVALID, 1));
+    append(&plan, expression(CSD_SQL_EXPR_PUSH_CONSTANT,
+                             CSD_SQL_TYPE_INT32, 0, 2));
+    CsdSqlExpressionInstruction multiply = expression(
+        CSD_SQL_EXPR_MULTIPLY, CSD_SQL_TYPE_INT64);
+    multiply.numeric_scale = 0;
+    append(&plan, multiply);
+    append(&plan, expression(CSD_SQL_EXPR_EMIT));
+    project_node.expression_length = sizeof(project) +
+        project.instruction_count * sizeof(CsdSqlExpressionInstruction);
+
+    CsdSqlPlanNode aggregate_node = make_node(2, CSD_SQL_OP_HASH_AGG);
+    aggregate_node.left_input = 1;
+    aggregate_node.flags = CSD_SQL_NODE_BLOCKING | CSD_SQL_NODE_SPILLABLE;
+    /* Eightfold protected estimate exactly fits the 2 KiB arena. */
+    aggregate_node.estimated_bytes = 64;
+    aggregate_node.arg0 = 256;
+    CsdSqlAggregateSpec aggregate = {};
+    aggregate.group_count = 1;
+    aggregate.aggregate_count = 5;
+    aggregate_node.expression_offset = append(&plan, aggregate);
+    const uint16_t group_column = 0;
+    append(&plan, group_column);
+    for (uint8_t operation = CSD_SQL_AGG_COUNT;
+         operation <= CSD_SQL_AGG_AVG; ++operation) {
+        CsdSqlAggregateColumn column = {};
+        column.input_column = 1;
+        column.operation = operation;
+        column.datum_type = CSD_SQL_TYPE_INT64;
+        append(&plan, column);
+    }
+    aggregate_node.expression_length = sizeof(aggregate) +
+        sizeof(group_column) +
+        aggregate.aggregate_count * sizeof(CsdSqlAggregateColumn);
+
+    CsdSqlPlanHeader header = {};
+    header.magic = CSD_SQL_PLAN_MAGIC;
+    header.version = CSD_SQL_PLAN_VERSION;
+    header.header_bytes = sizeof(header);
+    header.node_count = 3;
+    header.node_bytes = sizeof(CsdSqlPlanNode);
+    header.plan_bytes = plan.size();
+    header.root_node = 2;
+    header.flags = CSD_SQL_PLAN_STATUS_LAST_RANGE |
+                   CSD_SQL_PLAN_FROZEN_SNAPSHOT |
+                   CSD_SQL_PLAN_FDM_FIFO | CSD_SQL_PLAN_FDM_ARENA;
+    header.output_range = 3;
+    header.spill_range = 4;
+    header.fifo_range_a = 1;
+    header.fifo_range_b = 2;
+    /* Exactly one two-column row fits in each FIFO transfer. */
+    header.fifo_bytes = 96;
+    header.operator_range = 5;
+    header.operator_bytes = 2048;
+    header.work_mem_bytes = 1;
+    header.parallel_workers = 1;
+    header.plan_id = 0x41474752;
+    header.fdm_reserved_bytes = 2 * header.fifo_bytes + 4096 + 4096 +
+                                header.operator_bytes;
+    overwrite(&plan, 0, header);
+    overwrite(&plan, sizeof(header), scan_node);
+    overwrite(&plan, sizeof(header) + sizeof(scan_node), project_node);
+    overwrite(&plan, sizeof(header) + 2 * sizeof(scan_node), aggregate_node);
+
+    std::vector<unsigned char> fifo_a(header.fifo_bytes, 0);
+    std::vector<unsigned char> fifo_b(header.fifo_bytes, 0);
+    std::vector<unsigned char> output(4096, 0);
+    std::vector<unsigned char> spill(4096, 0);
+    std::vector<unsigned char> arena(header.operator_bytes, 0);
+    std::vector<unsigned char> status(sizeof(CsdSqlExecutionStatus), 0);
+    void *ranges[] = {page.data(), fifo_a.data(), fifo_b.data(), output.data(),
+                      spill.data(), arena.data(), status.data()};
+    long long lengths[] = {static_cast<long long>(page.size()),
+                           static_cast<long long>(fifo_a.size()),
+                           static_cast<long long>(fifo_b.size()),
+                           static_cast<long long>(output.size()),
+                           static_cast<long long>(spill.size()),
+                           static_cast<long long>(arena.size()),
+                           static_cast<long long>(status.size())};
+    cemu_args args = {};
+    args.numr = 7;
+    args.mr_addr = ranges;
+    args.mr_len = lengths;
+    args.data_buffer = plan.data();
+    args.buffer_len = plan.size();
+    assert(csd_sql(&args) == 2);
+
+    const CsdSqlResultHeader *result =
+        reinterpret_cast<const CsdSqlResultHeader *>(output.data());
+    const CsdSqlResultCell *cells = reinterpret_cast<const CsdSqlResultCell *>(
+        output.data() + result->cells_offset);
+    const CsdSqlExecutionStatus *execution =
+        reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
+    assert(result->row_count == 2 && result->column_count == 6);
+    assert(cells[0].integer == 1);
+    assert(cells[1].integer == 3);
+    assert(cells[2].integer == 120);
+    assert(cells[3].integer == 20);
+    assert(cells[4].integer == 60);
+    assert(cells[5].integer == 40);
+    assert(cells[6].integer == 2);
+    assert(cells[7].integer == 2);
+    assert(cells[8].integer == 40);
+    assert(cells[9].integer == 10);
+    assert(cells[10].integer == 30);
+    assert(cells[11].integer == 20);
+    assert(execution->status_code == CSD_SQL_STATUS_OK);
+    assert(execution->validated_nodes == 3 && execution->executed_nodes == 3);
+    assert(execution->stream_input_batches == 5);
+    assert(execution->stream_input_rows == 5);
+    assert(execution->stream_input_peak_bytes == 40);
+    assert(execution->operator_peak_bytes <= header.operator_bytes);
+    assert(execution->operator_allocations == 2);
+    assert(execution->operator_spill_count == 0);
+    assert(execution->spill_write_bytes == 0);
+    assert(execution->spill_read_bytes == 0);
+}
+
 void test_heap_pipeline_memory_policy(bool use_fdm_arena)
 {
     std::vector<unsigned char> left_page(CSD_SQL_PAGE_BYTES, 0);
@@ -1342,6 +1504,7 @@ int main()
     test_chunked_nvm_scan();
     test_streaming_scan_sort_batches(0);
     test_streaming_scan_sort_batches(3);
+    test_streaming_scan_aggregate_batches();
     test_heap_pipeline_memory_policy(false);
     test_heap_pipeline_memory_policy(true);
     test_tpch_expression_and_multikey_pipeline();
