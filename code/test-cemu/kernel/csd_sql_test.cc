@@ -678,7 +678,7 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
     nodes[2].flags = CSD_SQL_NODE_BLOCKING | CSD_SQL_NODE_SPILLABLE;
     CsdSqlJoinSpec join = {};
     join.key_count = 1;
-    join.join_kind = CSD_SQL_JOIN_INNER;
+    join.join_kind = fit_build ? CSD_SQL_JOIN_INNER : CSD_SQL_JOIN_LEFT;
     nodes[2].expression_offset = append(&plan, join);
     CsdSqlJoinKey key = {};
     key.left_key = 0;
@@ -737,7 +737,16 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
     args.mr_len = lengths;
     args.data_buffer = plan.data();
     args.buffer_len = plan.size();
-    assert(csd_sql(&args) == 2);
+    const int result_rows = csd_sql(&args);
+    if (result_rows != (fit_build ? 2 : 3)) {
+        const CsdSqlExecutionStatus *failed =
+            reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
+        std::fprintf(stderr,
+            "stream join failed: fit=%d result=%d status=%u node=%u\n",
+            fit_build ? 1 : 0, result_rows, failed->status_code,
+            failed->failed_node);
+    }
+    assert(result_rows == (fit_build ? 2 : 3));
 
     const CsdSqlResultHeader *result =
         reinterpret_cast<const CsdSqlResultHeader *>(output.data());
@@ -745,11 +754,22 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         output.data() + result->cells_offset);
     const CsdSqlExecutionStatus *execution =
         reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
-    assert(result->row_count == 2 && result->column_count == 4);
+    assert(result->row_count == (fit_build ? 2U : 3U) &&
+           result->column_count == 4);
     assert(cells[0].integer == 1 && cells[1].integer == 10);
     assert(cells[2].integer == 1 && cells[3].integer == 100);
-    assert(cells[4].integer == 3 && cells[5].integer == 30);
-    assert(cells[6].integer == 3 && cells[7].integer == 300);
+    if (fit_build) {
+        assert(cells[4].integer == 3 && cells[5].integer == 30);
+        assert(cells[6].integer == 3 && cells[7].integer == 300);
+    } else {
+        /* Two scan lanes emit physical items in 1,3,2 order. Partition replay
+         * must preserve that global FIFO order across three records. */
+        assert(cells[4].integer == 3 && cells[5].integer == 30);
+        assert(cells[6].integer == 3 && cells[7].integer == 300);
+        assert(cells[8].integer == 2 && cells[9].integer == 20);
+        assert((cells[10].flags & 1U) != 0 &&
+               (cells[11].flags & 1U) != 0);
+    }
     assert(execution->status_code == CSD_SQL_STATUS_OK);
     assert(execution->validated_nodes == 3 && execution->executed_nodes == 3);
     assert(execution->fifo_batches == 5);
@@ -761,20 +781,23 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         assert(execution->stream_join_batches == 3);
         assert(execution->stream_join_rows == 3);
         assert(execution->stream_join_build_bytes == 80);
+        assert(execution->stream_join_partitioned_calls == 0);
         assert(execution->operator_peak_bytes == 80);
         assert(execution->operator_allocations == 1);
         assert(execution->operator_spill_count == 0);
         assert(execution->spill_write_bytes == 0);
         assert(execution->spill_read_bytes == 0);
     } else {
-        /* The build relation cannot fit, so both scans materialize and the
-         * existing radix/Grace path owns spill and replay. */
-        assert(execution->stream_input_batches == 0);
-        assert(execution->stream_input_rows == 0);
-        assert(execution->stream_join_calls == 0);
-        assert(execution->stream_join_batches == 0);
-        assert(execution->stream_join_rows == 0);
-        assert(execution->stream_join_build_bytes == 0);
+        /* The build relation cannot fit. It is radix-partitioned once, while
+         * each probe FIFO batch goes directly to its Flash partition. */
+        assert(execution->stream_input_batches == 3);
+        assert(execution->stream_input_rows == 3);
+        assert(execution->stream_input_peak_bytes == 40);
+        assert(execution->stream_join_calls == 1);
+        assert(execution->stream_join_batches == 3);
+        assert(execution->stream_join_rows == 3);
+        assert(execution->stream_join_build_bytes == 80);
+        assert(execution->stream_join_partitioned_calls == 1);
         assert(execution->operator_peak_bytes <= header.operator_bytes);
         assert(execution->operator_spill_count > 0);
         assert(execution->spill_write_bytes > 0);

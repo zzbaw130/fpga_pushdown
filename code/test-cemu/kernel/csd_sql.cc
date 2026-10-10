@@ -677,14 +677,15 @@ private:
                 can_stream_aggregate(nodes_[aggregate_index]);
             const uint32_t join_index = streaming_join_target(index, pipeline,
                 consumers, sole_consumer);
-            /* Actual build bytes, rather than a planner estimate, are the
-             * admission guard. Oversized builds retain the complete-input
-             * radix/Grace path below. */
+            /* Actual build bytes, rather than a planner estimate, select a
+             * resident hash or a Flash-partitioned build. A spillable
+             * oversized build still consumes its probe Scan by FIFO batch. */
             const bool stream_join = join_index != CSD_SQL_INVALID_NODE &&
                 complete[nodes_[join_index].right_input] &&
-                batch_bytes(input_batch(nodes_[join_index].right_input,
-                                        results)) <=
-                    operator_memory_capacity_;
+                (batch_bytes(input_batch(nodes_[join_index].right_input,
+                                         results)) <=
+                     operator_memory_capacity_ ||
+                 (nodes_[join_index].flags & CSD_SQL_NODE_SPILLABLE));
             bool succeeded = false;
             if (stream_sort)
                 succeeded = execute_scan_to_sort(index, node, pipeline, next,

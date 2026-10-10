@@ -396,6 +396,8 @@ struct CsdSqlExecutionStatus {
     uint64_t stream_join_batches;
     uint64_t stream_join_rows;
     uint64_t stream_join_build_bytes;
+    /* Subset of stream_join_calls whose build required Flash partitions. */
+    uint64_t stream_join_partitioned_calls;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

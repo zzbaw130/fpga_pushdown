@@ -2,6 +2,11 @@
 
 Date: 2026-10-10
 
+This report records the resident-build milestone. The later
+`tpch_sf1_partition_probe_validation.md` milestone supersedes its
+complete-probe fallback for oversized builds by streaming probe FIFO batches
+directly to Flash partitions.
+
 ## Scope
 
 This milestone lets an eligible

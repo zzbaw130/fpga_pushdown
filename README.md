@@ -163,6 +163,9 @@ Scan/FIFO 直连 external Sort、cursor merge 与保守准入的流式 Aggregate
 右侧 build 驻留、左侧 Scan/FIFO 逐批 probe 的 one-sided streaming Join 及其低内存
 Grace/radix 回退记录在
 [Scan-to-Join 验证](results/tpch_sf1_streaming_join_validation.md)。
+当 build 超出 arena 时，probe Scan 逐 FIFO batch 直接写 Flash partition、用全局 ordinal
+保序 replay 的后续验证记录在
+[Join probe-to-Flash 验证](results/tpch_sf1_partition_probe_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD

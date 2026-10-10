@@ -177,10 +177,13 @@
     }
 
     /* Serialize either a complete Batch or a row-ordinal selection directly.
-     * Selection mode avoids constructing a copied partition Batch. */
+     * Selection mode avoids constructing a copied partition Batch. An ordinal
+     * base lets independently consumed FIFO batches share one global probe
+     * order during partition replay. */
     bool spill_batch_selection(uint32_t index, const Batch &batch,
                                const std::vector<size_t> *selection,
-                               bool append_ordinal, SpillHandle *handle)
+                               bool append_ordinal, uint64_t ordinal_base,
+                               SpillHandle *handle)
     {
         std::lock_guard<std::mutex> spill_guard(spill_mutex_);
         if (header_->spill_range == CSD_SQL_INVALID_RANGE ||
@@ -200,10 +203,13 @@
             return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
         for (size_t logical_row = 0; logical_row < row_count; ++logical_row) {
             const size_t source_row = selection == NULL ? logical_row : (*selection)[logical_row];
+            uint64_t ordinal = 0;
             if (source_row >= batch.rows.size() ||
                 batch.rows[source_row].size() != batch.columns ||
                 (append_ordinal &&
-                 source_row > static_cast<size_t>(std::numeric_limits<int64_t>::max())))
+                 (!checked_add(ordinal_base, source_row, &ordinal) ||
+                  ordinal > static_cast<uint64_t>(
+                      std::numeric_limits<int64_t>::max()))))
                 return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x208);
             for (Row::const_iterator value = batch.rows[source_row].begin();
                  value != batch.rows[source_row].end(); ++value)
@@ -253,8 +259,14 @@
                     payload_offset += value->bytes.size();
                 }
                 if (append_ordinal) {
+                    uint64_t ordinal_value = 0;
+                    if (!checked_add(ordinal_base, source_row,
+                                     &ordinal_value) ||
+                        ordinal_value > static_cast<uint64_t>(
+                            std::numeric_limits<int64_t>::max()))
+                        return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x208);
                     CsdSqlResultCell ordinal = {};
-                    ordinal.integer = static_cast<int64_t>(source_row);
+                    ordinal.integer = static_cast<int64_t>(ordinal_value);
                     ordinal.bytes_offset = payload_offset;
                     ordinal.datum_type = CSD_SQL_TYPE_INT64;
                     if (!append_spill_bytes(index, stage, capacity, record_offset,
@@ -308,8 +320,14 @@
                     }
                 }
                 if (append_ordinal) {
+                    uint64_t ordinal_value = 0;
+                    if (!checked_add(ordinal_base, source_row,
+                                     &ordinal_value) ||
+                        ordinal_value > static_cast<uint64_t>(
+                            std::numeric_limits<int64_t>::max()))
+                        return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x208);
                     CsdSqlResultCell ordinal = {};
-                    ordinal.integer = static_cast<int64_t>(source_row);
+                    ordinal.integer = static_cast<int64_t>(ordinal_value);
                     ordinal.bytes_offset = payload_offset;
                     ordinal.datum_type = CSD_SQL_TYPE_INT64;
                     cells[cell_index++] = ordinal;
@@ -334,15 +352,16 @@
     /* Flash allocation is serialized: all CSD lanes share one append cursor. */
     bool spill_batch(uint32_t index, const Batch &batch, SpillHandle *handle = NULL)
     {
-        return spill_batch_selection(index, batch, NULL, false, handle);
+        return spill_batch_selection(index, batch, NULL, false, 0, handle);
     }
 
     bool spill_selected_rows(uint32_t index, const Batch &batch,
                              const std::vector<size_t> &selection,
-                             bool append_ordinal, SpillHandle *handle)
+                             bool append_ordinal, SpillHandle *handle,
+                             uint64_t ordinal_base = 0)
     {
         return spill_batch_selection(index, batch, &selection,
-                                     append_ordinal, handle);
+                                     append_ordinal, ordinal_base, handle);
     }
 
     bool read_spill_batch(uint32_t index, const SpillHandle &handle, Batch *output)

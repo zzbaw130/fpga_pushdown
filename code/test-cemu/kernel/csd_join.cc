@@ -87,6 +87,65 @@
         return true;
     }
 
+    bool classify_join_build_partitions(
+        uint32_t index, const CsdSqlJoinSpec &spec,
+        const CsdSqlJoinKey *keys, const Batch &left, const Batch &right,
+        size_t *partition_count, bool *scalar_key,
+        std::vector<std::vector<size_t> > *partition_rows)
+    {
+        const uint64_t capacity = std::max<uint64_t>(
+            1, operator_memory_capacity_);
+        const uint64_t right_bytes = batch_bytes(right);
+        *scalar_key = join_uses_scalar_key(left, right, keys,
+                                           spec.key_count, false);
+        std::vector<uint64_t> right_row_bytes(right.rows.size());
+        for (size_t row_index = 0; row_index < right.rows.size();
+             ++row_index) {
+            if (!join_row_bytes(right.rows[row_index], right.columns,
+                                &right_row_bytes[row_index]) ||
+                right_row_bytes[row_index] > capacity)
+                return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x406);
+        }
+        const size_t max_partitions = size_t(1) << 16;
+        *partition_count = 2;
+        const uint64_t required_partitions = right_bytes == 0 ? 1 :
+            1 + (right_bytes - 1) / capacity;
+        while (*partition_count < required_partitions &&
+               *partition_count < max_partitions)
+            *partition_count <<= 1;
+        if (*partition_count < required_partitions)
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x402);
+
+        for (;;) {
+            partition_rows->assign(*partition_count,
+                                   std::vector<size_t>());
+            std::vector<uint64_t> partition_bytes(*partition_count, 0);
+            for (size_t row_index = 0; row_index < right.rows.size();
+                 ++row_index) {
+                size_t partition = 0;
+                if (!join_partition_index(right.rows[row_index], keys,
+                                          spec.key_count, false, *scalar_key,
+                                          *partition_count, &partition))
+                    continue;
+                (*partition_rows)[partition].push_back(row_index);
+                if (!checked_add(partition_bytes[partition],
+                                 right_row_bytes[row_index],
+                                 &partition_bytes[partition]))
+                    return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x406);
+            }
+            uint64_t largest_partition = 0;
+            for (size_t partition = 0; partition < *partition_count;
+                 ++partition)
+                largest_partition = std::max<uint64_t>(
+                    largest_partition, partition_bytes[partition]);
+            if (largest_partition <= capacity) break;
+            if (*partition_count == max_partitions)
+                return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x403);
+            *partition_count <<= 1;
+        }
+        return true;
+    }
+
     bool join_residual_matches(uint32_t index, const CsdSqlJoinSpec &spec, const Row &joined,
                                bool *matches, std::vector<EvalValue> *expression_stack)
     {
@@ -374,6 +433,247 @@
         return true;
     }
 
+    struct OrderedJoinRow {
+        uint64_t ordinal;
+        Row row;
+    };
+
+    struct StreamingPartitionedJoinState {
+        const CsdSqlJoinSpec *spec;
+        const CsdSqlJoinKey *keys;
+        const Batch *right;
+        size_t partition_count;
+        bool scalar_key;
+        uint64_t input_rows;
+        std::vector<SpillHandle> right_handles;
+        std::vector<std::vector<SpillHandle> > left_handles;
+        std::vector<OrderedJoinRow> ordered;
+        bool configured;
+        StreamingPartitionedJoinState()
+            : spec(NULL), keys(NULL), right(NULL), partition_count(0),
+              scalar_key(false), input_rows(0), configured(false) {}
+    };
+
+    /* The complete build supplies exact fan-out/skew information. Probe rows
+     * arrive later as bounded FIFO batches and become independent Flash
+     * records carrying global ordinals. */
+    bool configure_streaming_partitioned_join(
+        uint32_t index, const CsdSqlPlanNode &node, const Batch &left,
+        const Batch &right, Batch *output,
+        StreamingPartitionedJoinState *state)
+    {
+        if (state->configured) {
+            const bool only_left =
+                state->spec->join_kind == CSD_SQL_JOIN_SEMI ||
+                state->spec->join_kind == CSD_SQL_JOIN_ANTI;
+            const uint16_t expected_columns =
+                left.columns + (only_left ? 0 : right.columns);
+            if (state->right == &right &&
+                output->columns == expected_columns)
+                return true;
+            return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x414);
+        }
+        const CsdSqlJoinSpec *spec = NULL;
+        uint64_t key_bytes = 0;
+        if (!expression_as(node, sizeof(CsdSqlJoinSpec), &spec) ||
+            !checked_mul(spec->key_count, sizeof(CsdSqlJoinKey),
+                         &key_bytes) ||
+            node.expression_length < sizeof(CsdSqlJoinSpec) + key_bytes ||
+            spec->join_kind < CSD_SQL_JOIN_INNER ||
+            spec->join_kind > CSD_SQL_JOIN_ANTI ||
+            spec->key_count == 0 ||
+            (spec->residual_length != 0 &&
+             !blob_range(spec->residual_offset, spec->residual_length)))
+            return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index, 0x415);
+        const CsdSqlJoinKey *keys =
+            reinterpret_cast<const CsdSqlJoinKey *>(spec + 1);
+        for (uint16_t key = 0; key < spec->key_count; ++key)
+            if (keys[key].left_key >= left.columns ||
+                keys[key].right_key >= right.columns)
+                return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index, 0x416);
+
+        const uint64_t right_bytes = batch_bytes(right);
+        std::vector<std::vector<size_t> > right_partition_rows;
+        size_t partition_count = 0;
+        if (!classify_join_build_partitions(index, *spec, keys, left, right,
+                                             &partition_count,
+                                             &state->scalar_key,
+                                             &right_partition_rows))
+            return false;
+
+        state->right_handles.resize(partition_count);
+        state->left_handles.resize(partition_count);
+        for (size_t partition = 0; partition < partition_count;
+             ++partition) {
+            if (!spill_selected_rows(index, right,
+                                     right_partition_rows[partition], false,
+                                     &state->right_handles[partition]))
+                return false;
+            std::vector<size_t>().swap(right_partition_rows[partition]);
+        }
+        state->spec = spec;
+        state->keys = keys;
+        state->right = &right;
+        state->partition_count = partition_count;
+        const bool only_left = spec->join_kind == CSD_SQL_JOIN_SEMI ||
+                               spec->join_kind == CSD_SQL_JOIN_ANTI;
+        output->columns = left.columns + (only_left ? 0 : right.columns);
+        state->configured = true;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_join_calls;
+            ++status_.stream_join_partitioned_calls;
+            status_.stream_join_build_bytes += right_bytes;
+        }
+        return true;
+    }
+
+    bool consume_streaming_partitioned_join_batch(
+        uint32_t index, const CsdSqlPlanNode &node, Batch &left,
+        const Batch &right, Batch *output,
+        StreamingPartitionedJoinState *state)
+    {
+        if (!configure_streaming_partitioned_join(index, node, left, right,
+                                                  output, state))
+            return false;
+        uint64_t end_ordinal = 0;
+        if (!checked_add(state->input_rows, left.rows.size(), &end_ordinal) ||
+            end_ordinal > static_cast<uint64_t>(
+                std::numeric_limits<int64_t>::max()))
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x41b);
+        std::vector<std::vector<size_t> > partition_rows(
+            state->partition_count);
+        for (size_t row_index = 0; row_index < left.rows.size();
+             ++row_index) {
+            size_t partition = 0;
+            if (join_partition_index(left.rows[row_index], state->keys,
+                                     state->spec->key_count, true,
+                                     state->scalar_key,
+                                     state->partition_count, &partition)) {
+                partition_rows[partition].push_back(row_index);
+                continue;
+            }
+            if (state->spec->join_kind != CSD_SQL_JOIN_LEFT &&
+                state->spec->join_kind != CSD_SQL_JOIN_ANTI)
+                continue;
+            OrderedJoinRow unmatched;
+            unmatched.ordinal = state->input_rows + row_index;
+            unmatched.row = left.rows[row_index];
+            if (state->spec->join_kind == CSD_SQL_JOIN_LEFT)
+                unmatched.row.resize(left.columns + right.columns);
+            state->ordered.push_back(std::move(unmatched));
+        }
+        for (size_t partition = 0; partition < state->partition_count;
+             ++partition) {
+            if (partition_rows[partition].empty()) continue;
+            SpillHandle handle;
+            if (!spill_selected_rows(index, left,
+                                     partition_rows[partition], true,
+                                     &handle, state->input_rows))
+                return false;
+            state->left_handles[partition].push_back(handle);
+        }
+        state->input_rows = end_ordinal;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_join_batches;
+            status_.stream_join_rows += left.rows.size();
+        }
+        return true;
+    }
+
+    bool finish_streaming_partitioned_join(
+        uint32_t index, const CsdSqlPlanNode &node,
+        StreamingPartitionedJoinState *state, Batch *output)
+    {
+        for (size_t partition = 0; partition < state->partition_count;
+             ++partition) {
+            Batch partition_right;
+            if (!read_spill_batch(index, state->right_handles[partition],
+                                  &partition_right))
+                return false;
+            OperatorMemoryLease partition_memory(this,
+                batch_bytes(partition_right), true);
+            if (!partition_memory.acquired())
+                return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x41c);
+            for (std::vector<SpillHandle>::const_iterator handle =
+                     state->left_handles[partition].begin();
+                 handle != state->left_handles[partition].end(); ++handle) {
+                if (!stream_spill_batch(index, *handle,
+                        [&](const Batch &partition_left) {
+                            Batch partition_output;
+                            if (!execute_join_core(index, *state->spec,
+                                    state->keys, partition_left,
+                                    partition_right, &partition_output,
+                                    false, true))
+                                return false;
+                            for (std::vector<Row>::iterator row =
+                                     partition_output.rows.begin();
+                                 row != partition_output.rows.end(); ++row) {
+                                if (row->empty() || row->back().is_null ||
+                                    row->back().type != CSD_SQL_TYPE_INT64 ||
+                                    row->back().integer < 0 ||
+                                    static_cast<uint64_t>(
+                                        row->back().integer) >=
+                                        state->input_rows)
+                                    return fail(CSD_SQL_STATUS_BAD_ABI, index,
+                                                0x41d);
+                                OrderedJoinRow restored;
+                                restored.ordinal = static_cast<uint64_t>(
+                                    row->back().integer);
+                                row->pop_back();
+                                restored.row = std::move(*row);
+                                state->ordered.push_back(std::move(restored));
+                            }
+                            return true;
+                        }))
+                    return false;
+            }
+        }
+        std::stable_sort(state->ordered.begin(), state->ordered.end(),
+            [](const OrderedJoinRow &first, const OrderedJoinRow &second) {
+                return first.ordinal < second.ordinal;
+            });
+        output->rows.reserve(state->ordered.size());
+        for (std::vector<OrderedJoinRow>::iterator row =
+                 state->ordered.begin(); row != state->ordered.end(); ++row)
+            output->rows.push_back(std::move(row->row));
+
+        uint64_t input_rows = 0, partition_work = 0, modeled_work = 0;
+        if (!checked_add(state->input_rows, state->right->rows.size(),
+                         &input_rows) ||
+            !checked_mul(input_rows, 3, &partition_work) ||
+            !checked_add(partition_work, output->rows.size(), &modeled_work))
+            modeled_work = std::numeric_limits<uint64_t>::max();
+        add_cycles(modeled_work, node);
+        if (node.opcode == CSD_SQL_OP_MERGE_JOIN)
+            add_canonicalized_node();
+        return true;
+    }
+
+    bool execute_scan_to_partitioned_join(
+        uint32_t scan_index, const CsdSqlPlanNode &scan_node,
+        const std::vector<uint32_t> &pipeline, uint32_t join_index,
+        const CsdSqlPlanNode &join_node, const Batch &right, Batch *output)
+    {
+        StreamingPartitionedJoinState state;
+        Batch discarded;
+        std::function<bool(Batch &)> consumer = [&](Batch &batch) {
+            return consume_streaming_partitioned_join_batch(
+                join_index, join_node, batch, right, output, &state);
+        };
+        if (!execute_scan(scan_index, scan_node, &discarded, &pipeline,
+                          &consumer))
+            return false;
+        if (!state.configured &&
+            !configure_streaming_partitioned_join(join_index, join_node,
+                                                   discarded, right, output,
+                                                   &state))
+            return false;
+        return finish_streaming_partitioned_join(join_index, join_node,
+                                                  &state, output);
+    }
+
     bool execute_scan_to_join(uint32_t scan_index,
                               const CsdSqlPlanNode &scan_node,
                               const std::vector<uint32_t> &pipeline,
@@ -382,6 +682,10 @@
                               const Batch &right,
                               Batch *output)
     {
+        if (batch_bytes(right) > operator_memory_capacity_)
+            return execute_scan_to_partitioned_join(
+                scan_index, scan_node, pipeline, join_index, join_node,
+                right, output);
         StreamingJoinState state;
         Batch discarded;
         std::function<bool(Batch &)> consumer = [&](Batch &batch) {
@@ -417,54 +721,15 @@
                                   const CsdSqlJoinKey *keys, const Batch &left,
                                   const Batch &right, Batch *output)
     {
-        const uint64_t capacity = std::max<uint64_t>(1, operator_memory_capacity_);
-        const uint64_t right_bytes = batch_bytes(right);
-        const bool scalar_key = join_uses_scalar_key(left, right, keys,
-                                                      spec.key_count, false);
-        std::vector<uint64_t> right_row_bytes(right.rows.size());
-        for (size_t row_index = 0; row_index < right.rows.size(); ++row_index) {
-            if (!join_row_bytes(right.rows[row_index], right.columns,
-                                &right_row_bytes[row_index]) ||
-                right_row_bytes[row_index] > capacity)
-                return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x406);
-        }
-        const size_t max_partitions = size_t(1) << 16;
-        size_t partition_count = 2;
-        const uint64_t required_partitions = right_bytes == 0 ? 1 :
-            1 + (right_bytes - 1) / capacity;
-        while (partition_count < required_partitions &&
-               partition_count < max_partitions)
-            partition_count <<= 1;
-        if (partition_count < required_partitions)
-            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x402);
-
         /* Classify with row ordinals and serialized byte counters. This keeps
          * adaptive radix sizing independent of full Row copies. */
         std::vector<std::vector<size_t> > right_partition_rows;
-        for (;;) {
-            right_partition_rows.assign(partition_count, std::vector<size_t>());
-            std::vector<uint64_t> partition_bytes(partition_count, 0);
-            for (size_t row_index = 0; row_index < right.rows.size(); ++row_index) {
-                size_t partition = 0;
-                if (!join_partition_index(right.rows[row_index], keys,
-                                          spec.key_count, false, scalar_key,
-                                          partition_count, &partition))
-                    continue;
-                right_partition_rows[partition].push_back(row_index);
-                if (!checked_add(partition_bytes[partition],
-                                 right_row_bytes[row_index],
-                                 &partition_bytes[partition]))
-                    return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x406);
-            }
-            uint64_t largest_partition = 0;
-            for (size_t partition = 0; partition < partition_count; ++partition)
-                largest_partition = std::max<uint64_t>(largest_partition,
-                                                       partition_bytes[partition]);
-            if (largest_partition <= capacity) break;
-            if (partition_count == max_partitions)
-                return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x403);
-            partition_count <<= 1;
-        }
+        size_t partition_count = 0;
+        bool scalar_key = false;
+        if (!classify_join_build_partitions(index, spec, keys, left, right,
+                                             &partition_count, &scalar_key,
+                                             &right_partition_rows))
+            return false;
 
         struct JoinPartitionHandles {
             SpillHandle left;
@@ -481,13 +746,8 @@
             std::vector<size_t>().swap(right_partition_rows[partition]);
         }
         std::vector<std::vector<size_t> >().swap(right_partition_rows);
-        std::vector<uint64_t>().swap(right_row_bytes);
 
         std::vector<std::vector<size_t> > left_partition_rows(partition_count);
-        struct OrderedJoinRow {
-            uint64_t ordinal;
-            Row row;
-        };
         std::vector<OrderedJoinRow> ordered;
         for (size_t row_index = 0; row_index < left.rows.size(); ++row_index) {
             size_t partition = 0;

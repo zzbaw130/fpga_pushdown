@@ -224,8 +224,9 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   restore 一个 build partition 并申请 arena lease；probe record 按 staging capacity
   解码为 row-complete chunks。hidden probe ordinal 恢复原顺序。若 sole left
   `Scan -> [Filter/Project]` probe 链的 right/build 已完成且实际 batch bytes 可驻留，
-  则 build hash 只构造并 lease 一次，left FIFO batch 直接逐批 probe；build 超限仍走
-  完整输入 radix/Grace 路径。
+  则 build hash 只构造并 lease 一次，left FIFO batch 直接逐批 probe。build 超限时
+  完整 build 负责精确 fan-out/skew 分类并写 Flash，但 left 不再累计：每个 FIFO batch
+  直接 selection-to-Flash，追加跨 batch 全局 ordinal 后逐 partition replay 并恢复顺序。
 - Grouped Aggregate：每个 group 永远落入一个 partition，保留 DISTINCT 与 AVG
   sum/count 语义；collision partition 使用更高 hash bits 递归 partition。新 group 和
   DISTINCT item 在插入前原子计费，一旦过 arena threshold 就丢弃 partial table 并按
@@ -239,13 +240,15 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
 
 必须诚实保留的当前边界：直接 Scan-to-Sort、符合准入条件的 Scan-to-Aggregate，以及
 build 可驻留的 Join 左/probe 链已消除对应完整 Scan `Batch`。但 Join build 与最终输出、
-build 超限时的两侧输入、超大/不确定/含 DISTINCT Aggregate 输入以及最终阻塞输出仍会
-累计；cursor chunk、hash state 仍是普通 STL container，而非真实 FDM arena allocator。
+build 超限时的完整 build、超大/不确定/含 DISTINCT Aggregate 输入以及最终阻塞输出仍会
+累计；超限 build 的 probe 已按 FIFO batch 直接写 partition。cursor chunk、hash state
+仍是普通 STL container，而非真实 FDM arena allocator；每个非空 batch selection 的
+小型 Flash handle 元数据也会随 record 数量增长。
 虽然 scan window、FIFO、run generation、cursor merge、部分 Aggregate/Join state、spill
-I/O 和 blocking lease 已有界，但在实现双侧 Join streaming partition writer、Aggregate
-streaming partition writer、bounded output consumer 与 arena-backed container 前，不能
-声称 SF=32 端到端物理内存已严格有界。global Aggregate 的大型 DISTINCT 仍保留
-compatibility/protection-copy 路径。
+I/O 和 blocking lease 已有界，但在实现 Join streaming/adaptive build writer、Aggregate
+streaming partition writer、bounded handle/output/reorder consumer 与 arena-backed
+container 前，不能声称 SF=32 端到端物理内存已严格有界。global Aggregate 的大型
+DISTINCT 仍保留 compatibility/protection-copy 路径。
 
 ## 9. 时延模型和已测性能
 
@@ -304,7 +307,8 @@ wall-time 数字保留只为历史可追溯。
 | Scan-to-Sort stream | 32 MiB FIFO；1 MiB arena；30,209 rows exact；peak 1,048,560 B；2,416,828 B spill write/read |
 | Cursor Sort merge | 1 MiB arena/staging；30,209 varlena rows exact；3 runs/2 merges；cursor peak 757,278 B；writer peak 1,048,566 B |
 | Scan-to-Aggregate stream | Q1 5,884,033 rows / 29 batches / 2,528 B query peak；Q6 119,810 rows / 29 batches / 134 B；均 0 spill |
-| Scan-to-Join stream | unit: 80 B build 在 128 B arena 下 3 probe batches、0 spill；64 B arena 自动回退 radix/Grace；Q3 29,949 probe rows/58,973,200 B build；Q5 两个 stream Join、10,001 probe rows；均 0 spill |
+| Scan-to-Join stream | unit: 80 B build 在 128 B arena 下 3 probe batches、0 spill；Q3 29,949 probe rows/58,973,200 B build；Q5 两个 stream Join、10,001 probe rows；均 0 spill |
+| Join probe-to-Flash | Q3 32 MiB arena；1 个 partitioned Join；30 probe batches / 3,231,383 rows；peak 29,494,560 B；60,171,304 B spill write/read；结果 exact |
 
 详细报告分别位于 `results/tpch_sf1_{sort,join,aggregate}_spill_replay_validation.md`、
 `results/tpch_sf1_fdm_arena_validation.md` 和 `results/tpch_sf1_fdm_fifo_validation.md`。
@@ -325,6 +329,11 @@ one-sided Scan-to-Join 验证位于
 build 超限回退、forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归与 ASan/UBSan
 均通过，原始证据归档 SHA-256 为
 `a8b22c61121bce30ee7a07c88e84ef73ef9469b36aac75dbeedc81e077e02619`。
+oversized-build Join 的 probe-to-Flash 验证位于
+`results/tpch_sf1_partition_probe_validation.md`；最终 v2 kernel 在 Q3 32 MiB arena 下
+逐批分区并 exact，默认容量 forced-CSD 22/22、planner 22/22、AUTO 定向回归与
+ASan/UBSan 均通过，原始证据归档 SHA-256 为
+`460c833204a395dc15ff2a965d2d017331f3559f7b0222472eaeb04759739485`。
 
 ## 10. 回归命令与通过标准
 

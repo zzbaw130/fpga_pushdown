@@ -77,9 +77,11 @@ batch and never materialize a separate complete Scan `Batch`. An eligible
 left/probe Scan chain feeding a Hash Join also consumes FIFO batches directly
 after the scheduler completes a resident right/build subtree. The build is
 leased once and its hash table is reused across all probe batches. A build that
-does not fit, the build side itself, and uncertain, DISTINCT, or oversized
-grouped Aggregate inputs still use the accumulating compatibility path, so the
-full operator pipeline is not yet hard-bounded.
+does not fit is classified and partitioned from its complete `Batch`, but the
+left Scan still writes each FIFO batch directly to Flash partitions with a
+global ordinal rather than accumulating. The build side itself and uncertain,
+DISTINCT, or oversized grouped Aggregate inputs still use the accumulating
+compatibility path, so the full operator pipeline is not yet hard-bounded.
 The visibility contract is
 intentionally strict: only planner-proven frozen/all-visible pages may use
 this path.  External/TOASTed or compressed varlena values and unsupported
@@ -110,7 +112,7 @@ CEMU:
 | --- | --- | --- |
 | Filter, project | SIMD-like lanes executing bounded expression bytecode | Never blocks; output compacts valid lanes |
 | Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state; eligible direct Scan chains update state per FIFO batch | Oversized or uncertain grouped state radix-partitions input rows by the complete group key and replays each partition |
-| Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE; an eligible left Scan chain probes one resident build hash per FIFO batch | An intrinsically oversized build side retains the complete-input path, radix-partitions both inputs to Flash, and replays one matching pair at a time |
+| Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE; an eligible left Scan chain probes one resident build hash per FIFO batch | An oversized complete build selects exact radix fan-out; each probe FIFO batch writes directly to Flash partitions, then matching pairs replay one at a time |
 | Sort | multi-key bounded run generation followed by stable merge passes | A direct Scan pipeline grows one arena-accounted run row by row, flushes before exceeding the lease, retains only Flash handles, and reads pairs back for stable merge |
 
 The choices follow the streaming filter/project and hash GQE direction in the
@@ -142,12 +144,12 @@ eligible `Scan -> [Filter/Project] -> Aggregate` chains execute as per-batch
 consumer pipelines: the Scan result slot remains empty and only the current
 FIFO batch plus bounded operator state is live. For an eligible Join, the
 scheduler resolves the right/build subtree first, then the left Scan pipeline
-probes that one resident hash table batch by batch. Other blocking consumers
-still accumulate FIFO output before execution. The task layer remains
-DAG-level concurrency; dual-side streaming partition writers, direct-to-Flash
-streaming Aggregate partitions, and double-buffering decode against
-consumption remain separate steps rather than being conflated with thread-level
-parallelism.
+either probes that one resident hash table or writes directly to radix
+partitions batch by batch. Other blocking consumers still accumulate FIFO
+output before execution. The task layer remains DAG-level concurrency; a
+streaming/adaptive build partition writer, direct-to-Flash streaming Aggregate
+partitions, and double-buffering decode against consumption remain separate
+steps rather than being conflated with thread-level parallelism.
 
 CEMU currently retains a shared-library mapping after its unload control
 command even when the CSD kernel itself has no TLS segment. Normal repeated
@@ -205,9 +207,13 @@ one-sided streaming path. It leases the exact build batch bytes once, creates
 one scalar or canonical multi-key hash table, and feeds every decoded left FIFO
 batch through the common probe/residual/join-kind logic. The lease is released
 only after the last probe batch. If the actual build bytes exceed the arena,
-the left Scan is allowed to materialize and the complete-input radix/Grace path
-above remains authoritative. This decision uses runtime bytes rather than a
-planner estimate.
+the complete build selects a power-of-two fan-out and is written to Flash, but
+the left Scan still does not materialize. Each probe FIFO batch classifies row
+ordinals, writes nonempty selections as separate partition records, and
+advances a global ordinal base. Replay consumes every record belonging to one
+build partition before advancing; hidden ordinals restore Scan/FIFO order and
+LEFT/ANTI NULL-key rows enter the same reorder stream. This decision uses
+runtime bytes rather than a planner estimate.
 
 Grouped Aggregate uses the same handle/replay infrastructure. All rows for a
 group are assigned to one radix partition, so `DISTINCT` sets and AVG's
@@ -233,16 +239,20 @@ Direct Scan-to-Sort plans no longer accumulate a complete decoded Scan
 chunk. Eligible direct Scan-to-Aggregate plans likewise keep only the current
 FIFO batch and the modeled hash state. Eligible Join probe chains keep the
 current FIFO batch plus one resident build, but the build subtree and Join
-output still materialize. Oversized-build Join and ineligible Aggregate inputs
-still accumulate before their radix writers run. The final Sort/Aggregate
-output is also reconstructed as a C++ `Batch`. Aggregate and Hash Join no
+output still materialize. With an oversized build, the probe Scan is also
+batch-bounded and writes directly to Flash, but the complete build remains
+live for exact fan-out/skew classification and its per-record handle metadata
+grows with nonempty batch selections. Ineligible Aggregate inputs still
+accumulate before their radix writers run. The final Sort/Aggregate output is
+also reconstructed as a C++ `Batch`. Aggregate and Hash Join no
 longer copy partition rows: their selection writer serializes source ordinals
 directly through the bounded FDM staging range, and Join probe replay is
 chunked by that same limit. The aggregate threshold bounds its modeled state,
 but the table and cursor chunks still use ordinary C++ containers rather than
-allocators carved from the FDM arena. Dual-side streaming Join partition
-writers, streaming Aggregate partition writers, bounded output consumers and
-arena-backed containers are needed for a strict physical FDM-only bound.
+allocators carved from the FDM arena. A streaming/adaptive Join build writer,
+bounded partition-handle management, streaming Aggregate partition writers,
+bounded output/reorder consumers and arena-backed containers are needed for a
+strict physical FDM-only bound.
 Serialized spill records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and
