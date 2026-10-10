@@ -501,7 +501,9 @@
             for (uint64_t slot = 0; slot < count; ++slot) {
                 const CsdSqlResultCell &cell = cells[slot];
                 uint64_t payload_end = 0;
-                if (!is_supported_type(cell.datum_type) ||
+                if ((!is_supported_type(cell.datum_type) &&
+                     !((cell.flags & kResultNull) != 0 &&
+                       cell.datum_type == CSD_SQL_TYPE_INVALID)) ||
                     cell.bytes_offset != expected_payload_offset ||
                     !checked_add(cell.bytes_offset, cell.bytes_length, &payload_end) ||
                     payload_end > record.bytes_length)
@@ -675,7 +677,9 @@
              cell_index < cursor->descriptors.size(); ++cell_index) {
             const CsdSqlResultCell &cell = cursor->descriptors[cell_index];
             uint64_t payload_end = 0;
-            if (!is_supported_type(cell.datum_type) ||
+            if ((!is_supported_type(cell.datum_type) &&
+                 !((cell.flags & kResultNull) != 0 &&
+                   cell.datum_type == CSD_SQL_TYPE_INVALID)) ||
                 cell.bytes_offset != cursor->validated_payload_offset ||
                 !checked_add(cell.bytes_offset, cell.bytes_length,
                              &payload_end) ||
@@ -1037,7 +1041,7 @@
     bool stream_spill_batch(uint32_t index, const SpillHandle &handle,
                             Consumer consumer)
     {
-        std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+        std::unique_lock<std::mutex> spill_guard(spill_mutex_);
         if (handle.length < sizeof(SpillRecordHeader) ||
             handle.offset > spill_offset_ ||
             handle.length > spill_offset_ - handle.offset)
@@ -1086,7 +1090,10 @@
                 return false;
             for (size_t cell_index = 0; cell_index < cells.size(); ++cell_index) {
                 uint64_t payload_end = 0;
-                if (!is_supported_type(cells[cell_index].datum_type) ||
+                if ((!is_supported_type(cells[cell_index].datum_type) &&
+                     !((cells[cell_index].flags & kResultNull) != 0 &&
+                       cells[cell_index].datum_type ==
+                           CSD_SQL_TYPE_INVALID)) ||
                     cells[cell_index].bytes_offset != expected_payload_offset ||
                     !checked_add(cells[cell_index].bytes_offset,
                                  cells[cell_index].bytes_length, &payload_end) ||
@@ -1156,7 +1163,13 @@
                     }
                 }
                 std::vector<unsigned char>().swap(payload);
-                if (!consumer(chunk)) return false;
+                /* The decoded chunk no longer references the shared FDM
+                 * staging window. Let a downstream consumer append another
+                 * spill record without recursively taking spill_mutex_. */
+                spill_guard.unlock();
+                const bool consumed = consumer(chunk);
+                spill_guard.lock();
+                if (!consumed) return false;
                 block_row = end_row;
             }
             first_row += block_rows;

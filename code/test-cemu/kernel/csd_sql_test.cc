@@ -746,9 +746,9 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         const CsdSqlExecutionStatus *failed =
             reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
         std::fprintf(stderr,
-            "stream join failed: fit=%d result=%d status=%u node=%u\n",
+            "stream join failed: fit=%d result=%d status=%u node=%u detail=%u\n",
             fit_build ? 1 : 0, result_rows, failed->status_code,
-            failed->failed_node);
+            failed->failed_node, failed->reserved32);
     }
     assert(result_rows == (fit_build ? 2 : 3));
 
@@ -793,6 +793,10 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         assert(execution->stream_join_chain_records == 0);
         assert(execution->stream_join_chain_record_reads == 0);
         assert(execution->stream_join_chain_peak_bytes == 0);
+        assert(execution->stream_join_ordinal_runs == 0);
+        assert(execution->stream_join_ordinal_merge_records == 0);
+        assert(execution->stream_join_ordinal_merge_rows == 0);
+        assert(execution->stream_join_ordinal_peak_bytes == 0);
         assert(execution->operator_peak_bytes == 80);
         assert(execution->operator_allocations == 1);
         assert(execution->operator_spill_count == 0);
@@ -819,8 +823,12 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         assert(execution->stream_join_chain_record_reads == 7);
         /* Eight build and eight probe partition heads, 16 bytes each. */
         assert(execution->stream_join_chain_peak_bytes == 256);
+        assert(execution->stream_join_ordinal_runs == 3);
+        assert(execution->stream_join_ordinal_merge_records == 2);
+        assert(execution->stream_join_ordinal_merge_rows == 5);
+        assert(execution->stream_join_ordinal_peak_bytes > 0);
         assert(execution->operator_peak_bytes <= header.operator_bytes);
-        assert(execution->operator_spill_count == 7);
+        assert(execution->operator_spill_count == 12);
         assert(execution->spill_write_bytes > 0);
         assert(execution->spill_read_bytes > 0);
     }

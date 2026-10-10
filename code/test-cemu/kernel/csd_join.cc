@@ -662,10 +662,205 @@
         return true;
     }
 
-    struct OrderedJoinRow {
-        uint64_t ordinal;
-        Row row;
+    struct JoinOrdinalRunState {
+        CsdSqlSortSpec sort_spec;
+        CsdSqlSortKey sort_key;
+        std::vector<SpillHandle> levels;
+        std::vector<uint8_t> occupied;
+        uint16_t visible_columns;
+        uint64_t rows;
+        uint64_t merge_rows;
+        bool configured;
+        JoinOrdinalRunState()
+            : visible_columns(0), rows(0), merge_rows(0), configured(false)
+        {
+            std::memset(&sort_spec, 0, sizeof(sort_spec));
+            std::memset(&sort_key, 0, sizeof(sort_key));
+            sort_spec.key_count = 1;
+        }
     };
+
+    void note_join_ordinal_memory(const JoinOrdinalRunState &state)
+    {
+        uint64_t handles = 0, occupied = 0, bytes = 0;
+        if (!checked_mul(state.levels.size(), sizeof(SpillHandle), &handles) ||
+            !checked_mul(state.occupied.size(), sizeof(uint8_t), &occupied) ||
+            !checked_add(handles, occupied, &bytes))
+            bytes = std::numeric_limits<uint64_t>::max();
+        std::lock_guard<std::mutex> status_guard(status_mutex_);
+        status_.stream_join_ordinal_peak_bytes = std::max<uint64_t>(
+            status_.stream_join_ordinal_peak_bytes, bytes);
+    }
+
+    bool configure_join_ordinal_runs(uint32_t index, uint16_t visible_columns,
+                                     JoinOrdinalRunState *state)
+    {
+        if (state->configured)
+            return state->visible_columns == visible_columns ? true :
+                fail(CSD_SQL_STATUS_BAD_NODE, index, 0x430);
+        if (visible_columns == std::numeric_limits<uint16_t>::max())
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x431);
+        state->visible_columns = visible_columns;
+        state->sort_key.key_column = visible_columns;
+        state->configured = true;
+        return true;
+    }
+
+    bool merge_join_ordinal_handles(uint32_t index,
+                                    JoinOrdinalRunState *state,
+                                    const SpillHandle &older,
+                                    const SpillHandle &newer,
+                                    SpillHandle *merged)
+    {
+        uint64_t rows = 0;
+        if (!checked_add(older.row_count, newer.row_count, &rows) ||
+            !merge_spill_runs(index, state->visible_columns + 1,
+                              &state->sort_spec, &state->sort_key,
+                              older, newer, merged))
+            return false;
+        if (!checked_add(state->merge_rows, rows, &state->merge_rows))
+            state->merge_rows = std::numeric_limits<uint64_t>::max();
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_join_ordinal_merge_records;
+            uint64_t total = 0;
+            if (checked_add(status_.stream_join_ordinal_merge_rows, rows,
+                            &total))
+                status_.stream_join_ordinal_merge_rows = total;
+            else
+                status_.stream_join_ordinal_merge_rows =
+                    std::numeric_limits<uint64_t>::max();
+        }
+        return true;
+    }
+
+    bool append_join_ordinal_run(uint32_t index, Batch *tagged,
+                                 JoinOrdinalRunState *state)
+    {
+        if (tagged->rows.empty()) return true;
+        if (!state->configured ||
+            tagged->columns != state->visible_columns + 1)
+            return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x432);
+        int64_t previous_ordinal = -1;
+        for (std::vector<Row>::const_iterator row = tagged->rows.begin();
+             row != tagged->rows.end(); ++row)
+            if (row->size() != tagged->columns || row->back().is_null ||
+                row->back().type != CSD_SQL_TYPE_INT64 ||
+                row->back().integer < 0 ||
+                row->back().integer < previous_ordinal)
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x433);
+            else
+                previous_ordinal = row->back().integer;
+
+        SpillHandle carry;
+        const uint64_t rows = tagged->rows.size();
+        if (!spill_batch(index, *tagged, &carry)) return false;
+        if (!checked_add(state->rows, rows, &state->rows))
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x434);
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_join_ordinal_runs;
+        }
+        size_t level = 0;
+        while (true) {
+            if (level == state->levels.size()) {
+                state->levels.resize(level + 1);
+                state->occupied.resize(level + 1, 0);
+                note_join_ordinal_memory(*state);
+            }
+            if (!state->occupied[level]) {
+                state->levels[level] = carry;
+                state->occupied[level] = 1;
+                return true;
+            }
+            SpillHandle merged;
+            if (!merge_join_ordinal_handles(index, state,
+                    state->levels[level], carry, &merged))
+                return false;
+            state->occupied[level] = 0;
+            carry = merged;
+            ++level;
+        }
+    }
+
+    bool buffer_join_ordinal_row(uint32_t index, Row *row, Batch *pending,
+                                 uint64_t *pending_bytes,
+                                 JoinOrdinalRunState *state)
+    {
+        uint64_t row_bytes = 0;
+        if (!join_row_bytes(*row, pending->columns, &row_bytes) ||
+            header_->spill_range == CSD_SQL_INVALID_RANGE ||
+            header_->spill_range >= static_cast<uint32_t>(args_->numr) ||
+            args_->mr_len[header_->spill_range] <= 0)
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x438);
+        const uint64_t capacity = static_cast<uint64_t>(
+            args_->mr_len[header_->spill_range]);
+        if (row_bytes > capacity)
+            return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x439);
+        if (!pending->rows.empty() && row_bytes > capacity - *pending_bytes) {
+            if (!append_join_ordinal_run(index, pending, state)) return false;
+            std::vector<Row>().swap(pending->rows);
+            *pending_bytes = 0;
+        }
+        pending->rows.push_back(std::move(*row));
+        *pending_bytes += row_bytes;
+        return true;
+    }
+
+    bool flush_join_ordinal_rows(uint32_t index, Batch *pending,
+                                 uint64_t *pending_bytes,
+                                 JoinOrdinalRunState *state)
+    {
+        if (!append_join_ordinal_run(index, pending, state)) return false;
+        std::vector<Row>().swap(pending->rows);
+        *pending_bytes = 0;
+        return true;
+    }
+
+    bool finish_join_ordinal_runs(uint32_t index,
+                                  JoinOrdinalRunState *state,
+                                  Batch *output)
+    {
+        output->columns = state->visible_columns;
+        SpillHandle final_handle;
+        bool have_final = false;
+        for (size_t level = state->levels.size(); level > 0; --level) {
+            const size_t slot = level - 1;
+            if (!state->occupied[slot]) continue;
+            if (!have_final) {
+                final_handle = state->levels[slot];
+                have_final = true;
+                continue;
+            }
+            SpillHandle merged;
+            if (!merge_join_ordinal_handles(index, state, final_handle,
+                                             state->levels[slot], &merged))
+                return false;
+            final_handle = merged;
+        }
+        if (!have_final) return true;
+        output->rows.reserve(final_handle.row_count);
+        if (!stream_spill_batch(index, final_handle,
+                [&](Batch &chunk) {
+                    if (chunk.columns != state->visible_columns + 1)
+                        return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x435);
+                    for (std::vector<Row>::iterator row =
+                             chunk.rows.begin(); row != chunk.rows.end();
+                         ++row) {
+                        if (row->size() != chunk.columns ||
+                            row->back().is_null ||
+                            row->back().type != CSD_SQL_TYPE_INT64 ||
+                            row->back().integer < 0)
+                            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x436);
+                        row->pop_back();
+                        output->rows.push_back(std::move(*row));
+                    }
+                    return true;
+                }))
+            return false;
+        return output->rows.size() == state->rows ? true :
+            fail(CSD_SQL_STATUS_BAD_ABI, index, 0x437);
+    }
 
     struct StreamingPartitionedJoinState {
         const CsdSqlJoinSpec *spec;
@@ -679,7 +874,7 @@
         uint64_t input_rows;
         std::vector<SpillHandleChain> right_chains;
         std::vector<SpillHandleChain> left_chains;
-        std::vector<OrderedJoinRow> ordered;
+        JoinOrdinalRunState ordinal_runs;
         bool configured;
         StreamingPartitionedJoinState()
             : spec(NULL), keys(NULL), right(NULL), right_columns(0),
@@ -761,6 +956,9 @@
         const bool only_left = spec->join_kind == CSD_SQL_JOIN_SEMI ||
                                spec->join_kind == CSD_SQL_JOIN_ANTI;
         output->columns = left.columns + (only_left ? 0 : right.columns);
+        if (!configure_join_ordinal_runs(index, output->columns,
+                                         &state->ordinal_runs))
+            return false;
         state->configured = true;
         {
             std::lock_guard<std::mutex> status_guard(status_mutex_);
@@ -792,6 +990,9 @@
             return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x41b);
         std::vector<std::vector<size_t> > partition_rows(
             state->partition_count);
+        Batch unmatched;
+        unmatched.columns = state->ordinal_runs.visible_columns + 1;
+        uint64_t unmatched_bytes = 0;
         for (size_t row_index = 0; row_index < left.rows.size();
              ++row_index) {
             size_t partition = 0;
@@ -805,13 +1006,23 @@
             if (state->spec->join_kind != CSD_SQL_JOIN_LEFT &&
                 state->spec->join_kind != CSD_SQL_JOIN_ANTI)
                 continue;
-            OrderedJoinRow unmatched;
-            unmatched.ordinal = state->input_rows + row_index;
-            unmatched.row = left.rows[row_index];
+            Row unmatched_row = left.rows[row_index];
             if (state->spec->join_kind == CSD_SQL_JOIN_LEFT)
-                unmatched.row.resize(left.columns + state->right_columns);
-            state->ordered.push_back(std::move(unmatched));
+                unmatched_row.resize(left.columns + state->right_columns);
+            Value ordinal;
+            ordinal.is_null = false;
+            ordinal.type = CSD_SQL_TYPE_INT64;
+            ordinal.integer = static_cast<int64_t>(state->input_rows +
+                                                   row_index);
+            unmatched_row.push_back(std::move(ordinal));
+            if (!buffer_join_ordinal_row(index, &unmatched_row, &unmatched,
+                                         &unmatched_bytes,
+                                         &state->ordinal_runs))
+                return false;
         }
+        if (!flush_join_ordinal_rows(index, &unmatched, &unmatched_bytes,
+                                     &state->ordinal_runs))
+            return false;
         for (size_t partition = 0; partition < state->partition_count;
              ++partition) {
             if (partition_rows[partition].empty()) continue;
@@ -862,6 +1073,9 @@
                                state->spec->join_kind == CSD_SQL_JOIN_ANTI;
         output->columns = left.columns +
                           (only_left ? 0 : state->right_columns);
+        if (!configure_join_ordinal_runs(index, output->columns,
+                                         &state->ordinal_runs))
+            return false;
         state->configured = true;
         build->consumed = true;
         {
@@ -920,7 +1134,7 @@
                                     partition_right, &partition_output,
                                     false, true))
                                 return false;
-                            for (std::vector<Row>::iterator row =
+                            for (std::vector<Row>::const_iterator row =
                                      partition_output.rows.begin();
                                  row != partition_output.rows.end(); ++row) {
                                 if (row->empty() || row->back().is_null ||
@@ -931,33 +1145,24 @@
                                         state->input_rows)
                                     return fail(CSD_SQL_STATUS_BAD_ABI, index,
                                                 0x41d);
-                                OrderedJoinRow restored;
-                                restored.ordinal = static_cast<uint64_t>(
-                                    row->back().integer);
-                                row->pop_back();
-                                restored.row = std::move(*row);
-                                state->ordered.push_back(std::move(restored));
                             }
-                            return true;
+                            return append_join_ordinal_run(index,
+                                &partition_output, &state->ordinal_runs);
                         }))
                     return false;
                 return true;
             })) return false;
         }
-        std::stable_sort(state->ordered.begin(), state->ordered.end(),
-            [](const OrderedJoinRow &first, const OrderedJoinRow &second) {
-                return first.ordinal < second.ordinal;
-            });
-        output->rows.reserve(state->ordered.size());
-        for (std::vector<OrderedJoinRow>::iterator row =
-                 state->ordered.begin(); row != state->ordered.end(); ++row)
-            output->rows.push_back(std::move(row->row));
+        if (!finish_join_ordinal_runs(index, &state->ordinal_runs, output))
+            return false;
 
         uint64_t input_rows = 0, partition_work = 0, modeled_work = 0;
         if (!checked_add(state->input_rows, state->right_rows,
                          &input_rows) ||
             !checked_mul(input_rows, 3, &partition_work) ||
-            !checked_add(partition_work, output->rows.size(), &modeled_work))
+            !checked_add(partition_work, output->rows.size(), &modeled_work) ||
+            !checked_add(modeled_work, state->ordinal_runs.merge_rows,
+                         &modeled_work))
             modeled_work = std::numeric_limits<uint64_t>::max();
         add_cycles(modeled_work, node);
         if (node.opcode == CSD_SQL_OP_MERGE_JOIN)
@@ -1090,8 +1295,17 @@
         }
         std::vector<std::vector<size_t> >().swap(right_partition_rows);
 
+        const bool only_left = spec.join_kind == CSD_SQL_JOIN_SEMI ||
+                               spec.join_kind == CSD_SQL_JOIN_ANTI;
+        output->columns = left.columns + (only_left ? 0 : right.columns);
+        JoinOrdinalRunState ordinal_runs;
+        if (!configure_join_ordinal_runs(index, output->columns,
+                                         &ordinal_runs))
+            return false;
+        Batch unmatched;
+        unmatched.columns = output->columns + 1;
+        uint64_t unmatched_bytes = 0;
         std::vector<std::vector<size_t> > left_partition_rows(partition_count);
-        std::vector<OrderedJoinRow> ordered;
         for (size_t row_index = 0; row_index < left.rows.size(); ++row_index) {
             size_t partition = 0;
             if (join_partition_index(left.rows[row_index], keys, spec.key_count,
@@ -1102,13 +1316,21 @@
             if (spec.join_kind != CSD_SQL_JOIN_LEFT &&
                 spec.join_kind != CSD_SQL_JOIN_ANTI)
                 continue;
-            OrderedJoinRow unmatched;
-            unmatched.ordinal = row_index;
-            unmatched.row = left.rows[row_index];
+            Row unmatched_row = left.rows[row_index];
             if (spec.join_kind == CSD_SQL_JOIN_LEFT)
-                unmatched.row.resize(left.columns + right.columns);
-            ordered.push_back(std::move(unmatched));
+                unmatched_row.resize(left.columns + right.columns);
+            Value ordinal;
+            ordinal.is_null = false;
+            ordinal.type = CSD_SQL_TYPE_INT64;
+            ordinal.integer = static_cast<int64_t>(row_index);
+            unmatched_row.push_back(std::move(ordinal));
+            if (!buffer_join_ordinal_row(index, &unmatched_row, &unmatched,
+                                         &unmatched_bytes, &ordinal_runs))
+                return false;
         }
+        if (!flush_join_ordinal_rows(index, &unmatched, &unmatched_bytes,
+                                     &ordinal_runs))
+            return false;
 
         /* The writer appends a private probe ordinal without copying/tagging
          * the source Row. Replay uses it to restore PostgreSQL probe order. */
@@ -1137,7 +1359,7 @@
                                                partition_right, &partition_output,
                                                false, true))
                             return false;
-                        for (std::vector<Row>::iterator row =
+                        for (std::vector<Row>::const_iterator row =
                                  partition_output.rows.begin();
                              row != partition_output.rows.end(); ++row) {
                             if (row->empty() || row->back().is_null ||
@@ -1146,33 +1368,21 @@
                                 static_cast<uint64_t>(row->back().integer) >=
                                     left.rows.size())
                                 return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x405);
-                            OrderedJoinRow restored;
-                            restored.ordinal = static_cast<uint64_t>(
-                                row->back().integer);
-                            row->pop_back();
-                            restored.row = std::move(*row);
-                            ordered.push_back(std::move(restored));
                         }
-                        return true;
+                        return append_join_ordinal_run(index,
+                            &partition_output, &ordinal_runs);
                     }))
                 return false;
         }
-        std::stable_sort(ordered.begin(), ordered.end(),
-            [](const OrderedJoinRow &first, const OrderedJoinRow &second) {
-                return first.ordinal < second.ordinal;
-            });
-        const bool only_left = spec.join_kind == CSD_SQL_JOIN_SEMI ||
-                               spec.join_kind == CSD_SQL_JOIN_ANTI;
-        output->columns = left.columns + (only_left ? 0 : right.columns);
-        output->rows.reserve(ordered.size());
-        for (std::vector<OrderedJoinRow>::iterator row = ordered.begin();
-             row != ordered.end(); ++row)
-            output->rows.push_back(std::move(row->row));
+        if (!finish_join_ordinal_runs(index, &ordinal_runs, output))
+            return false;
 
         uint64_t input_rows = 0, partition_work = 0, modeled_work = 0;
         if (!checked_add(left.rows.size(), right.rows.size(), &input_rows) ||
             !checked_mul(input_rows, 3, &partition_work) ||
-            !checked_add(partition_work, output->rows.size(), &modeled_work))
+            !checked_add(partition_work, output->rows.size(), &modeled_work) ||
+            !checked_add(modeled_work, ordinal_runs.merge_rows,
+                         &modeled_work))
             modeled_work = std::numeric_limits<uint64_t>::max();
         add_cycles(modeled_work, node);
         return true;

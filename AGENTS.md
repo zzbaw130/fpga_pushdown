@@ -234,7 +234,9 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   写 Flash；保守值选择初始 fan-out，实际 partition bytes 超限时倍增 radix fan-out 后
   再 probe。每条 streamed data record 后附加 40 B Flash 反向链节点，controller 内每个
   partition 只保留 16 B `{tail,count}`，常驻句柄不再随 batch selection 数量增长。其他
-  build 子树仍用完整 build 做精确分类。
+  build 子树仍用完整 build 做精确分类。partition replay 的 tagged output 直接形成
+  sorted Flash run；binary-carry merge 每层最多保留一个 handle，最终 run 分块读回并去掉
+  hidden ordinal，不再保留 output-sized `OrderedJoinRow` vector。
 - Grouped Aggregate：每个 group 永远落入一个 partition，保留 DISTINCT 与 AVG
   sum/count 语义；collision partition 使用更高 hash bits 递归 partition。新 group 和
   DISTINCT item 在插入前原子计费，一旦过 arena threshold 就丢弃 partial table 并按
@@ -252,10 +254,12 @@ Join 左/probe 链已消除对应完整 Scan `Batch`；符合两侧 Scan 准入�
 阻塞输出仍会累计。cursor chunk、hash state 仍是普通 STL container，而非真实 FDM
 arena allocator；streamed Join 的句柄 payload 已由 Flash 链约束为 O(partition count)，
 但 descriptor vector 仍有 STL allocator 开销，adaptive repartition 也不会在 query 内
-回收旧 data/chain scratch record。
+回收旧 data/chain scratch record。partitioned Join 的 ordinal reorder payload 已约束为
+O(log run count)，但最终 visible output 仍完整物化；单个 probe chunk 的极端一对多输出也
+可能在写 run 前形成较大的临时 `partition_output`。
 虽然 scan window、FIFO、run generation、cursor merge、部分 Aggregate/Join state、spill
-I/O 和 blocking lease 已有界，但在实现 bounded output/reorder consumer、Aggregate
-streaming partition writer 与 arena-backed
+I/O 和 blocking lease 已有界，但在实现 streaming Join/final-result consumer、
+fan-out-bounded probe emission、Aggregate streaming partition writer 与 arena-backed
 container 前，不能声称 SF=32 端到端物理内存已严格有界。global Aggregate 的大型
 DISTINCT 仍保留 compatibility/protection-copy 路径。
 
@@ -320,6 +324,7 @@ wall-time 数字保留只为历史可追溯。
 | Join probe-to-Flash | Q3 32 MiB arena；1 个 partitioned Join；30 probe batches / 3,231,383 rows；peak 29,494,560 B；60,171,304 B spill write/read；结果 exact |
 | Join build-to-Flash | Q3 32 MiB arena；7 build batches / 737,165 rows + 30 probe batches；peak 8,832,780 B；60,180,376 B spill write/read；结果 exact |
 | Join Flash handle chain | Q3 256 data/chain records；resident descriptor peak 1,024 B；40 B/record metadata；60,190,616 B spill write/read；结果 exact |
+| Join ordinal Flash merge | Q3 32 leaf runs / 31 merges；736,065 merge rows；resident handles 150 B；166,186,244 B spill write/read；结果 exact |
 
 详细报告分别位于 `results/tpch_sf1_{sort,join,aggregate}_spill_replay_validation.md`、
 `results/tpch_sf1_fdm_arena_validation.md` 和 `results/tpch_sf1_fdm_fifo_validation.md`。
@@ -355,6 +360,11 @@ streamed Join 的 bounded Flash handle-chain 验证位于
 1,024 B，forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归与 ASan/UBSan 均通过，
 原始证据归档 SHA-256 为
 `75646d7446fd7712a724a8e56121629767bd4077f2006a257896b4405f92c271`。
+partitioned Join 的 bounded ordinal merge 验证位于
+`results/tpch_sf1_ordinal_merge_validation.md`；最终 v1 kernel 的 Q3 常驻 run handle
+payload 为 150 B，新增 Flash 模型时延与实测差异 1.92%，forced-CSD 22/22 exact、
+planner 22/22、AUTO 定向回归与 ASan/UBSan 均通过，原始证据归档 SHA-256 为
+`881662128094edca4e98f190eac2d32e2957997e9f6b3e416bf227a39de7f978`。
 
 ## 10. 回归命令与通过标准
 

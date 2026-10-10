@@ -241,6 +241,16 @@ and probe records carry global ordinals before the final stable reorder.
 Adaptive repartition writes a new chain; its obsolete data and link records
 remain charged to the current query's scratch capacity until query teardown.
 
+Partition replay also avoids a complete controller-memory ordinal reorder
+vector. Every tagged output chunk becomes a sorted Flash run. Binary-carry
+merge retains at most one run handle per level and uses the same two bounded
+row cursors plus one bounded writer as external Sort. Final levels merge from
+oldest to newest; the winning run is decoded by staging-sized chunks and the
+hidden ordinal is removed while rows move into the visible result. NULL-key
+LEFT/ANTI rows are staged through this path as well. Once a replay chunk is
+fully decoded, the shared spill-stage lock is released before invoking a
+downstream spill-writing consumer and reacquired before the next read.
+
 Grouped Aggregate uses the same handle/replay infrastructure. All rows for a
 group are assigned to one radix partition, so `DISTINCT` sets and AVG's
 sum/count pair never require cross-partition reconciliation. Hash collisions
@@ -264,12 +274,14 @@ Direct Scan-to-Sort plans no longer accumulate a complete decoded Scan
 `Batch`, and Sort merge memory is bounded by two cursor chunks plus one writer
 chunk. Eligible direct Scan-to-Aggregate plans likewise keep only the current
 FIFO batch and the modeled hash state. Eligible Join probe chains keep the
-current FIFO batch plus one resident build, but the Join output still
+current FIFO batch plus one resident build, but their final Join output still
 materializes. With an oversized build, the probe Scan is batch-bounded and
 writes directly to Flash. An eligible two-sided Scan shape also streams the
 build without a complete build `Batch`; other build subtrees still materialize
 for exact fan-out/skew classification. Streamed Join handle payload is bounded
 by the radix partition count because per-record metadata is Flash-linked;
+partitioned Join ordinal reorder payload is bounded logarithmically by a
+binary-carry Flash merge instead of a complete `OrderedJoinRow` vector;
 adaptive repartitioning still appends replacement records without reclaiming
 old query scratch extents.
 Ineligible Aggregate inputs still
@@ -280,8 +292,8 @@ directly through the bounded FDM staging range, and Join probe replay is
 chunked by that same limit. The aggregate threshold bounds its modeled state,
 but the table and cursor chunks still use ordinary C++ containers rather than
 allocators carved from the FDM arena. Streaming Aggregate partition writers,
-bounded output/reorder consumers and arena-backed containers are needed for a
-strict physical FDM-only bound.
+streaming Join/final-result consumers, fan-out-bounded probe emission and
+arena-backed containers are needed for a strict physical FDM-only bound.
 Serialized spill records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and

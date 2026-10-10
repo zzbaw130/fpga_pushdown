@@ -406,6 +406,10 @@ struct CsdSqlExecutionStatus {
     uint64_t stream_join_chain_records;
     uint64_t stream_join_chain_record_reads;
     uint64_t stream_join_chain_peak_bytes;
+    uint64_t stream_join_ordinal_runs;
+    uint64_t stream_join_ordinal_merge_records;
+    uint64_t stream_join_ordinal_merge_rows;
+    uint64_t stream_join_ordinal_peak_bytes;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

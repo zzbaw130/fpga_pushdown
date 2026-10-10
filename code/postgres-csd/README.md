@@ -127,6 +127,10 @@ Actual partition bytes can double the initial radix fan-out before replay.
 Each streamed Join data record stores a 40-byte backwards-link record in Flash;
 controller memory retains only a 16-byte tail/count descriptor per radix
 partition instead of a handle per batch selection.
+Partition replay writes tagged result chunks as sorted Flash runs. A
+binary-carry merge retains at most one handle per level, so ordinal-reorder
+metadata is logarithmic rather than a complete output-sized vector. The final
+run is decoded in bounded chunks while its hidden ordinal is removed.
 Sort merge intermediates are cursor-bounded.
 Oversized grouped Aggregate state now
 radix-partitions input by the complete group key and replays each partition,
@@ -143,9 +147,10 @@ radix partitions; for other build subtrees it is still materialized for exact
 fan-out/skew inspection. Join handle descriptor payload is now bounded by the
 65,536-partition limit, although adaptive rebucketing does not reclaim obsolete
 query scratch records. End-to-end physical memory becomes hard-bounded only
-after spill-bound Aggregate paths, final outputs and ordinal reordering consume
+after spill-bound Aggregate paths, Join fan-out chunks and final outputs consume
 bounded storage, and real arena-backed container allocators replace the
-remaining C++ heap objects.
+remaining C++ heap objects. Partitioned Join ordinal-reorder metadata itself is
+already bounded by the binary-carry run levels.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

@@ -172,6 +172,9 @@ Grace/radix 回退记录在
 两侧流式 Join 的每条 resident handle 进一步改为 Flash 反向链表，内存中只保留每个
 radix partition 的固定链头；Q3 32 MiB 与完整回归记录在
 [Join spill-chain 验证](results/tpch_sf1_spill_chain_validation.md)。
+partition replay 的完整 `OrderedJoinRow` 向量进一步替换为 binary-carry Flash runs，
+常驻 reorder handle 为 O(log runs)；Q3 32 MiB 的时延/I/O 校准与完整回归记录在
+[Join ordinal-merge 验证](results/tpch_sf1_ordinal_merge_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD

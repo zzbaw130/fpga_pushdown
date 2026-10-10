@@ -71,6 +71,11 @@ in `tpch_sf1_spill_chain_validation_raw.tar.gz` with SHA-256
 
 ## Remaining boundary
 
+Historical note: the subsequent ordinal-merge milestone removes the complete
+`OrderedJoinRow` vector and keeps only logarithmically many Flash run handles.
+See `tpch_sf1_ordinal_merge_validation.md`. The final-output and allocator
+limitations below remain current.
+
 The resident descriptor payload is now proportional to radix partition count,
 not spill-record count. It is still stored in ordinary `std::vector` objects,
 and the metric excludes allocator overhead. Partition count is explicitly
