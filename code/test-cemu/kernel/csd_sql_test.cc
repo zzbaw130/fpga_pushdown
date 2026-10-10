@@ -797,6 +797,9 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         assert(execution->stream_join_ordinal_merge_records == 0);
         assert(execution->stream_join_ordinal_merge_rows == 0);
         assert(execution->stream_join_ordinal_peak_bytes == 0);
+        assert(execution->stream_join_output_buffers == 0);
+        assert(execution->stream_join_output_rows == 0);
+        assert(execution->stream_join_output_peak_bytes == 0);
         assert(execution->operator_peak_bytes == 80);
         assert(execution->operator_allocations == 1);
         assert(execution->operator_spill_count == 0);
@@ -827,6 +830,9 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         assert(execution->stream_join_ordinal_merge_records == 2);
         assert(execution->stream_join_ordinal_merge_rows == 5);
         assert(execution->stream_join_ordinal_peak_bytes > 0);
+        assert(execution->stream_join_output_buffers == 3);
+        assert(execution->stream_join_output_rows == 3);
+        assert(execution->stream_join_output_peak_bytes == 100);
         assert(execution->operator_peak_bytes <= header.operator_bytes);
         assert(execution->operator_spill_count == 12);
         assert(execution->spill_write_bytes > 0);

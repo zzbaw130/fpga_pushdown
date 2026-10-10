@@ -251,6 +251,15 @@ LEFT/ANTI rows are staged through this path as well. Once a replay chunk is
 fully decoded, the shared spill-stage lock is released before invoking a
 downstream spill-writing consumer and reacquired before the next read.
 
+The hash probe does not construct a complete output `Batch` for that decoded
+chunk. It emits each matched, preserved or NULL-extended row through a callback
+into a pending ordinal-run buffer capped by the reusable spill staging
+capacity. The restored build-partition hash table is built once and reused for
+all probe records in that partition. Backwards-chain traversal can move from a
+newer ordinal range to an older one, so the pending buffer is flushed at every
+record-handle boundary; additional flushes occur whenever the staging bound is
+reached. Each resulting leaf run is therefore sorted before binary carry.
+
 Grouped Aggregate uses the same handle/replay infrastructure. All rows for a
 group are assigned to one radix partition, so `DISTINCT` sets and AVG's
 sum/count pair never require cross-partition reconciliation. Hash collisions
@@ -282,6 +291,8 @@ for exact fan-out/skew classification. Streamed Join handle payload is bounded
 by the radix partition count because per-record metadata is Flash-linked;
 partitioned Join ordinal reorder payload is bounded logarithmically by a
 binary-carry Flash merge instead of a complete `OrderedJoinRow` vector;
+partitioned probe fan-out is emitted row by row into a staging-bounded run
+buffer instead of a complete per-chunk `partition_output`;
 adaptive repartitioning still appends replacement records without reclaiming
 old query scratch extents.
 Ineligible Aggregate inputs still
@@ -292,8 +303,8 @@ directly through the bounded FDM staging range, and Join probe replay is
 chunked by that same limit. The aggregate threshold bounds its modeled state,
 but the table and cursor chunks still use ordinary C++ containers rather than
 allocators carved from the FDM arena. Streaming Aggregate partition writers,
-streaming Join/final-result consumers, fan-out-bounded probe emission and
-arena-backed containers are needed for a strict physical FDM-only bound.
+streaming downstream/final-result consumers and arena-backed containers are
+needed for a strict physical FDM-only bound.
 Serialized spill records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort
 and Hash Join replay increment both `flash_read_bytes` and

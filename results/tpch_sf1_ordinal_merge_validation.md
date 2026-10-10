@@ -85,6 +85,11 @@ Raw query outputs, Q3 profile, planner output and AUTO plans are archived in
 
 ## Remaining boundary
 
+Historical note: the subsequent fan-out streaming stage removes the temporary
+per-probe-chunk `partition_output`; see
+`tpch_sf1_fanout_stream_validation.md`. The paragraph below records the
+boundary at the time of this ordinal-merge milestone.
+
 Ordinal reorder metadata and its row copies are now bounded, but the final
 visible Join output is still reconstructed as one `Batch` because the current
 DAG scheduler exposes materialized node results. A single probe chunk with

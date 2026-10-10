@@ -131,6 +131,11 @@ Partition replay writes tagged result chunks as sorted Flash runs. A
 binary-carry merge retains at most one handle per level, so ordinal-reorder
 metadata is logarithmic rather than a complete output-sized vector. The final
 run is decoded in bounded chunks while its hidden ordinal is removed.
+The replay hash probe itself emits one joined row at a time into a buffer
+bounded by the reusable spill staging capacity; it no longer constructs a
+complete `partition_output` for a potentially high-fanout probe chunk. The
+buffer is also flushed at each backwards-chain handle boundary so every leaf
+run remains ordinal-sorted.
 Sort merge intermediates are cursor-bounded.
 Oversized grouped Aggregate state now
 radix-partitions input by the complete group key and replays each partition,
@@ -147,10 +152,10 @@ radix partitions; for other build subtrees it is still materialized for exact
 fan-out/skew inspection. Join handle descriptor payload is now bounded by the
 65,536-partition limit, although adaptive rebucketing does not reclaim obsolete
 query scratch records. End-to-end physical memory becomes hard-bounded only
-after spill-bound Aggregate paths, Join fan-out chunks and final outputs consume
-bounded storage, and real arena-backed container allocators replace the
-remaining C++ heap objects. Partitioned Join ordinal-reorder metadata itself is
-already bounded by the binary-carry run levels.
+after spill-bound Aggregate paths and final outputs consume bounded storage,
+and real arena-backed container allocators replace the remaining C++ heap
+objects. Partitioned Join probe fan-out and ordinal-reorder metadata are
+already bounded by the staging window and binary-carry run levels respectively.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

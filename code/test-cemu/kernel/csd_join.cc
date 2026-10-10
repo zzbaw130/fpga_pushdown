@@ -547,6 +547,86 @@
         return true;
     }
 
+    /* Partition replay emits each joined row immediately. This is the
+     * functional equivalent of a bounded FPGA output FIFO: a high-fanout
+     * probe cannot first accumulate a complete partition_output Batch. */
+    template <typename Consumer>
+    bool stream_join_probe_rows(uint32_t index, const CsdSqlJoinSpec &spec,
+                                const CsdSqlJoinKey *keys,
+                                const Batch &left, const Batch &right,
+                                const JoinHashState &state,
+                                bool tagged_left, Consumer consumer)
+    {
+        if (tagged_left && left.columns == 0)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x43a);
+        const uint16_t logical_left_columns = left.columns -
+                                              (tagged_left ? 1 : 0);
+        const std::vector<size_t> no_candidates;
+        std::vector<EvalValue> expression_stack;
+        for (size_t left_index = 0; left_index < left.rows.size();
+             ++left_index) {
+            const Row &left_row = left.rows[left_index];
+            const std::vector<size_t> *candidates = &no_candidates;
+            if (state.scalar_key) {
+                ScalarJoinKey key;
+                if (make_scalar_join_key(left_row, keys[0], true, &key)) {
+                    std::unordered_map<ScalarJoinKey, std::vector<size_t>,
+                        ScalarJoinKeyHash>::const_iterator found =
+                        state.scalar_hash_table.find(key);
+                    if (found != state.scalar_hash_table.end())
+                        candidates = &found->second;
+                }
+            } else {
+                std::string key;
+                if (make_join_key(left_row, keys, spec.key_count, true,
+                                  &key)) {
+                    std::unordered_map<std::string,
+                        std::vector<size_t> >::const_iterator found =
+                        state.hash_table.find(key);
+                    if (found != state.hash_table.end())
+                        candidates = &found->second;
+                }
+            }
+            const Value *ordinal = tagged_left ? &left_row.back() : NULL;
+            Row logical_left(left_row.begin(),
+                             left_row.begin() + logical_left_columns);
+            bool matched = false;
+            for (std::vector<size_t>::const_iterator candidate =
+                     candidates->begin(); candidate != candidates->end();
+                 ++candidate) {
+                Row joined_row = logical_left;
+                joined_row.insert(joined_row.end(),
+                    right.rows[*candidate].begin(),
+                    right.rows[*candidate].end());
+                bool residual_match = false;
+                if (!join_residual_matches(index, spec, joined_row,
+                                           &residual_match,
+                                           &expression_stack))
+                    return false;
+                if (!residual_match) continue;
+                matched = true;
+                if (spec.join_kind == CSD_SQL_JOIN_SEMI) {
+                    if (tagged_left) logical_left.push_back(*ordinal);
+                    if (!consumer(std::move(logical_left))) return false;
+                    break;
+                }
+                if (spec.join_kind != CSD_SQL_JOIN_ANTI) {
+                    if (tagged_left) joined_row.push_back(*ordinal);
+                    if (!consumer(std::move(joined_row))) return false;
+                }
+            }
+            if (spec.join_kind == CSD_SQL_JOIN_ANTI && !matched) {
+                if (tagged_left) logical_left.push_back(*ordinal);
+                if (!consumer(std::move(logical_left))) return false;
+            } else if (spec.join_kind == CSD_SQL_JOIN_LEFT && !matched) {
+                logical_left.resize(logical_left_columns + right.columns);
+                if (tagged_left) logical_left.push_back(*ordinal);
+                if (!consumer(std::move(logical_left))) return false;
+            }
+        }
+        return true;
+    }
+
     /* Build/probe one in-memory partition. A tagged left row has a private
      * ordinal in its final column; residual expressions never see that tag. */
     bool execute_join_core(uint32_t index, const CsdSqlJoinSpec &spec,
@@ -798,12 +878,17 @@
         if (row_bytes > capacity)
             return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x439);
         if (!pending->rows.empty() && row_bytes > capacity - *pending_bytes) {
-            if (!append_join_ordinal_run(index, pending, state)) return false;
-            std::vector<Row>().swap(pending->rows);
-            *pending_bytes = 0;
+            if (!flush_join_ordinal_rows(index, pending, pending_bytes,
+                                         state))
+                return false;
         }
         pending->rows.push_back(std::move(*row));
         *pending_bytes += row_bytes;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            status_.stream_join_output_peak_bytes = std::max<uint64_t>(
+                status_.stream_join_output_peak_bytes, *pending_bytes);
+        }
         return true;
     }
 
@@ -811,9 +896,21 @@
                                  uint64_t *pending_bytes,
                                  JoinOrdinalRunState *state)
     {
+        if (pending->rows.empty()) return true;
+        const uint64_t rows = pending->rows.size();
         if (!append_join_ordinal_run(index, pending, state)) return false;
         std::vector<Row>().swap(pending->rows);
         *pending_bytes = 0;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_join_output_buffers;
+            uint64_t total = 0;
+            if (checked_add(status_.stream_join_output_rows, rows, &total))
+                status_.stream_join_output_rows = total;
+            else
+                status_.stream_join_output_rows =
+                    std::numeric_limits<uint64_t>::max();
+        }
         return true;
     }
 
@@ -1123,34 +1220,43 @@
                 batch_bytes(partition_right), true);
             if (!partition_memory.acquired())
                 return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x41c);
+            JoinHashState partition_hash;
+            bool hash_built = false;
             if (!for_each_spill_chain_handle(index,
                     state->left_chains[partition],
                     [&](const SpillHandle &handle) {
+                Batch pending;
+                pending.columns = state->ordinal_runs.visible_columns + 1;
+                uint64_t pending_bytes = 0;
                 if (!stream_spill_batch(index, handle,
                         [&](const Batch &partition_left) {
-                            Batch partition_output;
-                            if (!execute_join_core(index, *state->spec,
-                                    state->keys, partition_left,
-                                    partition_right, &partition_output,
-                                    false, true))
-                                return false;
-                            for (std::vector<Row>::const_iterator row =
-                                     partition_output.rows.begin();
-                                 row != partition_output.rows.end(); ++row) {
-                                if (row->empty() || row->back().is_null ||
-                                    row->back().type != CSD_SQL_TYPE_INT64 ||
-                                    row->back().integer < 0 ||
-                                    static_cast<uint64_t>(
-                                        row->back().integer) >=
-                                        state->input_rows)
-                                    return fail(CSD_SQL_STATUS_BAD_ABI, index,
-                                                0x41d);
+                            if (!hash_built) {
+                                build_join_hash(partition_left,
+                                    partition_right, state->keys,
+                                    state->spec->key_count, false,
+                                    &partition_hash);
+                                hash_built = true;
                             }
-                            return append_join_ordinal_run(index,
-                                &partition_output, &state->ordinal_runs);
+                            return stream_join_probe_rows(index, *state->spec,
+                                state->keys, partition_left, partition_right,
+                                partition_hash, true, [&](Row &&row) {
+                                    if (row.empty() || row.back().is_null ||
+                                        row.back().type !=
+                                            CSD_SQL_TYPE_INT64 ||
+                                        row.back().integer < 0 ||
+                                        static_cast<uint64_t>(
+                                            row.back().integer) >=
+                                            state->input_rows)
+                                        return fail(CSD_SQL_STATUS_BAD_ABI,
+                                                    index, 0x41d);
+                                    return buffer_join_ordinal_row(index, &row,
+                                        &pending, &pending_bytes,
+                                        &state->ordinal_runs);
+                                });
                         }))
                     return false;
-                return true;
+                return flush_join_ordinal_rows(index, &pending,
+                    &pending_bytes, &state->ordinal_runs);
             })) return false;
         }
         if (!finish_join_ordinal_runs(index, &state->ordinal_runs, output))
@@ -1352,26 +1458,37 @@
                 batch_bytes(partition_right), true);
             if (!partition_memory.acquired())
                 return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x404);
+            JoinHashState partition_hash;
+            bool hash_built = false;
+            Batch pending;
+            pending.columns = ordinal_runs.visible_columns + 1;
+            uint64_t pending_bytes = 0;
             if (!stream_spill_batch(index, handles[partition].left,
                     [&](const Batch &partition_left) {
-                        Batch partition_output;
-                        if (!execute_join_core(index, spec, keys, partition_left,
-                                               partition_right, &partition_output,
-                                               false, true))
-                            return false;
-                        for (std::vector<Row>::const_iterator row =
-                                 partition_output.rows.begin();
-                             row != partition_output.rows.end(); ++row) {
-                            if (row->empty() || row->back().is_null ||
-                                row->back().type != CSD_SQL_TYPE_INT64 ||
-                                row->back().integer < 0 ||
-                                static_cast<uint64_t>(row->back().integer) >=
-                                    left.rows.size())
-                                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x405);
+                        if (!hash_built) {
+                            build_join_hash(partition_left, partition_right,
+                                            keys, spec.key_count, false,
+                                            &partition_hash);
+                            hash_built = true;
                         }
-                        return append_join_ordinal_run(index,
-                            &partition_output, &ordinal_runs);
+                        return stream_join_probe_rows(index, spec, keys,
+                            partition_left, partition_right, partition_hash,
+                            true, [&](Row &&row) {
+                                if (row.empty() || row.back().is_null ||
+                                    row.back().type != CSD_SQL_TYPE_INT64 ||
+                                    row.back().integer < 0 ||
+                                    static_cast<uint64_t>(
+                                        row.back().integer) >=
+                                        left.rows.size())
+                                    return fail(CSD_SQL_STATUS_BAD_ABI, index,
+                                                0x405);
+                                return buffer_join_ordinal_row(index, &row,
+                                    &pending, &pending_bytes, &ordinal_runs);
+                            });
                     }))
+                return false;
+            if (!flush_join_ordinal_rows(index, &pending, &pending_bytes,
+                                         &ordinal_runs))
                 return false;
         }
         if (!finish_join_ordinal_runs(index, &ordinal_runs, output))
