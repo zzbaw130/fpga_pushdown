@@ -65,6 +65,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `20a83f89a` | 保守准入的 Scan/FIFO 直连 Aggregate、Q1/Q6 profile 与 SF=1 22/22 回归 |
 | `dade2128f` | resident-build one-sided streaming Join、低内存回退、Q3/Q5 profile 与 SF=1 22/22 回归 |
 | `c7ff19c3e` | oversized-build Join probe-to-Flash、32 MiB Q3 exact 与 SF=1 22/22 回归 |
+| `8fbe3622a` | two-sided Scan Join build-to-Flash、自适应 fan-out、32 MiB Q3 与 22/22 回归 |
 
 ## 3. 环境不变量
 
