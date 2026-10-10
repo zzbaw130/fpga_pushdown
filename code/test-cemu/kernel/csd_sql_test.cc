@@ -635,15 +635,16 @@ void test_streaming_scan_aggregate_batches()
 
 void test_streaming_scan_join_probe_batches(bool fit_build)
 {
+    const int32_t second_key = fit_build ? 3 : 5;
     std::vector<unsigned char> left_page(CSD_SQL_PAGE_BYTES, 0);
     std::vector<unsigned char> right_page(CSD_SQL_PAGE_BYTES, 0);
     put_u16(left_page.data() + 12, 24 + 3 * 4);
     put_u16(right_page.data() + 12, 24 + 2 * 4);
     add_right_tuple(left_page.data(), 0, 128, 1, 10);
     add_right_tuple(left_page.data(), 1, 192, 2, 20);
-    add_right_tuple(left_page.data(), 2, 256, 3, 30);
+    add_right_tuple(left_page.data(), 2, 256, second_key, 30);
     add_right_tuple(right_page.data(), 0, 128, 1, 100);
-    add_right_tuple(right_page.data(), 1, 192, 3, 300);
+    add_right_tuple(right_page.data(), 1, 192, second_key, 300);
 
     std::vector<unsigned char> plan(
         sizeof(CsdSqlPlanHeader) + 3 * sizeof(CsdSqlPlanNode), 0);
@@ -676,6 +677,9 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
     nodes[2].left_input = 0;
     nodes[2].right_input = 1;
     nodes[2].flags = CSD_SQL_NODE_BLOCKING | CSD_SQL_NODE_SPILLABLE;
+    /* A conservative build capacity above the arena activates the direct
+     * build Scan/FIFO partition writer in the low-memory case. */
+    nodes[2].arg0 = fit_build ? 80 : 160;
     CsdSqlJoinSpec join = {};
     join.key_count = 1;
     join.join_kind = fit_build ? CSD_SQL_JOIN_INNER : CSD_SQL_JOIN_LEFT;
@@ -759,13 +763,13 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
     assert(cells[0].integer == 1 && cells[1].integer == 10);
     assert(cells[2].integer == 1 && cells[3].integer == 100);
     if (fit_build) {
-        assert(cells[4].integer == 3 && cells[5].integer == 30);
-        assert(cells[6].integer == 3 && cells[7].integer == 300);
+        assert(cells[4].integer == second_key && cells[5].integer == 30);
+        assert(cells[6].integer == second_key && cells[7].integer == 300);
     } else {
-        /* Two scan lanes emit physical items in 1,3,2 order. Partition replay
+        /* Two scan lanes emit physical items in 1,5,2 order. Partition replay
          * must preserve that global FIFO order across three records. */
-        assert(cells[4].integer == 3 && cells[5].integer == 30);
-        assert(cells[6].integer == 3 && cells[7].integer == 300);
+        assert(cells[4].integer == second_key && cells[5].integer == 30);
+        assert(cells[6].integer == second_key && cells[7].integer == 300);
         assert(cells[8].integer == 2 && cells[9].integer == 20);
         assert((cells[10].flags & 1U) != 0 &&
                (cells[11].flags & 1U) != 0);
@@ -782,22 +786,32 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         assert(execution->stream_join_rows == 3);
         assert(execution->stream_join_build_bytes == 80);
         assert(execution->stream_join_partitioned_calls == 0);
+        assert(execution->stream_join_streamed_build_calls == 0);
+        assert(execution->stream_join_build_batches == 0);
+        assert(execution->stream_join_build_rows == 0);
+        assert(execution->stream_join_build_repartition_passes == 0);
         assert(execution->operator_peak_bytes == 80);
         assert(execution->operator_allocations == 1);
         assert(execution->operator_spill_count == 0);
         assert(execution->spill_write_bytes == 0);
         assert(execution->spill_read_bytes == 0);
     } else {
-        /* The build relation cannot fit. It is radix-partitioned once, while
-         * each probe FIFO batch goes directly to its Flash partition. */
-        assert(execution->stream_input_batches == 3);
-        assert(execution->stream_input_rows == 3);
+        /* Neither side first forms a complete Batch: two build and three probe
+         * FIFO batches go directly to matching Flash partitions. */
+        assert(execution->stream_input_batches == 5);
+        assert(execution->stream_input_rows == 5);
         assert(execution->stream_input_peak_bytes == 40);
         assert(execution->stream_join_calls == 1);
         assert(execution->stream_join_batches == 3);
         assert(execution->stream_join_rows == 3);
         assert(execution->stream_join_build_bytes == 80);
         assert(execution->stream_join_partitioned_calls == 1);
+        assert(execution->stream_join_streamed_build_calls == 1);
+        assert(execution->stream_join_build_batches == 2);
+        assert(execution->stream_join_build_rows == 2);
+        /* Keys 1 and 5 collide at the planned four-way fan-out but split at
+         * eight ways, proving that actual build skew drives rebucketing. */
+        assert(execution->stream_join_build_repartition_passes == 1);
         assert(execution->operator_peak_bytes <= header.operator_bytes);
         assert(execution->operator_spill_count > 0);
         assert(execution->spill_write_bytes > 0);

@@ -888,6 +888,7 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 	{
 		const CsdExprSchema *left_schema;
 		const CsdExprSchema *right_schema;
+		List *build_metadata;
 
 		if (child_index != 2)
 			ereport(ERROR,
@@ -897,6 +898,12 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 			&child_results[1].schema : &child_results[0].schema;
 		right_schema = strcmp(name, "Right Hash Join") == 0 ?
 			&child_results[0].schema : &child_results[1].schema;
+		/* Join arg0 carries the planner's conservative build-side capacity.
+		 * The kernel uses it only to decide whether a sole Scan pipeline must
+		 * partition directly to Flash instead of first forming a complete Batch. */
+		build_metadata = (List *) list_nth(children,
+			strcmp(name, "Right Hash Join") == 0 ? 0 : 1);
+		node.arg0 = csd_wire_estimate(build_metadata, 9);
 		csd_wire_append_join_payload(builder, &node, metadata, name,
 			left_schema, right_schema);
 	}

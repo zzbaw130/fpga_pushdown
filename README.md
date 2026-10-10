@@ -166,6 +166,9 @@ Grace/radix 回退记录在
 当 build 超出 arena 时，probe Scan 逐 FIFO batch 直接写 Flash partition、用全局 ordinal
 保序 replay 的后续验证记录在
 [Join probe-to-Flash 验证](results/tpch_sf1_partition_probe_validation.md)。
+当 Join 两侧均为可融合的 Scan 流水链时，超大 build 也按 FIFO batch 直接写 Flash，
+并用实际 partition 字节自适应扩大 radix fan-out；Q3 32 MiB 的验证记录在
+[Join build-to-Flash 验证](results/tpch_sf1_streaming_build_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD

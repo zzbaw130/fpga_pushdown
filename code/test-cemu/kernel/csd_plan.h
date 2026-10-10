@@ -220,7 +220,7 @@ struct CsdSqlPlanNode {
     uint32_t output_schema_id;
     uint64_t estimated_rows;
     uint64_t estimated_bytes;
-    uint64_t arg0; /* LIMIT count; Aggregate conservative output bytes */
+    uint64_t arg0; /* LIMIT count; Aggregate output bytes; Join build bytes */
     uint64_t arg1;
     uint32_t reserved;
 } __attribute__((packed));
@@ -398,6 +398,11 @@ struct CsdSqlExecutionStatus {
     uint64_t stream_join_build_bytes;
     /* Subset of stream_join_calls whose build required Flash partitions. */
     uint64_t stream_join_partitioned_calls;
+    /* Direct Scan/FIFO build-side partition writer diagnostics. */
+    uint64_t stream_join_streamed_build_calls;
+    uint64_t stream_join_build_batches;
+    uint64_t stream_join_build_rows;
+    uint64_t stream_join_build_repartition_passes;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

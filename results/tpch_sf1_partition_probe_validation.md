@@ -1,5 +1,10 @@
 # SF=1 streaming Join probe-to-Flash validation
 
+> Historical milestone: the later
+> [two-sided streaming build validation](tpch_sf1_streaming_build_validation.md)
+> removes the complete build `Batch` for eligible two-sided Scan pipelines.
+> The measurements below remain the probe-only baseline.
+
 Date: 2026-10-10
 
 ## Scope

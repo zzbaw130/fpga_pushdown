@@ -116,12 +116,15 @@ each selection directly to Flash without a copied partition Batch. A direct
 non-DISTINCT global Aggregate consumes FIFO batches immediately. A grouped
 non-DISTINCT Aggregate does the same only when eight times PostgreSQL's
 resource-bound output estimate (carried in node `arg0`) fits the operator
-arena; unknown or larger states retain radix replay. Join build inputs,
-ineligible Aggregate plans, and final blocking outputs still accumulate in C++
-`Batch` objects. Eligible resident-build probe Scans are bounded consumers;
-when the complete build is oversized, each probe FIFO batch instead writes
-directly to the selected Flash partitions with a global replay ordinal. Sort
-merge intermediates are cursor-bounded.
+arena; unknown or larger states retain radix replay. Ineligible Join/Aggregate
+inputs and final blocking outputs still accumulate in C++ `Batch` objects.
+Eligible resident-build probe Scans are bounded consumers; when the build is
+oversized, each probe FIFO batch instead writes directly to the selected Flash
+partitions with a global replay ordinal. If both Join inputs are sole
+Scan/Filter/Project chains, Join `arg0` carries the conservative build capacity
+and an oversized build Scan also writes each FIFO batch directly to Flash.
+Actual partition bytes can double the initial radix fan-out before replay.
+Sort merge intermediates are cursor-bounded.
 Oversized grouped Aggregate state now
 radix-partitions input by the complete group key and replays each partition,
 including grouped DISTINCT and AVG; global Aggregate retains its protection
@@ -131,13 +134,13 @@ is released immediately after merge. Arena leases enforce the modeled CSD
 capacity. In addition, when a Join's right/build result actually fits the
 arena, the scheduler completes that subtree first and sends an eligible sole
 left `Scan -> [Filter/Project]` chain directly from the FIFO into one reused
-hash table. The complete probe Scan batch is eliminated. An oversized build is
-still materialized for exact fan-out/skew inspection, but probe batches are
-classified and serialized directly to Flash rather than accumulated first.
-End-to-end physical memory becomes hard-bounded only after an adaptive
-streaming build writer, spill-bound Aggregate paths and final outputs consume
-bounded batches, and real arena-backed container allocators replace the
-remaining C++ heap objects.
+hash table. The complete probe Scan batch is eliminated. For eligible
+two-sided Scan chains, an oversized build is likewise streamed into adaptive
+radix partitions; for other build subtrees it is still materialized for exact
+fan-out/skew inspection. End-to-end physical memory becomes hard-bounded only
+after handle metadata, spill-bound Aggregate paths, final outputs and ordinal
+reordering consume bounded storage, and real arena-backed container allocators
+replace the remaining C++ heap objects.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

@@ -110,6 +110,27 @@ struct SpillRowWriter {
           offset(0), reserved_length(0), cells_bytes(0), payload_bytes(0),
           chunk_capacity(0), initialized(false) {}
 };
+/* A direct Scan->[Filter/Project] build pipeline may finish before its probe
+ * Scan starts.  Keep only Flash record handles and exact per-partition byte
+ * totals across those two DAG steps; table rows never enter results[]. */
+struct StreamedJoinBuildState {
+    const CsdSqlJoinSpec *spec;
+    const CsdSqlJoinKey *keys;
+    uint16_t columns;
+    size_t partition_count;
+    bool scalar_key;
+    uint64_t rows;
+    uint64_t bytes;
+    std::vector<std::vector<SpillHandle> > handles;
+    std::vector<uint64_t> partition_bytes;
+    bool configured;
+    bool complete;
+    bool consumed;
+    StreamedJoinBuildState()
+        : spec(NULL), keys(NULL), columns(0), partition_count(0),
+          scalar_key(false), rows(0), bytes(0), configured(false),
+          complete(false), consumed(false) {}
+};
 struct FifoBatchHeader {
     uint32_t magic;
     uint32_t generation;
@@ -228,6 +249,8 @@ public:
     long long run()
     {
         if (!validate_plan()) return error_return();
+        streamed_join_builds_.clear();
+        streamed_join_builds_.resize(header_->node_count);
         std::vector<Batch> results(header_->node_count);
         std::vector<uint8_t> complete(header_->node_count, 0);
         std::vector<uint32_t> consumers(header_->node_count, 0);
@@ -677,6 +700,8 @@ private:
                 can_stream_aggregate(nodes_[aggregate_index]);
             const uint32_t join_index = streaming_join_target(index, pipeline,
                 consumers, sole_consumer);
+            const uint32_t build_join_index = streaming_join_build_target(
+                index, pipeline, consumers, sole_consumer);
             /* Actual build bytes, rather than a planner estimate, select a
              * resident hash or a Flash-partitioned build. A spillable
              * oversized build still consumes its probe Scan by FIFO batch. */
@@ -687,7 +712,10 @@ private:
                      operator_memory_capacity_ ||
                  (nodes_[join_index].flags & CSD_SQL_NODE_SPILLABLE));
             bool succeeded = false;
-            if (stream_sort)
+            if (build_join_index != CSD_SQL_INVALID_NODE)
+                succeeded = execute_scan_to_join_build(index, node, pipeline,
+                    build_join_index, nodes_[build_join_index], output);
+            else if (stream_sort)
                 succeeded = execute_scan_to_sort(index, node, pipeline, next,
                                                   nodes_[next], output);
             else if (stream_aggregate)
@@ -801,6 +829,47 @@ private:
             join.right_input == CSD_SQL_INVALID_NODE)
             return CSD_SQL_INVALID_NODE;
         return join_index;
+    }
+
+    uint32_t streaming_join_build_target(
+        uint32_t input, const std::vector<uint32_t> &pipeline,
+        const std::vector<uint32_t> &consumers,
+        const std::vector<uint32_t> &sole_consumer) const
+    {
+        const uint32_t tail = pipeline.empty() ? input : pipeline.back();
+        if (consumers[tail] != 1 ||
+            sole_consumer[tail] == CSD_SQL_INVALID_NODE)
+            return CSD_SQL_INVALID_NODE;
+        const uint32_t join_index = sole_consumer[tail];
+        const CsdSqlPlanNode &join = nodes_[join_index];
+        if ((join.opcode != CSD_SQL_OP_HASH_JOIN &&
+             join.opcode != CSD_SQL_OP_MERGE_JOIN) ||
+            join.right_input != tail ||
+            join.left_input == CSD_SQL_INVALID_NODE ||
+            !has_streaming_scan_source(join.left_input, consumers,
+                                       sole_consumer) ||
+            !(join.flags & CSD_SQL_NODE_SPILLABLE) ||
+            join.arg0 <= operator_memory_capacity_)
+            return CSD_SQL_INVALID_NODE;
+        return join_index;
+    }
+
+    bool has_streaming_scan_source(
+        uint32_t tail, const std::vector<uint32_t> &consumers,
+        const std::vector<uint32_t> &sole_consumer) const
+    {
+        uint32_t current = tail;
+        while (current != CSD_SQL_INVALID_NODE &&
+               (nodes_[current].opcode == CSD_SQL_OP_FILTER ||
+                nodes_[current].opcode == CSD_SQL_OP_PROJECT)) {
+            const uint32_t input = nodes_[current].left_input;
+            if (input == CSD_SQL_INVALID_NODE || consumers[input] != 1 ||
+                sole_consumer[input] != current)
+                return false;
+            current = input;
+        }
+        return current != CSD_SQL_INVALID_NODE &&
+               nodes_[current].opcode == CSD_SQL_OP_SCAN;
     }
 
 #include "csd_fifo.cc"
@@ -938,6 +1007,7 @@ private:
     uint32_t fifo_generation_;
     uint64_t operator_memory_capacity_;
     uint64_t operator_memory_used_;
+    std::vector<StreamedJoinBuildState> streamed_join_builds_;
     pthread_key_t worker_budget_key_;
     bool worker_budget_key_valid_;
     CsdSqlExecutionStatus status_;
