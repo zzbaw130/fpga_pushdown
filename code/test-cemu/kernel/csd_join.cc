@@ -100,38 +100,51 @@
         return true;
     }
 
-    /* Build/probe one in-memory partition. A tagged left row has a private
-     * ordinal in its final column; residual expressions never see that tag. */
-    bool execute_join_core(uint32_t index, const CsdSqlJoinSpec &spec,
-                           const CsdSqlJoinKey *keys, const Batch &left,
-                           const Batch &right, Batch *output, bool nested_loop,
-                           bool tagged_left)
-    {
-        const bool scalar_key = join_uses_scalar_key(left, right, keys,
-                                                      spec.key_count, nested_loop);
+    struct JoinHashState {
+        bool scalar_key;
         std::unordered_map<std::string, std::vector<size_t> > hash_table;
-        std::unordered_map<ScalarJoinKey, std::vector<size_t>, ScalarJoinKeyHash>
-            scalar_hash_table;
-        if (!nested_loop) {
-            if (scalar_key) {
-                scalar_hash_table.reserve(right.rows.size());
-                for (size_t row_index = 0; row_index < right.rows.size(); ++row_index) {
-                    ScalarJoinKey key;
-                    if (make_scalar_join_key(right.rows[row_index], keys[0], false, &key))
-                        scalar_hash_table[key].push_back(row_index);
-                }
-            } else {
-                hash_table.reserve(right.rows.size());
-                for (size_t row_index = 0; row_index < right.rows.size(); ++row_index) {
-                    std::string key;
-                    if (make_join_key(right.rows[row_index], keys, spec.key_count, false, &key))
-                        hash_table[key].push_back(row_index);
-                }
+        std::unordered_map<ScalarJoinKey, std::vector<size_t>,
+                           ScalarJoinKeyHash> scalar_hash_table;
+        JoinHashState() : scalar_key(false) {}
+    };
+
+    void build_join_hash(const Batch &left, const Batch &right,
+                         const CsdSqlJoinKey *keys, uint16_t key_count,
+                         bool nested_loop, JoinHashState *state)
+    {
+        state->scalar_key = join_uses_scalar_key(left, right, keys,
+                                                 key_count, nested_loop);
+        if (nested_loop) return;
+        if (state->scalar_key) {
+            state->scalar_hash_table.reserve(right.rows.size());
+            for (size_t row_index = 0; row_index < right.rows.size();
+                 ++row_index) {
+                ScalarJoinKey key;
+                if (make_scalar_join_key(right.rows[row_index], keys[0],
+                                         false, &key))
+                    state->scalar_hash_table[key].push_back(row_index);
+            }
+        } else {
+            state->hash_table.reserve(right.rows.size());
+            for (size_t row_index = 0; row_index < right.rows.size();
+                 ++row_index) {
+                std::string key;
+                if (make_join_key(right.rows[row_index], keys, key_count,
+                                  false, &key))
+                    state->hash_table[key].push_back(row_index);
             }
         }
+    }
+
+    bool execute_join_probe(uint32_t index, const CsdSqlJoinSpec &spec,
+                            const CsdSqlJoinKey *keys, const Batch &left,
+                            const Batch &right, const JoinHashState &state,
+                            Batch *output, bool nested_loop, bool tagged_left)
+    {
         if (tagged_left && left.columns == 0)
             return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x401);
-        const uint16_t logical_left_columns = left.columns - (tagged_left ? 1 : 0);
+        const uint16_t logical_left_columns = left.columns -
+                                              (tagged_left ? 1 : 0);
         const bool only_left = spec.join_kind == CSD_SQL_JOIN_SEMI ||
                                spec.join_kind == CSD_SQL_JOIN_ANTI;
         output->columns = logical_left_columns + (only_left ? 0 : right.columns) +
@@ -150,40 +163,49 @@
             std::vector<EvalValue> expression_stack;
             if (nested_loop) {
                 nested_candidates.reserve(right.rows.size());
-                for (size_t candidate = 0; candidate < right.rows.size(); ++candidate)
+                for (size_t candidate = 0; candidate < right.rows.size();
+                     ++candidate)
                     nested_candidates.push_back(candidate);
             }
             for (size_t left_index = begin; left_index < end; ++left_index) {
                 const Row &left_row = left.rows[left_index];
                 const std::vector<size_t> *candidates = &no_candidates;
-                if (nested_loop) candidates = &nested_candidates;
-                else if (scalar_key) {
+                if (nested_loop) {
+                    candidates = &nested_candidates;
+                } else if (state.scalar_key) {
                     ScalarJoinKey key;
                     if (make_scalar_join_key(left_row, keys[0], true, &key)) {
                         std::unordered_map<ScalarJoinKey, std::vector<size_t>,
                             ScalarJoinKeyHash>::const_iterator found =
-                            scalar_hash_table.find(key);
-                        if (found != scalar_hash_table.end()) candidates = &found->second;
+                            state.scalar_hash_table.find(key);
+                        if (found != state.scalar_hash_table.end())
+                            candidates = &found->second;
                     }
                 } else {
                     std::string key;
-                    if (make_join_key(left_row, keys, spec.key_count, true, &key)) {
-                        std::unordered_map<std::string, std::vector<size_t> >::const_iterator
-                            found = hash_table.find(key);
-                        if (found != hash_table.end()) candidates = &found->second;
+                    if (make_join_key(left_row, keys, spec.key_count, true,
+                                      &key)) {
+                        std::unordered_map<std::string,
+                            std::vector<size_t> >::const_iterator found =
+                            state.hash_table.find(key);
+                        if (found != state.hash_table.end())
+                            candidates = &found->second;
                     }
                 }
                 const Value *ordinal = tagged_left ? &left_row.back() : NULL;
                 Row logical_left(left_row.begin(),
                                  left_row.begin() + logical_left_columns);
                 bool matched = false;
-                for (std::vector<size_t>::const_iterator candidate = candidates->begin();
-                     candidate != candidates->end(); ++candidate) {
+                for (std::vector<size_t>::const_iterator candidate =
+                         candidates->begin(); candidate != candidates->end();
+                     ++candidate) {
                     if (nested_loop && spec.key_count != 0) {
                         bool equal = true;
                         for (uint16_t key = 0; key < spec.key_count; ++key) {
-                            const Value &left_value = left_row[keys[key].left_key];
-                            const Value &right_value = right.rows[*candidate][keys[key].right_key];
+                            const Value &left_value =
+                                left_row[keys[key].left_key];
+                            const Value &right_value =
+                                right.rows[*candidate][keys[key].right_key];
                             if (left_value.is_null || right_value.is_null ||
                                 compare_value(left_value, right_value) != 0) {
                                 equal = false;
@@ -193,11 +215,14 @@
                         if (!equal) continue;
                     }
                     Row joined_row = logical_left;
-                    joined_row.insert(joined_row.end(), right.rows[*candidate].begin(),
-                                      right.rows[*candidate].end());
+                    joined_row.insert(joined_row.end(),
+                        right.rows[*candidate].begin(),
+                        right.rows[*candidate].end());
                     bool residual_match = false;
-                    if (!join_residual_matches(index, spec, joined_row, &residual_match,
-                                               &expression_stack)) return;
+                    if (!join_residual_matches(index, spec, joined_row,
+                                               &residual_match,
+                                               &expression_stack))
+                        return;
                     if (!residual_match) continue;
                     matched = true;
                     if (spec.join_kind == CSD_SQL_JOIN_SEMI) {
@@ -224,13 +249,164 @@
         size_t output_rows = 0;
         for (size_t tile = 0; tile < tiles; ++tile)
             output_rows += joined[tile].rows.size();
-        output->rows.reserve(output_rows);
+        output->rows.reserve(output->rows.size() + output_rows);
         for (size_t tile = 0; tile < tiles; ++tile) {
             if (!joined_ok[tile]) return false;
             output->rows.insert(output->rows.end(),
                 std::make_move_iterator(joined[tile].rows.begin()),
                 std::make_move_iterator(joined[tile].rows.end()));
         }
+        return true;
+    }
+
+    /* Build/probe one in-memory partition. A tagged left row has a private
+     * ordinal in its final column; residual expressions never see that tag. */
+    bool execute_join_core(uint32_t index, const CsdSqlJoinSpec &spec,
+                           const CsdSqlJoinKey *keys, const Batch &left,
+                           const Batch &right, Batch *output, bool nested_loop,
+                           bool tagged_left)
+    {
+        JoinHashState state;
+        build_join_hash(left, right, keys, spec.key_count, nested_loop,
+                        &state);
+        return execute_join_probe(index, spec, keys, left, right, state,
+                                  output, nested_loop, tagged_left);
+    }
+
+    struct StreamingJoinState {
+        const CsdSqlJoinSpec *spec;
+        const CsdSqlJoinKey *keys;
+        const Batch *right;
+        JoinHashState hash;
+        uint64_t held_bytes;
+        uint64_t input_rows;
+        bool configured;
+        StreamingJoinState()
+            : spec(NULL), keys(NULL), right(NULL), held_bytes(0),
+              input_rows(0), configured(false) {}
+    };
+
+    bool configure_streaming_join(uint32_t index,
+                                  const CsdSqlPlanNode &node,
+                                  const Batch &left,
+                                  const Batch &right,
+                                  Batch *output,
+                                  StreamingJoinState *state)
+    {
+        if (state->configured) {
+            const bool only_left =
+                state->spec->join_kind == CSD_SQL_JOIN_SEMI ||
+                state->spec->join_kind == CSD_SQL_JOIN_ANTI;
+            const uint16_t expected_columns =
+                left.columns + (only_left ? 0 : right.columns);
+            if (state->right == &right &&
+                output->columns == expected_columns)
+                return true;
+            return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x410);
+        }
+        const CsdSqlJoinSpec *spec = NULL;
+        uint64_t key_bytes = 0;
+        if (!expression_as(node, sizeof(CsdSqlJoinSpec), &spec) ||
+            !checked_mul(spec->key_count, sizeof(CsdSqlJoinKey),
+                         &key_bytes) ||
+            node.expression_length < sizeof(CsdSqlJoinSpec) + key_bytes ||
+            spec->join_kind < CSD_SQL_JOIN_INNER ||
+            spec->join_kind > CSD_SQL_JOIN_ANTI ||
+            spec->key_count == 0 ||
+            (spec->residual_length != 0 &&
+             !blob_range(spec->residual_offset, spec->residual_length)))
+            return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index, 0x411);
+        const CsdSqlJoinKey *keys =
+            reinterpret_cast<const CsdSqlJoinKey *>(spec + 1);
+        for (uint16_t key = 0; key < spec->key_count; ++key)
+            if (keys[key].left_key >= left.columns ||
+                keys[key].right_key >= right.columns)
+                return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index, 0x412);
+        const uint64_t right_bytes = batch_bytes(right);
+        if (right_bytes > operator_memory_capacity_ ||
+            !wait_acquire_operator_memory(right_bytes))
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x413);
+        state->held_bytes = right_bytes;
+        state->spec = spec;
+        state->keys = keys;
+        state->right = &right;
+        build_join_hash(left, right, keys, spec->key_count, false,
+                        &state->hash);
+        const bool only_left = spec->join_kind == CSD_SQL_JOIN_SEMI ||
+                               spec->join_kind == CSD_SQL_JOIN_ANTI;
+        output->columns = left.columns + (only_left ? 0 : right.columns);
+        state->configured = true;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_join_calls;
+            status_.stream_join_build_bytes += right_bytes;
+        }
+        return true;
+    }
+
+    void release_streaming_join_memory(StreamingJoinState *state)
+    {
+        if (state->held_bytes != 0) {
+            release_operator_memory(state->held_bytes);
+            state->held_bytes = 0;
+        }
+    }
+
+    bool consume_streaming_join_batch(uint32_t index,
+                                      const CsdSqlPlanNode &node,
+                                      Batch &left,
+                                      const Batch &right,
+                                      Batch *output,
+                                      StreamingJoinState *state)
+    {
+        if (!configure_streaming_join(index, node, left, right, output,
+                                      state))
+            return false;
+        if (!execute_join_probe(index, *state->spec, state->keys, left,
+                                right, state->hash, output, false, false))
+            return false;
+        state->input_rows += left.rows.size();
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_join_batches;
+            status_.stream_join_rows += left.rows.size();
+        }
+        return true;
+    }
+
+    bool execute_scan_to_join(uint32_t scan_index,
+                              const CsdSqlPlanNode &scan_node,
+                              const std::vector<uint32_t> &pipeline,
+                              uint32_t join_index,
+                              const CsdSqlPlanNode &join_node,
+                              const Batch &right,
+                              Batch *output)
+    {
+        StreamingJoinState state;
+        Batch discarded;
+        std::function<bool(Batch &)> consumer = [&](Batch &batch) {
+            return consume_streaming_join_batch(join_index, join_node, batch,
+                                                right, output, &state);
+        };
+        if (!execute_scan(scan_index, scan_node, &discarded, &pipeline,
+                          &consumer)) {
+            release_streaming_join_memory(&state);
+            return false;
+        }
+        if (!state.configured &&
+            !configure_streaming_join(join_index, join_node, discarded,
+                                      right, output, &state)) {
+            release_streaming_join_memory(&state);
+            return false;
+        }
+        uint64_t input_rows = 0, with_output = 0;
+        if (!checked_add(state.input_rows, right.rows.size(), &input_rows) ||
+            !checked_add(input_rows, output->rows.size(), &with_output))
+            with_output = std::numeric_limits<uint64_t>::max();
+        add_cycles(with_output, join_node);
+        if (join_node.opcode == CSD_SQL_OP_MERGE_JOIN)
+            add_canonicalized_node();
+        release_streaming_join_memory(&state);
         return true;
     }
 

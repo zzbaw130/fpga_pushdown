@@ -156,6 +156,13 @@ Hash Join 的 radix 分区、Flash replay 和低内存 build lease 记录在
 [SF=1 Join spill replay 验证](results/tpch_sf1_join_spill_replay_validation.md)。
 分组 Aggregate（含 grouped `DISTINCT`/`AVG`）的递归 radix replay 记录在
 [SF=1 Aggregate spill replay 验证](results/tpch_sf1_aggregate_spill_replay_validation.md)。
+Scan/FIFO 直连 external Sort、cursor merge 与保守准入的流式 Aggregate 分别记录在
+[Scan-to-Sort 验证](results/tpch_sf1_streaming_sort_validation.md)、
+[Sort cursor merge 验证](results/tpch_sf1_cursor_merge_validation.md) 和
+[Scan-to-Aggregate 验证](results/tpch_sf1_streaming_aggregate_validation.md)。
+右侧 build 驻留、左侧 Scan/FIFO 逐批 probe 的 one-sided streaming Join 及其低内存
+Grace/radix 回退记录在
+[Scan-to-Join 验证](results/tpch_sf1_streaming_join_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD

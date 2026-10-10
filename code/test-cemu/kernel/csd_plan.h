@@ -392,6 +392,10 @@ struct CsdSqlExecutionStatus {
     uint64_t spill_cursor_peak_bytes;
     uint64_t spill_writer_peak_bytes;
     uint64_t sort_merge_rows;
+    uint64_t stream_join_calls;
+    uint64_t stream_join_batches;
+    uint64_t stream_join_rows;
+    uint64_t stream_join_build_bytes;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

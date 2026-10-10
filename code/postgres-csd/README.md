@@ -116,18 +116,24 @@ each selection directly to Flash without a copied partition Batch. A direct
 non-DISTINCT global Aggregate consumes FIFO batches immediately. A grouped
 non-DISTINCT Aggregate does the same only when eight times PostgreSQL's
 resource-bound output estimate (carried in node `arg0`) fits the operator
-arena; unknown or larger states retain radix replay. Scan inputs to Join and
-ineligible Aggregate plans, plus final blocking outputs, still accumulate in
-C++ `Batch` objects, while Sort merge intermediates are cursor-bounded.
+arena; unknown or larger states retain radix replay. Join build inputs,
+oversized-build probe inputs, ineligible Aggregate plans, and final blocking
+outputs still accumulate in C++ `Batch` objects, while eligible resident-build
+probe Scans and Sort merge intermediates are bounded consumers.
 Oversized grouped Aggregate state now
 radix-partitions input by the complete group key and replays each partition,
 including grouped DISTINCT and AVG; global Aggregate retains its protection
 copy. Grouped state is accounted during construction and switches to radix
 spill as soon as it crosses the modeled arena threshold; per-lane partial state
 is released immediately after merge. Arena leases enforce the modeled CSD
-capacity, but end-to-end physical memory becomes hard-bounded only after
-Join and spill-bound Aggregate paths consume Scan batches directly and real
-arena-backed container allocators replace the remaining C++ heap objects.
+capacity. In addition, when a Join's right/build result actually fits the
+arena, the scheduler completes that subtree first and sends an eligible sole
+left `Scan -> [Filter/Project]` chain directly from the FIFO into one reused
+hash table. The complete probe Scan batch is eliminated; oversized builds
+retain the complete-input radix/Grace path. End-to-end physical memory becomes
+hard-bounded only after both-side Join/partition writers, spill-bound Aggregate
+paths and final outputs consume bounded batches, and real arena-backed
+container allocators replace the remaining C++ heap objects.
 
 Run all supplied TPC-H planner cases with `tests/test_csd_planner.sh`.  In
 forced mode the test permits a PostgreSQL `Limit` control node above a

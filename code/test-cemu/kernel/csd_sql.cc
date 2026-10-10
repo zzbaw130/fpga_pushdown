@@ -242,8 +242,23 @@ public:
         uint32_t completed = 0;
         while (completed < header_->node_count) {
             std::vector<uint32_t> ready;
-            for (uint32_t index = 0; index < header_->node_count; ++index)
-                if (!complete[index] && node_ready(nodes_[index], complete)) ready.push_back(index);
+            for (uint32_t index = 0; index < header_->node_count; ++index) {
+                if (complete[index] || !node_ready(nodes_[index], complete))
+                    continue;
+                if (nodes_[index].opcode == CSD_SQL_OP_SCAN) {
+                    const std::vector<uint32_t> pipeline = stateless_pipeline(
+                        index, consumers, sole_consumer);
+                    const uint32_t join_index = streaming_join_target(index,
+                        pipeline, consumers, sole_consumer);
+                    /* A resident-build Join consumes its sole probe Scan
+                     * directly. Resolve the build subtree first; nested Join
+                     * trees apply the same rule recursively. */
+                    if (join_index != CSD_SQL_INVALID_NODE &&
+                        !complete[nodes_[join_index].right_input])
+                        continue;
+                }
+                ready.push_back(index);
+            }
             if (ready.empty()) {
                 fail(CSD_SQL_STATUS_BAD_NODE, CSD_SQL_INVALID_NODE);
                 return error_return();
@@ -251,7 +266,8 @@ public:
             std::vector<uint8_t> success(ready.size(), 0);
             run_ready_nodes(ready, [&](size_t slot) {
                 success[slot] = execute_node(ready[slot], &results[ready[slot]], results,
-                                             consumers, sole_consumer, precomputed) ? 1 : 0;
+                                             complete, consumers, sole_consumer,
+                                             precomputed) ? 1 : 0;
             });
             for (size_t slot = 0; slot < ready.size(); ++slot) {
                 if (!success[slot]) return error_return();
@@ -579,12 +595,14 @@ private:
     };
 
     bool execute_node(uint32_t index, Batch *output, std::vector<Batch> &results,
+                      const std::vector<uint8_t> &complete,
                       const std::vector<uint32_t> &consumers,
                       const std::vector<uint32_t> &sole_consumer,
                       std::vector<uint8_t> &precomputed)
     {
         const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
-        const bool succeeded = execute_node_impl(index, output, results, consumers,
+        const bool succeeded = execute_node_impl(index, output, results,
+                                                 complete, consumers,
                                                  sole_consumer, precomputed);
         const uint64_t elapsed_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -606,6 +624,7 @@ private:
     }
 
     bool execute_node_impl(uint32_t index, Batch *output, std::vector<Batch> &results,
+                           const std::vector<uint8_t> &complete,
                            const std::vector<uint32_t> &consumers,
                            const std::vector<uint32_t> &sole_consumer,
                            std::vector<uint8_t> &precomputed)
@@ -656,6 +675,16 @@ private:
             const bool stream_aggregate =
                 aggregate_index != CSD_SQL_INVALID_NODE &&
                 can_stream_aggregate(nodes_[aggregate_index]);
+            const uint32_t join_index = streaming_join_target(index, pipeline,
+                consumers, sole_consumer);
+            /* Actual build bytes, rather than a planner estimate, are the
+             * admission guard. Oversized builds retain the complete-input
+             * radix/Grace path below. */
+            const bool stream_join = join_index != CSD_SQL_INVALID_NODE &&
+                complete[nodes_[join_index].right_input] &&
+                batch_bytes(input_batch(nodes_[join_index].right_input,
+                                        results)) <=
+                    operator_memory_capacity_;
             bool succeeded = false;
             if (stream_sort)
                 succeeded = execute_scan_to_sort(index, node, pipeline, next,
@@ -665,6 +694,11 @@ private:
                     aggregate_index, nodes_[aggregate_index],
                     aggregate_project == CSD_SQL_INVALID_NODE ? NULL :
                         &nodes_[aggregate_project], output);
+            else if (stream_join)
+                succeeded = execute_scan_to_join(index, node, pipeline,
+                    join_index, nodes_[join_index],
+                    input_batch(nodes_[join_index].right_input, results),
+                    output);
             else
                 succeeded = execute_scan(index, node, output, &pipeline);
             if (succeeded) {
@@ -677,6 +711,7 @@ private:
                         precomputed[aggregate_project] = 1;
                     precomputed[aggregate_index] = 1;
                 }
+                if (stream_join) precomputed[join_index] = 1;
             }
             return succeeded;
         }
@@ -746,6 +781,25 @@ private:
             current = next;
         }
         return pipeline;
+    }
+
+    uint32_t streaming_join_target(
+        uint32_t input, const std::vector<uint32_t> &pipeline,
+        const std::vector<uint32_t> &consumers,
+        const std::vector<uint32_t> &sole_consumer) const
+    {
+        const uint32_t tail = pipeline.empty() ? input : pipeline.back();
+        if (consumers[tail] != 1 ||
+            sole_consumer[tail] == CSD_SQL_INVALID_NODE)
+            return CSD_SQL_INVALID_NODE;
+        const uint32_t join_index = sole_consumer[tail];
+        const CsdSqlPlanNode &join = nodes_[join_index];
+        if ((join.opcode != CSD_SQL_OP_HASH_JOIN &&
+             join.opcode != CSD_SQL_OP_MERGE_JOIN) ||
+            join.left_input != tail ||
+            join.right_input == CSD_SQL_INVALID_NODE)
+            return CSD_SQL_INVALID_NODE;
+        return join_index;
     }
 
 #include "csd_fifo.cc"
