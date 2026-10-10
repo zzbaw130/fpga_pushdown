@@ -68,6 +68,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `8fbe3622a` | two-sided Scan Join build-to-Flash、自适应 fan-out、32 MiB Q3 与 22/22 回归 |
 | `218ba67a3` | streamed Join Flash handle-chain、Q3 常驻描述符 1,024 B 与 22/22 回归 |
 | `9ffae8781` | partitioned Join binary-carry ordinal merge、Q3 常驻 handle 150 B 与 22/22 回归 |
+| `7ce97b472` | partitioned Join 逐行扇出输出、Q3 pending peak 598,680 B 与 22/22 回归 |
 
 ## 3. 环境不变量
 
