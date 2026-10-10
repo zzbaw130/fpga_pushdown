@@ -169,6 +169,9 @@ Grace/radix 回退记录在
 当 Join 两侧均为可融合的 Scan 流水链时，超大 build 也按 FIFO batch 直接写 Flash，
 并用实际 partition 字节自适应扩大 radix fan-out；Q3 32 MiB 的验证记录在
 [Join build-to-Flash 验证](results/tpch_sf1_streaming_build_validation.md)。
+两侧流式 Join 的每条 resident handle 进一步改为 Flash 反向链表，内存中只保留每个
+radix partition 的固定链头；Q3 32 MiB 与完整回归记录在
+[Join spill-chain 验证](results/tpch_sf1_spill_chain_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD

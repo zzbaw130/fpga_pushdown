@@ -790,6 +790,9 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         assert(execution->stream_join_build_batches == 0);
         assert(execution->stream_join_build_rows == 0);
         assert(execution->stream_join_build_repartition_passes == 0);
+        assert(execution->stream_join_chain_records == 0);
+        assert(execution->stream_join_chain_record_reads == 0);
+        assert(execution->stream_join_chain_peak_bytes == 0);
         assert(execution->operator_peak_bytes == 80);
         assert(execution->operator_allocations == 1);
         assert(execution->operator_spill_count == 0);
@@ -812,8 +815,12 @@ void test_streaming_scan_join_probe_batches(bool fit_build)
         /* Keys 1 and 5 collide at the planned four-way fan-out but split at
          * eight ways, proving that actual build skew drives rebucketing. */
         assert(execution->stream_join_build_repartition_passes == 1);
+        assert(execution->stream_join_chain_records == 7);
+        assert(execution->stream_join_chain_record_reads == 7);
+        /* Eight build and eight probe partition heads, 16 bytes each. */
+        assert(execution->stream_join_chain_peak_bytes == 256);
         assert(execution->operator_peak_bytes <= header.operator_bytes);
-        assert(execution->operator_spill_count > 0);
+        assert(execution->operator_spill_count == 7);
         assert(execution->spill_write_bytes > 0);
         assert(execution->spill_read_bytes > 0);
     }

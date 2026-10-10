@@ -1200,7 +1200,7 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 			uint32 opcode;
 
 			ereport(NOTICE,
-					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f flash_read_bytes=%llu flash_write_bytes=%llu input_chunks=%llu spill_write_bytes=%llu spill_read_bytes=%llu fifo_batches=%llu fifo_write_bytes=%llu fifo_read_bytes=%llu fdm_reserved_bytes=%llu operator_memory_bytes=%llu operator_peak_bytes=%llu operator_allocations=%llu operator_spill_count=%llu stream_input_batches=%llu stream_input_rows=%llu stream_input_peak_bytes=%llu spill_cursor_peak_bytes=%llu spill_writer_peak_bytes=%llu sort_merge_rows=%llu stream_join_calls=%llu stream_join_batches=%llu stream_join_rows=%llu stream_join_build_bytes=%llu stream_join_partitioned_calls=%llu stream_join_streamed_build_calls=%llu stream_join_build_batches=%llu stream_join_build_rows=%llu stream_join_build_repartition_passes=%llu",
+					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f flash_read_bytes=%llu flash_write_bytes=%llu input_chunks=%llu spill_write_bytes=%llu spill_read_bytes=%llu fifo_batches=%llu fifo_write_bytes=%llu fifo_read_bytes=%llu fdm_reserved_bytes=%llu operator_memory_bytes=%llu operator_peak_bytes=%llu operator_allocations=%llu operator_spill_count=%llu stream_input_batches=%llu stream_input_rows=%llu stream_input_peak_bytes=%llu spill_cursor_peak_bytes=%llu spill_writer_peak_bytes=%llu sort_merge_rows=%llu stream_join_calls=%llu stream_join_batches=%llu stream_join_rows=%llu stream_join_build_bytes=%llu stream_join_partitioned_calls=%llu stream_join_streamed_build_calls=%llu stream_join_build_batches=%llu stream_join_build_rows=%llu stream_join_build_repartition_passes=%llu stream_join_chain_records=%llu stream_join_chain_record_reads=%llu stream_join_chain_peak_bytes=%llu",
 							(unsigned long long) status.operator_calls[CSD_SQL_OP_SCAN],
 							(double) status.operator_ns[CSD_SQL_OP_SCAN] / 1000000.0,
 							(unsigned long long) status.flash_read_bytes,
@@ -1230,7 +1230,10 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 							(unsigned long long) status.stream_join_streamed_build_calls,
 							(unsigned long long) status.stream_join_build_batches,
 							(unsigned long long) status.stream_join_build_rows,
-							(unsigned long long) status.stream_join_build_repartition_passes)));
+							(unsigned long long) status.stream_join_build_repartition_passes,
+							(unsigned long long) status.stream_join_chain_records,
+							(unsigned long long) status.stream_join_chain_record_reads,
+							(unsigned long long) status.stream_join_chain_peak_bytes)));
 
 			for (opcode = CSD_SQL_OP_SCAN; opcode < CSD_SQL_PROFILE_SLOTS; ++opcode)
 				if (status.operator_calls[opcode] != 0)

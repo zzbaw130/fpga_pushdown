@@ -232,6 +232,15 @@ The build optimization is admitted only when the probe tail can be walked back
 through sole Filter/Project nodes to a Scan; a Join-produced probe therefore
 keeps its complete build result for the normal executor.
 
+Streamed build and probe records do not retain one controller-memory handle
+per nonempty batch selection. Each data record is followed by a packed
+40-byte backwards-link record in query-local Flash. A partition retains only
+the 16-byte tail offset and record count needed for bounded traversal. Reverse
+traversal is semantically safe because build insertion order is unobservable
+and probe records carry global ordinals before the final stable reorder.
+Adaptive repartition writes a new chain; its obsolete data and link records
+remain charged to the current query's scratch capacity until query teardown.
+
 Grouped Aggregate uses the same handle/replay infrastructure. All rows for a
 group are assigned to one radix partition, so `DISTINCT` sets and AVG's
 sum/count pair never require cross-partition reconciliation. Hash collisions
@@ -259,9 +268,10 @@ current FIFO batch plus one resident build, but the Join output still
 materializes. With an oversized build, the probe Scan is batch-bounded and
 writes directly to Flash. An eligible two-sided Scan shape also streams the
 build without a complete build `Batch`; other build subtrees still materialize
-for exact fan-out/skew classification. Per-record handle metadata grows with
-nonempty batch selections on either streamed side, and adaptive repartitioning
-appends replacement records without reclaiming old query scratch extents.
+for exact fan-out/skew classification. Streamed Join handle payload is bounded
+by the radix partition count because per-record metadata is Flash-linked;
+adaptive repartitioning still appends replacement records without reclaiming
+old query scratch extents.
 Ineligible Aggregate inputs still
 accumulate before their radix writers run. The final Sort/Aggregate output is
 also reconstructed as a C++ `Batch`. Aggregate and Hash Join no
@@ -269,8 +279,7 @@ longer copy partition rows: their selection writer serializes source ordinals
 directly through the bounded FDM staging range, and Join probe replay is
 chunked by that same limit. The aggregate threshold bounds its modeled state,
 but the table and cursor chunks still use ordinary C++ containers rather than
-allocators carved from the FDM arena. Bounded partition-handle management,
-streaming Aggregate partition writers,
+allocators carved from the FDM arena. Streaming Aggregate partition writers,
 bounded output/reorder consumers and arena-backed containers are needed for a
 strict physical FDM-only bound.
 Serialized spill records reside in real NVM scratch extents.

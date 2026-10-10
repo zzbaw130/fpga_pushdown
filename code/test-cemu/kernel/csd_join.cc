@@ -155,6 +155,16 @@
              right.rows[0][keys[0].right_key].type != CSD_SQL_TYPE_BYTES);
     }
 
+    void note_join_chain_memory(size_t chain_count)
+    {
+        uint64_t bytes = 0;
+        if (!checked_mul(chain_count, sizeof(SpillHandleChain), &bytes))
+            bytes = std::numeric_limits<uint64_t>::max();
+        std::lock_guard<std::mutex> status_guard(status_mutex_);
+        status_.stream_join_chain_peak_bytes = std::max<uint64_t>(
+            status_.stream_join_chain_peak_bytes, bytes);
+    }
+
     bool configure_streamed_join_build(uint32_t index,
                                        const CsdSqlPlanNode &node,
                                        const Batch &right,
@@ -196,8 +206,9 @@
         state->partition_count = partition_count;
         state->scalar_key = join_build_uses_scalar_key(
             right, keys, spec->key_count);
-        state->handles.resize(partition_count);
+        state->chains.resize(partition_count);
         state->partition_bytes.assign(partition_count, 0);
+        note_join_chain_memory(partition_count);
         state->configured = true;
         return true;
     }
@@ -239,7 +250,9 @@
             if (!spill_selected_rows(index, right, selected[partition], false,
                                      &handle))
                 return false;
-            state->handles[partition].push_back(handle);
+            if (!append_spill_chain_handle(index, handle,
+                                           &state->chains[partition]))
+                return false;
             if (!checked_add(state->partition_bytes[partition],
                              selected_bytes[partition],
                              &state->partition_bytes[partition]))
@@ -278,15 +291,15 @@
                 std::lock_guard<std::mutex> status_guard(status_mutex_);
                 ++status_.stream_join_build_repartition_passes;
             }
-            std::vector<std::vector<SpillHandle> > next_handles(next_count);
+            std::vector<SpillHandleChain> next_chains(next_count);
             std::vector<uint64_t> next_bytes(next_count, 0);
+            note_join_chain_memory(next_count);
             for (size_t partition = 0; partition < state->partition_count;
                  ++partition) {
-                for (std::vector<SpillHandle>::const_iterator handle =
-                         state->handles[partition].begin();
-                     handle != state->handles[partition].end(); ++handle) {
+                if (!for_each_spill_chain_handle(index,
+                        state->chains[partition], [&](const SpillHandle &handle) {
                     Batch batch;
-                    if (!read_spill_batch(index, *handle, &batch) ||
+                    if (!read_spill_batch(index, handle, &batch) ||
                         batch.columns != state->columns)
                         return false;
                     std::vector<std::vector<size_t> > selected(next_count);
@@ -316,17 +329,20 @@
                                 selected[next_partition], false,
                                 &next_handle))
                             return false;
-                        next_handles[next_partition].push_back(next_handle);
+                        if (!append_spill_chain_handle(index, next_handle,
+                                &next_chains[next_partition]))
+                            return false;
                         if (!checked_add(next_bytes[next_partition],
                                 selected_bytes[next_partition],
                                 &next_bytes[next_partition]))
                             return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
                                         0x42b);
                     }
-                }
+                    return true;
+                })) return false;
             }
             state->partition_count = next_count;
-            state->handles.swap(next_handles);
+            state->chains.swap(next_chains);
             state->partition_bytes.swap(next_bytes);
         }
     }
@@ -661,8 +677,8 @@
         size_t partition_count;
         bool scalar_key;
         uint64_t input_rows;
-        std::vector<std::vector<SpillHandle> > right_handles;
-        std::vector<std::vector<SpillHandle> > left_handles;
+        std::vector<SpillHandleChain> right_chains;
+        std::vector<SpillHandleChain> left_chains;
         std::vector<OrderedJoinRow> ordered;
         bool configured;
         StreamingPartitionedJoinState()
@@ -718,8 +734,9 @@
                                              &right_partition_rows))
             return false;
 
-        state->right_handles.resize(partition_count);
-        state->left_handles.resize(partition_count);
+        state->right_chains.resize(partition_count);
+        state->left_chains.resize(partition_count);
+        note_join_chain_memory(partition_count * 2);
         for (size_t partition = 0; partition < partition_count;
              ++partition) {
             if (!right_partition_rows[partition].empty()) {
@@ -728,7 +745,9 @@
                                          right_partition_rows[partition], false,
                                          &handle))
                     return false;
-                state->right_handles[partition].push_back(handle);
+                if (!append_spill_chain_handle(index, handle,
+                        &state->right_chains[partition]))
+                    return false;
             }
             std::vector<size_t>().swap(right_partition_rows[partition]);
         }
@@ -801,7 +820,9 @@
                                      partition_rows[partition], true,
                                      &handle, state->input_rows))
                 return false;
-            state->left_handles[partition].push_back(handle);
+            if (!append_spill_chain_handle(index, handle,
+                    &state->left_chains[partition]))
+                return false;
         }
         state->input_rows = end_ordinal;
         {
@@ -820,7 +841,7 @@
         if (state->configured) return true;
         if (!build->configured || !build->complete || build->consumed ||
             build->spec == NULL || build->keys == NULL ||
-            build->handles.size() != build->partition_count)
+            build->chains.size() != build->partition_count)
             return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x42c);
         for (uint16_t key = 0; key < build->spec->key_count; ++key)
             if (build->keys[key].left_key >= left.columns ||
@@ -834,8 +855,9 @@
         state->right_bytes = build->bytes;
         state->partition_count = build->partition_count;
         state->scalar_key = build->scalar_key;
-        state->right_handles.swap(build->handles);
-        state->left_handles.resize(state->partition_count);
+        state->right_chains.swap(build->chains);
+        state->left_chains.resize(state->partition_count);
+        note_join_chain_memory(state->partition_count * 2);
         const bool only_left = state->spec->join_kind == CSD_SQL_JOIN_SEMI ||
                                state->spec->join_kind == CSD_SQL_JOIN_ANTI;
         output->columns = left.columns +
@@ -871,26 +893,26 @@
              ++partition) {
             Batch partition_right;
             partition_right.columns = state->right_columns;
-            for (std::vector<SpillHandle>::const_iterator build_handle =
-                     state->right_handles[partition].begin();
-                 build_handle != state->right_handles[partition].end();
-                 ++build_handle) {
+            if (!for_each_spill_chain_handle(index,
+                    state->right_chains[partition],
+                    [&](const SpillHandle &build_handle) {
                 Batch build_chunk;
-                if (!read_spill_batch(index, *build_handle, &build_chunk) ||
+                if (!read_spill_batch(index, build_handle, &build_chunk) ||
                     build_chunk.columns != state->right_columns)
                     return false;
                 partition_right.rows.insert(partition_right.rows.end(),
                     std::make_move_iterator(build_chunk.rows.begin()),
                     std::make_move_iterator(build_chunk.rows.end()));
-            }
+                return true;
+            })) return false;
             OperatorMemoryLease partition_memory(this,
                 batch_bytes(partition_right), true);
             if (!partition_memory.acquired())
                 return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x41c);
-            for (std::vector<SpillHandle>::const_iterator handle =
-                     state->left_handles[partition].begin();
-                 handle != state->left_handles[partition].end(); ++handle) {
-                if (!stream_spill_batch(index, *handle,
+            if (!for_each_spill_chain_handle(index,
+                    state->left_chains[partition],
+                    [&](const SpillHandle &handle) {
+                if (!stream_spill_batch(index, handle,
                         [&](const Batch &partition_left) {
                             Batch partition_output;
                             if (!execute_join_core(index, *state->spec,
@@ -919,7 +941,8 @@
                             return true;
                         }))
                     return false;
-            }
+                return true;
+            })) return false;
         }
         std::stable_sort(state->ordered.begin(), state->ordered.end(),
             [](const OrderedJoinRow &first, const OrderedJoinRow &second) {

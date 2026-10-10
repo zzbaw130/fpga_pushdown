@@ -403,6 +403,9 @@ struct CsdSqlExecutionStatus {
     uint64_t stream_join_build_batches;
     uint64_t stream_join_build_rows;
     uint64_t stream_join_build_repartition_passes;
+    uint64_t stream_join_chain_records;
+    uint64_t stream_join_chain_record_reads;
+    uint64_t stream_join_chain_peak_bytes;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

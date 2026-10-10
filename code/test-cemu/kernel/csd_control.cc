@@ -364,6 +364,99 @@
                                      append_ordinal, ordinal_base, handle);
     }
 
+    /* Persist a backwards link immediately after its data record. A Join keeps
+     * only one head/tail descriptor per radix partition in controller memory;
+     * reverse traversal is harmless because probe rows carry global ordinals
+     * and build hash insertion order is not observable. */
+    bool append_spill_chain_handle(uint32_t index, const SpillHandle &handle,
+                                   SpillHandleChain *chain)
+    {
+        SpillChainRecord record = {};
+        record.magic = kSpillChainMagic;
+        record.node_id = index;
+        record.previous_offset = chain->tail_offset;
+        record.data_offset = handle.offset;
+        record.data_length = handle.length;
+        record.row_count = handle.row_count;
+        record.column_count = handle.column_count;
+        uint64_t record_offset = 0;
+        {
+            std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+            const uint64_t capacity =
+                (header_->flags & CSD_SQL_PLAN_FLASH_SPILL) ?
+                    header_->spill_bytes : static_cast<uint64_t>(
+                        args_->mr_len[header_->spill_range]);
+            if (spill_offset_ > capacity ||
+                sizeof(record) > capacity - spill_offset_)
+                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x23c);
+            record_offset = spill_offset_;
+            if (!write_spill_storage_unlocked(index, record_offset, &record,
+                                              sizeof(record)))
+                return false;
+            spill_offset_ += sizeof(record);
+        }
+        chain->tail_offset = record_offset;
+        ++chain->count;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            status_.spill_write_bytes += sizeof(record);
+            ++status_.stream_join_chain_records;
+        }
+        return true;
+    }
+
+    bool read_spill_chain_handle(uint32_t index, uint64_t record_offset,
+                                 uint64_t *previous_offset,
+                                 SpillHandle *handle)
+    {
+        SpillChainRecord record = {};
+        {
+            std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+            if (record_offset > spill_offset_ ||
+                sizeof(record) > spill_offset_ - record_offset ||
+                !read_spill_bytes(index, record_offset, &record,
+                                  sizeof(record)))
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x23d);
+        }
+        if (record.magic != kSpillChainMagic || record.node_id != index ||
+            record.data_length < sizeof(SpillRecordHeader) ||
+            record.data_offset > spill_offset_ ||
+            record.data_length > spill_offset_ - record.data_offset ||
+            record.column_count == 0)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x23e);
+        handle->offset = record.data_offset;
+        handle->length = record.data_length;
+        handle->row_count = record.row_count;
+        handle->column_count = record.column_count;
+        *previous_offset = record.previous_offset;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            status_.spill_read_bytes += sizeof(record);
+            ++status_.stream_join_chain_record_reads;
+        }
+        return true;
+    }
+
+    template <typename Consumer>
+    bool for_each_spill_chain_handle(uint32_t index,
+                                     const SpillHandleChain &chain,
+                                     Consumer consumer)
+    {
+        uint64_t offset = chain.tail_offset;
+        for (uint64_t item = 0; item < chain.count; ++item) {
+            SpillHandle handle;
+            uint64_t previous = 0;
+            if (offset == std::numeric_limits<uint64_t>::max() ||
+                !read_spill_chain_handle(index, offset, &previous, &handle) ||
+                !consumer(handle))
+                return false;
+            offset = previous;
+        }
+        if (offset != std::numeric_limits<uint64_t>::max())
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x23f);
+        return true;
+    }
+
     bool read_spill_batch(uint32_t index, const SpillHandle &handle, Batch *output)
     {
         std::lock_guard<std::mutex> spill_guard(spill_mutex_);

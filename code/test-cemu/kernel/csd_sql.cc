@@ -29,6 +29,7 @@ const uint16_t kPageHeaderBytes = 24;
 const uint16_t kHeapTupleHeaderBytes = 23;
 const uint16_t kResultNull = 1;
 const uint32_t kSpillMagic = UINT32_C(0x4353504c); /* CSPL */
+const uint32_t kSpillChainMagic = UINT32_C(0x43534348); /* CSCH */
 const uint32_t kFifoMagic = UINT32_C(0x43464946); /* CFIF */
 const uint32_t kMaxParallelWorkers = 32;
 const uint32_t kTupleBindWordBits = 1024;
@@ -64,6 +65,22 @@ struct SpillHandle {
     uint16_t column_count;
     uint16_t reserved16;
     SpillHandle() : offset(0), length(0), row_count(0), column_count(0), reserved16(0) {}
+};
+struct SpillChainRecord {
+    uint32_t magic;
+    uint32_t node_id;
+    uint64_t previous_offset;
+    uint64_t data_offset;
+    uint64_t data_length;
+    uint32_t row_count;
+    uint16_t column_count;
+    uint16_t reserved16;
+} __attribute__((packed));
+struct SpillHandleChain {
+    uint64_t tail_offset;
+    uint64_t count;
+    SpillHandleChain()
+        : tail_offset(std::numeric_limits<uint64_t>::max()), count(0) {}
 };
 struct SpillRowCursor {
     SpillHandle handle;
@@ -121,7 +138,7 @@ struct StreamedJoinBuildState {
     bool scalar_key;
     uint64_t rows;
     uint64_t bytes;
-    std::vector<std::vector<SpillHandle> > handles;
+    std::vector<SpillHandleChain> chains;
     std::vector<uint64_t> partition_bytes;
     bool configured;
     bool complete;

@@ -89,6 +89,12 @@ Raw outputs, Q3/Q7 profiles, planner output and AUTO plans are archived in
 
 ## Remaining boundary
 
+Historical note: the subsequent bounded spill-chain milestone replaces these
+per-record resident handle vectors with Flash-linked records and one fixed
+descriptor per radix partition. See
+`tpch_sf1_spill_chain_validation.md`. The output/reorder and arena-backed
+container limitations below remain current.
+
 Build and probe payloads are now FIFO-bounded for the eligible two-sided Scan
 shape, but their `SpillHandle` vectors still grow with every nonempty
 batch/partition selection. Repartitioning appends new Flash records and does
