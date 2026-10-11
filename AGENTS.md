@@ -69,6 +69,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `218ba67a3` | streamed Join Flash handle-chain、Q3 常驻描述符 1,024 B 与 22/22 回归 |
 | `9ffae8781` | partitioned Join binary-carry ordinal merge、Q3 常驻 handle 150 B 与 22/22 回归 |
 | `7ce97b472` | partitioned Join 逐行扇出输出、Q3 pending peak 598,680 B 与 22/22 回归 |
+| `57b3c607d` | partitioned Join 最终 Flash run 直连 non-DISTINCT Aggregate、Q12/Q14/Q19 32 MiB 与 22/22 回归 |
 
 ## 3. 环境不变量
 
@@ -84,6 +85,10 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 - 当前 CEMU FTL 的 LPN->PPA 映射没有随容器/控制器重启持久化；即使 backing volume
   仍存在，重启后的 namespace 也会表现为空盘。镜像重建后需重新执行
   `stage_tpch_nvme.sh`，不能把这段 9P->NVMe 恢复时间计入查询实验。
+- `csd.execute_timeout_ms` 默认 600,000，只控制 host NVMe ioctl 对 TCG 功能模型的
+  watchdog，不进入 FPGA/Flash 时延模型。VM-Freeze kernel 超时后 Linux abort/reset
+  目前不能协作取消仍在 QEMU 中运行的 C++ worker；一旦发生超时，应重启 CEMU、重新
+  stage PGDATA 后再测，不能继续使用可能带遗留热线程的环境。
 - 默认先用 SF=1 做功能和快速回归，再用 SF=32 验证内存边界和可扩展性。
 - FDMFS 表示 CSD 内存，不是无限磁盘。默认总容量 4 GiB。表数据按默认 32 MiB
   scan window 从 NVMe 分块进入 FDM；不得把大表整体复制到 FDMFS。
@@ -240,7 +245,10 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   sorted Flash run；binary-carry merge 每层最多保留一个 handle，最终 run 分块读回并去掉
   hidden ordinal，不再保留 output-sized `OrderedJoinRow` vector。replay hash probe 逐匹配
   行发射到 spill-staging-bounded ordinal buffer，不再先构造完整 `partition_output`；每个
-  Flash 反向链 handle 结束时强制 flush，以保证每个 leaf run 的 ordinal 单调性。
+  Flash 反向链 handle 结束时强制 flush，以保证每个 leaf run 的 ordinal 单调性。若最终
+  run 的唯一后继是任意 Filter/Project 链加 non-DISTINCT Aggregate，则按 staging-bounded
+  chunk 直接更新聚合状态，不再恢复完整 visible Join `Batch`；聚合 state 实际超出 arena
+  时释放 partial state、重读仍完整的 final run，并进入原 materialized/radix 兼容路径。
 - Grouped Aggregate：每个 group 永远落入一个 partition，保留 DISTINCT 与 AVG
   sum/count 语义；collision partition 使用更高 hash bits 递归 partition。新 group 和
   DISTINCT item 在插入前原子计费，一旦过 arena threshold 就丢弃 partial table 并按
@@ -260,9 +268,10 @@ arena allocator；streamed Join 的句柄 payload 已由 Flash 链约束为 O(pa
 但 descriptor vector 仍有 STL allocator 开销，adaptive repartition 也不会在 query 内
 回收旧 data/chain scratch record。partitioned Join 的 ordinal reorder payload 已约束为
 O(log run count)，probe fan-out 暂存已由 spill staging 容量约束，但最终 visible output
-仍完整物化。
+仅在 Join-to-Join、最终返回、DISTINCT/不支持 Aggregate 或容量回退时仍完整物化；符合
+sole-consumer non-DISTINCT Aggregate 形状的 final run 已按 chunk 直连。
 虽然 scan window、FIFO、run generation、cursor merge、部分 Aggregate/Join state、spill
-I/O 和 blocking lease 已有界，但在实现 streaming Join/final-result consumer、
+I/O 和 blocking lease 已有界，但在实现 Join-to-Join/final-result consumer、
 Aggregate streaming partition writer 与 arena-backed container 前，不能声称 SF=32
 端到端物理内存已严格有界。global Aggregate 的大型
 DISTINCT 仍保留 compatibility/protection-copy 路径。
@@ -330,6 +339,7 @@ wall-time 数字保留只为历史可追溯。
 | Join Flash handle chain | Q3 256 data/chain records；resident descriptor peak 1,024 B；40 B/record metadata；60,190,616 B spill write/read；结果 exact |
 | Join ordinal Flash merge | Q3 32 leaf runs / 31 merges；736,065 merge rows；resident handles 150 B；166,186,244 B spill write/read；结果 exact |
 | Join fan-out stream | Q3 147,213 partitioned output rows / 32 buffers；pending peak 598,680 B；Flash I/O 与 ordinal-merge 版相同；结果 exact |
+| Join-to-Aggregate handoff | 32 MiB Q12/Q14/Q19 分别直连 31,235/77,062/127 行；最大 replay chunk 3,510,755/10,835,462/24,738 B；0 fallback；Flash I/O 不变；结果 exact |
 
 详细报告分别位于 `results/tpch_sf1_{sort,join,aggregate}_spill_replay_validation.md`、
 `results/tpch_sf1_fdm_arena_validation.md` 和 `results/tpch_sf1_fdm_fifo_validation.md`。
@@ -375,6 +385,14 @@ partitioned Join 的 fan-out-bounded row emission 验证位于
 峰值为 598,680 B，Flash I/O 未增加，forced-CSD 22/22 exact、planner 22/22、AUTO
 定向回归与 ASan/UBSan 均通过，原始证据归档 SHA-256 为
 `750d61f6231bf67a4e2c675958b706b8e2646bb0be4c03d06d8de3cd9780e772`。
+partitioned Join 最终 run 到 Aggregate 的 bounded handoff 验证位于
+`results/tpch_sf1_join_aggregate_handoff_validation.md`；Q12/Q14/Q19 在 32 MiB arena
+下均命中一次、零 fallback，Flash 读写与前一版本逐字节相同；清洁恢复后的 forced-CSD
+22/22 exact、planner 22/22、AUTO 定向回归与 ASan/UBSan 均通过。完整回归、新路径和
+旧 kernel 基线三份归档 SHA-256 分别为
+`a294c7517f8ee080aba913126ed3ec572f850b22f2b0b4be8a8321710e004672`、
+`5beda81163615312135ca69e936d8f92234939f21152ca7ec4a940b1fb865082`、
+`1f773d85941895d002864dd1e272c84d5f8b3e1563d438bac8d152d883d8c87e`。
 
 ## 10. 回归命令与通过标准
 
@@ -563,5 +581,9 @@ Q2 复测为 19,176.669/19,218.811 ms。Q20 是 1.024x 的剩余 near-tie。详�
 - `flash_read_bytes` 包括 base relation 与 replay，`spill_read_bytes` 只包括 replay；分析时
   不要重复相加。
 - Q15 会创建临时 view，测试脚本必须显式处理 read-only transaction 设置。
+- Program Execute watchdog 超时不是普通 SQL 失败：当前 abort/reset 可能留下继续占用宿主
+  CPU 的 VM-Freeze C++ worker。看到 `EINTR`/`ETIMEDOUT` 后不要直接继续测下一条；重启
+  CEMU、重新 stage 数据并验证干净 Q1 profile。低内存压力实验可显式提高
+  `csd.execute_timeout_ms`，但该值不得写入设备时延。
 - 任何“支持全部 TPC-H”的结论都必须同时有 planner 22/22 和 result exact 22/22 证据。
 
