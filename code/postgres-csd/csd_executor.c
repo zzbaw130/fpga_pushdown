@@ -125,6 +125,7 @@ int csd_fdm_capacity_mb = 4096;
 int csd_nvm_nsid = 1;
 int csd_parallel_workers = 32;
 int csd_program_runtime = 0;
+int csd_execute_timeout_ms = 600000;
 int csd_device_work_mem_mb = 0;
 int csd_cache_wait_ms = 0;
 bool csd_profile = false;
@@ -1051,6 +1052,12 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 		transport.range_sizes[status_range] = CSD_RANGE_ALIGNMENT;
 		transport.range_fds[status_range] = csd_create_range(status_range,
 			CSD_RANGE_ALIGNMENT);
+		/* The execution-status ABI is append-only within a plan version.  Clear
+		 * the complete range so an older compatible kernel that writes only the
+		 * known prefix leaves newly appended counters deterministically zero. */
+		MemSet(&status, 0, sizeof(status));
+		csd_write_range(transport.range_fds[status_range], &status,
+			sizeof(status));
 
 		header->output_range = output_range;
 		header->spill_range = spill_range;
@@ -1137,6 +1144,7 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 		execute_command->cparam1 = plan_length;
 		execute_command->cparam2 = plan_range;
 		execute_command->user_runtime = csd_program_runtime;
+		command.timeout_ms = csd_execute_timeout_ms;
 		if (cache_fill_active)
 		{
 			execute_command->flags |= CSD_EXEC_CACHE_TRACK;
@@ -1144,10 +1152,21 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 				execute_command->flags |= CSD_EXEC_HOST_CACHE_OVERLAP;
 		}
 		if (ioctl(transport.execute_fd, NVME_IOCTL_IO_CMD, &command) < 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_IO_ERROR),
-					 errmsg("CEMU Program Execute failed: %m"),
-					 errhint("The PostgreSQL executable needs CAP_SYS_ADMIN in the CEMU guest.")));
+		{
+			int saved_errno = errno;
+
+			errno = saved_errno;
+			if (saved_errno == EINTR || saved_errno == ETIMEDOUT)
+				ereport(ERROR,
+						(errcode(ERRCODE_IO_ERROR),
+						 errmsg("CEMU Program Execute failed: %m"),
+						 errhint("The TCG functional execution exceeded the NVMe request watchdog; raise csd.execute_timeout_ms explicitly for low-memory stress tests.")));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_IO_ERROR),
+						 errmsg("CEMU Program Execute failed: %m"),
+						 errhint("The PostgreSQL executable needs CAP_SYS_ADMIN in the CEMU guest.")));
+		}
 		if (cache_fill_active)
 		{
 			struct ioctl_cemu_cache_stats cache_stats;
@@ -1200,7 +1219,7 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 			uint32 opcode;
 
 			ereport(NOTICE,
-					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f flash_read_bytes=%llu flash_write_bytes=%llu input_chunks=%llu spill_write_bytes=%llu spill_read_bytes=%llu fifo_batches=%llu fifo_write_bytes=%llu fifo_read_bytes=%llu fdm_reserved_bytes=%llu operator_memory_bytes=%llu operator_peak_bytes=%llu operator_allocations=%llu operator_spill_count=%llu stream_input_batches=%llu stream_input_rows=%llu stream_input_peak_bytes=%llu spill_cursor_peak_bytes=%llu spill_writer_peak_bytes=%llu sort_merge_rows=%llu stream_join_calls=%llu stream_join_batches=%llu stream_join_rows=%llu stream_join_build_bytes=%llu stream_join_partitioned_calls=%llu stream_join_streamed_build_calls=%llu stream_join_build_batches=%llu stream_join_build_rows=%llu stream_join_build_repartition_passes=%llu stream_join_chain_records=%llu stream_join_chain_record_reads=%llu stream_join_chain_peak_bytes=%llu stream_join_ordinal_runs=%llu stream_join_ordinal_merge_records=%llu stream_join_ordinal_merge_rows=%llu stream_join_ordinal_peak_bytes=%llu stream_join_output_buffers=%llu stream_join_output_rows=%llu stream_join_output_peak_bytes=%llu",
+					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f flash_read_bytes=%llu flash_write_bytes=%llu input_chunks=%llu spill_write_bytes=%llu spill_read_bytes=%llu fifo_batches=%llu fifo_write_bytes=%llu fifo_read_bytes=%llu fdm_reserved_bytes=%llu operator_memory_bytes=%llu operator_peak_bytes=%llu operator_allocations=%llu operator_spill_count=%llu stream_input_batches=%llu stream_input_rows=%llu stream_input_peak_bytes=%llu spill_cursor_peak_bytes=%llu spill_writer_peak_bytes=%llu sort_merge_rows=%llu stream_join_calls=%llu stream_join_batches=%llu stream_join_rows=%llu stream_join_build_bytes=%llu stream_join_partitioned_calls=%llu stream_join_streamed_build_calls=%llu stream_join_build_batches=%llu stream_join_build_rows=%llu stream_join_build_repartition_passes=%llu stream_join_chain_records=%llu stream_join_chain_record_reads=%llu stream_join_chain_peak_bytes=%llu stream_join_ordinal_runs=%llu stream_join_ordinal_merge_records=%llu stream_join_ordinal_merge_rows=%llu stream_join_ordinal_peak_bytes=%llu stream_join_output_buffers=%llu stream_join_output_rows=%llu stream_join_output_peak_bytes=%llu stream_join_downstream_calls=%llu stream_join_downstream_batches=%llu stream_join_downstream_rows=%llu stream_join_downstream_peak_bytes=%llu stream_join_downstream_fallbacks=%llu",
 							(unsigned long long) status.operator_calls[CSD_SQL_OP_SCAN],
 							(double) status.operator_ns[CSD_SQL_OP_SCAN] / 1000000.0,
 							(unsigned long long) status.flash_read_bytes,
@@ -1240,7 +1259,12 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 							(unsigned long long) status.stream_join_ordinal_peak_bytes,
 							(unsigned long long) status.stream_join_output_buffers,
 							(unsigned long long) status.stream_join_output_rows,
-							(unsigned long long) status.stream_join_output_peak_bytes)));
+							(unsigned long long) status.stream_join_output_peak_bytes,
+							(unsigned long long) status.stream_join_downstream_calls,
+							(unsigned long long) status.stream_join_downstream_batches,
+							(unsigned long long) status.stream_join_downstream_rows,
+							(unsigned long long) status.stream_join_downstream_peak_bytes,
+							(unsigned long long) status.stream_join_downstream_fallbacks)));
 
 			for (opcode = CSD_SQL_OP_SCAN; opcode < CSD_SQL_PROFILE_SLOTS; ++opcode)
 				if (status.operator_calls[opcode] != 0)

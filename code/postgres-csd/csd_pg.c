@@ -201,6 +201,10 @@ _PG_init(void)
 	DefineCustomIntVariable("csd.program_runtime", "CEMU modeled Program Execute runtime.", NULL,
 						&csd_program_runtime, 0, 0, INT_MAX, PGC_USERSET, 0,
 						NULL, NULL, NULL);
+	DefineCustomIntVariable("csd.execute_timeout_ms",
+						"Host NVMe ioctl watchdog for the TCG functional Program Execute path.", NULL,
+						&csd_execute_timeout_ms, 600000, 1000, INT_MAX,
+						PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("csd.device_work_mem_mb",
 						"Optional cap for the query-level FDM operator arena; zero uses all remaining FDM.", NULL,
 						&csd_device_work_mem_mb, 0, 0, INT_MAX, PGC_USERSET, 0,

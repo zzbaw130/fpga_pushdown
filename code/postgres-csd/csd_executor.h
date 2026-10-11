@@ -24,6 +24,7 @@ extern int csd_fdm_capacity_mb;
 extern int csd_nvm_nsid;
 extern int csd_parallel_workers;
 extern int csd_program_runtime;
+extern int csd_execute_timeout_ms;
 extern int csd_device_work_mem_mb;
 extern int csd_cache_wait_ms;
 extern bool csd_profile;

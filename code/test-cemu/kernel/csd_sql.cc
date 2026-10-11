@@ -728,6 +728,27 @@ private:
                                          results)) <=
                      operator_memory_capacity_ ||
                  (nodes_[join_index].flags & CSD_SQL_NODE_SPILLABLE));
+            std::vector<uint32_t> join_aggregate_pipeline;
+            uint32_t join_aggregate_index = CSD_SQL_INVALID_NODE;
+            bool stream_join_aggregate = false;
+            if (stream_join) {
+                const bool streamed_build_ready =
+                    join_index < streamed_join_builds_.size() &&
+                    streamed_join_builds_[join_index].complete &&
+                    !streamed_join_builds_[join_index].consumed;
+                const bool partitioned_join = streamed_build_ready ||
+                    batch_bytes(input_batch(nodes_[join_index].right_input,
+                                             results)) >
+                        operator_memory_capacity_;
+                if (partitioned_join) {
+                    join_aggregate_index =
+                        streaming_join_aggregate_target(join_index,
+                            consumers, sole_consumer,
+                            &join_aggregate_pipeline);
+                    stream_join_aggregate =
+                        join_aggregate_index != CSD_SQL_INVALID_NODE;
+                }
+            }
             bool succeeded = false;
             if (build_join_index != CSD_SQL_INVALID_NODE)
                 succeeded = execute_scan_to_join_build(index, node, pipeline,
@@ -744,7 +765,11 @@ private:
                 succeeded = execute_scan_to_join(index, node, pipeline,
                     join_index, nodes_[join_index],
                     input_batch(nodes_[join_index].right_input, results),
-                    output);
+                    output, join_aggregate_index,
+                    stream_join_aggregate ?
+                        &nodes_[join_aggregate_index] : NULL,
+                    stream_join_aggregate ?
+                        &join_aggregate_pipeline : NULL);
             else
                 succeeded = execute_scan(index, node, output, &pipeline);
             if (succeeded) {
@@ -757,7 +782,16 @@ private:
                         precomputed[aggregate_project] = 1;
                     precomputed[aggregate_index] = 1;
                 }
-                if (stream_join) precomputed[join_index] = 1;
+                if (stream_join) {
+                    precomputed[join_index] = 1;
+                    if (stream_join_aggregate) {
+                        for (std::vector<uint32_t>::const_iterator stage =
+                                 join_aggregate_pipeline.begin();
+                             stage != join_aggregate_pipeline.end(); ++stage)
+                            precomputed[*stage] = 1;
+                        precomputed[join_aggregate_index] = 1;
+                    }
+                }
             }
             return succeeded;
         }
@@ -869,6 +903,33 @@ private:
             join.arg0 <= operator_memory_capacity_)
             return CSD_SQL_INVALID_NODE;
         return join_index;
+    }
+
+    uint32_t streaming_join_aggregate_target(
+        uint32_t join_index, const std::vector<uint32_t> &consumers,
+        const std::vector<uint32_t> &sole_consumer,
+        std::vector<uint32_t> *pipeline)
+    {
+        pipeline->clear();
+        if (join_index >= header_->node_count || consumers[join_index] != 1 ||
+            sole_consumer[join_index] == CSD_SQL_INVALID_NODE)
+            return CSD_SQL_INVALID_NODE;
+        uint32_t current = join_index;
+        while (consumers[current] == 1 &&
+               sole_consumer[current] != CSD_SQL_INVALID_NODE) {
+            const uint32_t next = sole_consumer[current];
+            if (nodes_[next].opcode == CSD_SQL_OP_HASH_AGG ||
+                nodes_[next].opcode == CSD_SQL_OP_GROUP_AGG)
+                return can_replay_stream_aggregate(nodes_[next]) ? next :
+                    CSD_SQL_INVALID_NODE;
+            if (nodes_[next].opcode != CSD_SQL_OP_FILTER &&
+                nodes_[next].opcode != CSD_SQL_OP_PROJECT)
+                return CSD_SQL_INVALID_NODE;
+            pipeline->push_back(next);
+            current = next;
+        }
+        pipeline->clear();
+        return CSD_SQL_INVALID_NODE;
     }
 
     bool has_streaming_scan_source(

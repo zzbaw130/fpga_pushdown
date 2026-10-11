@@ -914,32 +914,40 @@
         return true;
     }
 
-    bool finish_join_ordinal_runs(uint32_t index,
-                                  JoinOrdinalRunState *state,
-                                  Batch *output)
+    bool final_join_ordinal_handle(uint32_t index,
+                                   JoinOrdinalRunState *state,
+                                   SpillHandle *final_handle,
+                                   bool *have_final)
     {
-        output->columns = state->visible_columns;
-        SpillHandle final_handle;
-        bool have_final = false;
+        *have_final = false;
         for (size_t level = state->levels.size(); level > 0; --level) {
             const size_t slot = level - 1;
             if (!state->occupied[slot]) continue;
-            if (!have_final) {
-                final_handle = state->levels[slot];
-                have_final = true;
+            if (!*have_final) {
+                *final_handle = state->levels[slot];
+                *have_final = true;
                 continue;
             }
             SpillHandle merged;
-            if (!merge_join_ordinal_handles(index, state, final_handle,
+            if (!merge_join_ordinal_handles(index, state, *final_handle,
                                              state->levels[slot], &merged))
                 return false;
-            final_handle = merged;
+            *final_handle = merged;
         }
-        if (!have_final) return true;
-        output->rows.reserve(final_handle.row_count);
-        if (!stream_spill_batch(index, final_handle,
+        return true;
+    }
+
+    bool stream_join_ordinal_handle(
+        uint32_t index, const JoinOrdinalRunState &state,
+        const SpillHandle &handle, Batch *output,
+        const std::function<bool(Batch &)> *consumer = NULL)
+    {
+        output->columns = state.visible_columns;
+        if (consumer == NULL) output->rows.reserve(handle.row_count);
+        uint64_t emitted_rows = 0;
+        if (!stream_spill_batch(index, handle,
                 [&](Batch &chunk) {
-                    if (chunk.columns != state->visible_columns + 1)
+                    if (chunk.columns != state.visible_columns + 1)
                         return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x435);
                     for (std::vector<Row>::iterator row =
                              chunk.rows.begin(); row != chunk.rows.end();
@@ -950,13 +958,160 @@
                             row->back().integer < 0)
                             return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x436);
                         row->pop_back();
-                        output->rows.push_back(std::move(*row));
+                    }
+                    const uint64_t rows = chunk.rows.size();
+                    if (!checked_add(emitted_rows, rows, &emitted_rows))
+                        return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x43b);
+                    if (consumer != NULL) {
+                        const uint64_t bytes = batch_bytes(chunk);
+                        {
+                            std::lock_guard<std::mutex> status_guard(
+                                status_mutex_);
+                            ++status_.stream_join_downstream_batches;
+                            uint64_t total = 0;
+                            if (checked_add(
+                                    status_.stream_join_downstream_rows,
+                                    rows, &total))
+                                status_.stream_join_downstream_rows = total;
+                            else
+                                status_.stream_join_downstream_rows =
+                                    std::numeric_limits<uint64_t>::max();
+                            status_.stream_join_downstream_peak_bytes =
+                                std::max<uint64_t>(
+                                    status_.stream_join_downstream_peak_bytes,
+                                    bytes);
+                        }
+                        if (!(*consumer)(chunk)) return false;
+                    } else {
+                        output->rows.insert(output->rows.end(),
+                            std::make_move_iterator(chunk.rows.begin()),
+                            std::make_move_iterator(chunk.rows.end()));
                     }
                     return true;
                 }))
             return false;
-        return output->rows.size() == state->rows ? true :
+        return emitted_rows == state.rows ? true :
             fail(CSD_SQL_STATUS_BAD_ABI, index, 0x437);
+    }
+
+    bool finish_join_ordinal_runs(uint32_t index,
+                                  JoinOrdinalRunState *state,
+                                  Batch *output)
+    {
+        output->columns = state->visible_columns;
+        SpillHandle final_handle;
+        bool have_final = false;
+        if (!final_join_ordinal_handle(index, state, &final_handle,
+                                       &have_final))
+            return false;
+        if (!have_final) return true;
+        return stream_join_ordinal_handle(index, *state, final_handle,
+                                          output);
+    }
+
+    /* A partitioned Join already owns a stable Flash run. Feed that run to a
+     * compatible downstream Aggregate one decoded chunk at a time instead of
+     * reconstructing the complete visible Join Batch. If the runtime hash
+     * state exceeds the shared arena, replay the still-intact run through the
+     * existing materialized compatibility path. */
+    bool apply_join_downstream_pipeline(
+        Batch &input, const std::vector<uint32_t> &pipeline, Batch *output)
+    {
+        Batch current;
+        current.columns = input.columns;
+        current.rows.swap(input.rows);
+        for (std::vector<uint32_t>::const_iterator stage = pipeline.begin();
+             stage != pipeline.end(); ++stage) {
+            Batch next;
+            if (nodes_[*stage].opcode == CSD_SQL_OP_FILTER) {
+                if (!execute_filter(*stage, nodes_[*stage], current, &next,
+                                    true))
+                    return false;
+            } else if (nodes_[*stage].opcode == CSD_SQL_OP_PROJECT) {
+                if (!execute_project(*stage, nodes_[*stage], current, &next,
+                                     true))
+                    return false;
+            } else {
+                return fail(CSD_SQL_STATUS_BAD_NODE, *stage, 0x43c);
+            }
+            current.columns = next.columns;
+            current.rows.swap(next.rows);
+        }
+        output->columns = current.columns;
+        output->rows.swap(current.rows);
+        return true;
+    }
+
+    bool finish_join_ordinal_to_aggregate(
+        uint32_t join_index, JoinOrdinalRunState *runs,
+        uint32_t aggregate_index, const CsdSqlPlanNode &aggregate_node,
+        const std::vector<uint32_t> &pipeline, Batch *output)
+    {
+        SpillHandle final_handle;
+        bool have_final = false;
+        if (!final_join_ordinal_handle(join_index, runs, &final_handle,
+                                       &have_final))
+            return false;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_join_downstream_calls;
+        }
+
+        bool capacity_exceeded = false;
+        uint64_t required_bytes = 0;
+        {
+            StreamingAggregateState aggregate_state;
+            Batch discarded;
+            discarded.columns = runs->visible_columns;
+            bool streamed = true;
+            if (have_final) {
+                std::function<bool(Batch &)> consumer = [&](Batch &chunk) {
+                    Batch prepared;
+                    if (!apply_join_downstream_pipeline(chunk, pipeline,
+                                                        &prepared))
+                        return false;
+                    return consume_streaming_aggregate_batch(
+                        aggregate_index, aggregate_node, prepared, NULL,
+                        &aggregate_state, true, &capacity_exceeded,
+                        &required_bytes);
+                };
+                streamed = stream_join_ordinal_handle(join_index, *runs,
+                    final_handle, &discarded, &consumer);
+            }
+            if (streamed && !aggregate_state.configured) {
+                Batch prepared;
+                if (!apply_join_downstream_pipeline(discarded, pipeline,
+                                                    &prepared))
+                    streamed = false;
+                if (streamed)
+                streamed = configure_streaming_aggregate(aggregate_index,
+                    aggregate_node, prepared.columns, NULL,
+                    &aggregate_state);
+            }
+            if (streamed)
+                streamed = finish_streaming_aggregate(aggregate_index,
+                    aggregate_node, &aggregate_state, output);
+            release_streaming_aggregate_memory(&aggregate_state);
+            if (streamed) return true;
+        }
+        if (failed_ || !capacity_exceeded) return false;
+
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_join_downstream_fallbacks;
+        }
+        Batch materialized;
+        materialized.columns = runs->visible_columns;
+        if (have_final && !stream_join_ordinal_handle(join_index, *runs,
+                final_handle, &materialized))
+            return false;
+        Batch prepared;
+        if (!apply_join_downstream_pipeline(materialized, pipeline,
+                                            &prepared))
+            return false;
+        (void) required_bytes;
+        return execute_aggregate(aggregate_index, aggregate_node,
+                                 prepared, output);
     }
 
     struct StreamingPartitionedJoinState {
@@ -1198,7 +1353,10 @@
 
     bool finish_streaming_partitioned_join(
         uint32_t index, const CsdSqlPlanNode &node,
-        StreamingPartitionedJoinState *state, Batch *output)
+        StreamingPartitionedJoinState *state, Batch *output,
+        uint32_t aggregate_index = CSD_SQL_INVALID_NODE,
+        const CsdSqlPlanNode *aggregate_node = NULL,
+        const std::vector<uint32_t> *aggregate_pipeline = NULL)
     {
         for (size_t partition = 0; partition < state->partition_count;
              ++partition) {
@@ -1259,14 +1417,24 @@
                     &pending_bytes, &state->ordinal_runs);
             })) return false;
         }
-        if (!finish_join_ordinal_runs(index, &state->ordinal_runs, output))
+        if (aggregate_node != NULL) {
+            if (aggregate_index == CSD_SQL_INVALID_NODE ||
+                aggregate_pipeline == NULL ||
+                !finish_join_ordinal_to_aggregate(index,
+                    &state->ordinal_runs, aggregate_index, *aggregate_node,
+                    *aggregate_pipeline, output))
+                return false;
+        } else if (!finish_join_ordinal_runs(index, &state->ordinal_runs,
+                                             output)) {
             return false;
+        }
 
         uint64_t input_rows = 0, partition_work = 0, modeled_work = 0;
         if (!checked_add(state->input_rows, state->right_rows,
                          &input_rows) ||
             !checked_mul(input_rows, 3, &partition_work) ||
-            !checked_add(partition_work, output->rows.size(), &modeled_work) ||
+            !checked_add(partition_work, state->ordinal_runs.rows,
+                         &modeled_work) ||
             !checked_add(modeled_work, state->ordinal_runs.merge_rows,
                          &modeled_work))
             modeled_work = std::numeric_limits<uint64_t>::max();
@@ -1279,7 +1447,10 @@
     bool execute_scan_to_partitioned_join(
         uint32_t scan_index, const CsdSqlPlanNode &scan_node,
         const std::vector<uint32_t> &pipeline, uint32_t join_index,
-        const CsdSqlPlanNode &join_node, const Batch &right, Batch *output)
+        const CsdSqlPlanNode &join_node, const Batch &right, Batch *output,
+        uint32_t aggregate_index = CSD_SQL_INVALID_NODE,
+        const CsdSqlPlanNode *aggregate_node = NULL,
+        const std::vector<uint32_t> *aggregate_pipeline = NULL)
     {
         StreamingPartitionedJoinState state;
         Batch discarded;
@@ -1296,13 +1467,17 @@
                                                    &state))
             return false;
         return finish_streaming_partitioned_join(join_index, join_node,
-                                                  &state, output);
+            &state, output, aggregate_index, aggregate_node,
+            aggregate_pipeline);
     }
 
     bool execute_scan_to_streamed_build_join(
         uint32_t scan_index, const CsdSqlPlanNode &scan_node,
         const std::vector<uint32_t> &pipeline, uint32_t join_index,
-        const CsdSqlPlanNode &join_node, Batch *output)
+        const CsdSqlPlanNode &join_node, Batch *output,
+        uint32_t aggregate_index = CSD_SQL_INVALID_NODE,
+        const CsdSqlPlanNode *aggregate_node = NULL,
+        const std::vector<uint32_t> *aggregate_pipeline = NULL)
     {
         StreamedJoinBuildState &build = streamed_join_builds_[join_index];
         StreamingPartitionedJoinState state;
@@ -1319,7 +1494,8 @@
                 join_index, join_node, discarded, &build, output, &state))
             return false;
         return finish_streaming_partitioned_join(join_index, join_node,
-                                                  &state, output);
+            &state, output, aggregate_index, aggregate_node,
+            aggregate_pipeline);
     }
 
     bool execute_scan_to_join(uint32_t scan_index,
@@ -1328,18 +1504,25 @@
                               uint32_t join_index,
                               const CsdSqlPlanNode &join_node,
                               const Batch &right,
-                              Batch *output)
+                              Batch *output,
+                              uint32_t aggregate_index =
+                                  CSD_SQL_INVALID_NODE,
+                              const CsdSqlPlanNode *aggregate_node = NULL,
+                              const std::vector<uint32_t> *aggregate_pipeline =
+                                  NULL)
     {
         if (join_index < streamed_join_builds_.size() &&
             streamed_join_builds_[join_index].complete &&
             !streamed_join_builds_[join_index].consumed)
             return execute_scan_to_streamed_build_join(
                 scan_index, scan_node, pipeline, join_index, join_node,
-                output);
+                output, aggregate_index, aggregate_node,
+                aggregate_pipeline);
         if (batch_bytes(right) > operator_memory_capacity_)
             return execute_scan_to_partitioned_join(
                 scan_index, scan_node, pipeline, join_index, join_node,
-                right, output);
+                right, output, aggregate_index, aggregate_node,
+                aggregate_pipeline);
         StreamingJoinState state;
         Batch discarded;
         std::function<bool(Batch &)> consumer = [&](Batch &batch) {

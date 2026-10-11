@@ -179,6 +179,10 @@ partition replay 进一步改为逐匹配行发射，并只在 spill staging 容
 run；高重复 key 不再先形成完整 `partition_output`。Q3 32 MiB 的 598,680 B 峰值与
 完整回归记录在
 [Join fan-out streaming 验证](results/tpch_sf1_fanout_stream_validation.md)。
+当 partitioned Join 的唯一后继是若干 Filter/Project 与 non-DISTINCT Aggregate 时，
+最终 ordinal Flash run 现在直接按 bounded chunk 更新聚合状态，不再先恢复完整 Join
+`Batch`；Q12/Q14/Q19 的 32 MiB profile、兼容回退和完整回归记录在
+[Join-to-Aggregate handoff 验证](results/tpch_sf1_join_aggregate_handoff_validation.md)。
 
 ## 测试说明
 `code/test-cemu` 是挂载到来宾 `/root/CEMU/code/CEMU/tests/cemu` 的最小 CSD

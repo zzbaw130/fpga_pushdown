@@ -260,6 +260,15 @@ newer ordinal range to an older one, so the pending buffer is flushed at every
 record-handle boundary; additional flushes occur whenever the staging bound is
 reached. Each resulting leaf run is therefore sorted before binary carry.
 
+When the final ordinal run has a sole downstream chain of zero or more
+Filter/Project nodes ending in a supported non-DISTINCT Aggregate, the executor
+does not rebuild the complete visible Join `Batch`. It removes ordinals from
+each staging-sized replay chunk, applies that stateless chain, and updates one
+streaming Aggregate state. If runtime group accounting crosses the arena
+capacity, the partial state is released and the intact final run is replayed
+through the materialized/radix compatibility path. The fallback is explicit
+and counted; partial aggregate output is never returned.
+
 Grouped Aggregate uses the same handle/replay infrastructure. All rows for a
 group are assigned to one radix partition, so `DISTINCT` sets and AVG's
 sum/count pair never require cross-partition reconciliation. Hash collisions
@@ -293,6 +302,8 @@ partitioned Join ordinal reorder payload is bounded logarithmically by a
 binary-carry Flash merge instead of a complete `OrderedJoinRow` vector;
 partitioned probe fan-out is emitted row by row into a staging-bounded run
 buffer instead of a complete per-chunk `partition_output`;
+eligible partitioned Join-to-Aggregate chains consume the final run by bounded
+chunk instead of rebuilding a complete visible Join `Batch`;
 adaptive repartitioning still appends replacement records without reclaiming
 old query scratch extents.
 Ineligible Aggregate inputs still
@@ -303,7 +314,7 @@ directly through the bounded FDM staging range, and Join probe replay is
 chunked by that same limit. The aggregate threshold bounds its modeled state,
 but the table and cursor chunks still use ordinary C++ containers rather than
 allocators carved from the FDM arena. Streaming Aggregate partition writers,
-streaming downstream/final-result consumers and arena-backed containers are
+Join-to-Join/final-result consumers and arena-backed containers are
 needed for a strict physical FDM-only bound.
 Serialized spill records reside in real NVM scratch extents.
 `flash_write_bytes` and `spill_write_bytes` count backend writes, while Sort

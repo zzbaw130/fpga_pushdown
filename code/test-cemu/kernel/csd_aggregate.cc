@@ -72,7 +72,7 @@
      * planner estimate has eightfold headroom.  Larger/uncertain grouped state
      * retains the existing raw-row radix replay until direct streaming
      * partition writers are installed. */
-    bool can_stream_aggregate(const CsdSqlPlanNode &node)
+    bool can_replay_stream_aggregate(const CsdSqlPlanNode &node)
     {
         const CsdSqlAggregateSpec *spec = NULL;
         if (!expression_as(node, sizeof(CsdSqlAggregateSpec), &spec) ||
@@ -97,6 +97,15 @@
              ++aggregate)
             if (aggregates[aggregate].flags & CSD_SQL_AGG_DISTINCT)
                 return false;
+        return true;
+    }
+
+    bool can_stream_aggregate(const CsdSqlPlanNode &node)
+    {
+        if (!can_replay_stream_aggregate(node)) return false;
+        const CsdSqlAggregateSpec *spec = NULL;
+        if (!expression_as(node, sizeof(CsdSqlAggregateSpec), &spec))
+            return false;
         if (spec->group_count == 0) return true;
         uint64_t protected_estimate = 0;
         return node.arg0 != 0 &&
@@ -184,7 +193,10 @@
                                            const CsdSqlPlanNode &node,
                                            Batch &input,
                                            const CsdSqlPlanNode *project_node,
-                                           StreamingAggregateState *state)
+                                           StreamingAggregateState *state,
+                                           bool allow_capacity_fallback = false,
+                                           bool *capacity_exceeded = NULL,
+                                           uint64_t *required_bytes = NULL)
     {
         if (!configure_streaming_aggregate(index, node, input.columns,
                                             project_node, state))
@@ -234,8 +246,21 @@
                                  &modeled_bytes))
                     return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x514);
                 if (modeled_bytes > operator_memory_capacity_ -
-                                    state->held_bytes ||
-                    !wait_acquire_operator_memory(modeled_bytes))
+                                    state->held_bytes) {
+                    if (allow_capacity_fallback) {
+                        if (capacity_exceeded != NULL)
+                            *capacity_exceeded = true;
+                        if (required_bytes != NULL) {
+                            uint64_t total = 0;
+                            *required_bytes = checked_add(state->held_bytes,
+                                modeled_bytes, &total) ? total :
+                                std::numeric_limits<uint64_t>::max();
+                        }
+                        return false;
+                    }
+                    return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x515);
+                }
+                if (!wait_acquire_operator_memory(modeled_bytes))
                     return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x515);
                 state->held_bytes += modeled_bytes;
                 group.count.assign(state->spec->aggregate_count, 0);
