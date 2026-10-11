@@ -1,0 +1,38 @@
+services:
+  cemu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cemu_vm
+    container_name: cemu_fpga_pushdown
+    ports:
+      # 2222 is already used by an unrelated CEMU experiment on this host.
+      - "2223:2222"
+    working_dir: /workspace/code/CEMU/build
+    environment:
+      - CSD_COUNT=1
+    volumes:
+      - ./code/test-cemu:/workspace/code/CEMU/tests/cemu
+      # Canonical source path used by the PostgreSQL extension's PGXS include
+      # flags; the CEMU path above remains the emulator-visible kernel path.
+      - ./code/test-cemu:/workspace/code/test-cemu
+      # run-csd.sh is copied into build/ during image construction; mount it
+      # here so launch configuration changes do not require a full CEMU rebuild.
+      - ./code/CEMU/femu-scripts/run-csd.sh:/workspace/code/CEMU/build/run-csd.sh:ro
+      - ./code/CEMU/femu-scripts/cemu-mount.sh:/workspace/code/CEMU/femu-scripts/cemu-mount.sh:ro
+      # PostgreSQL is compiled once inside the persistent CEMU guest from this
+      # source tree, then installed in its qcow2 overlay.
+      - ./code/postgres:/workspace/code/postgres
+      # The extension must also be compiled inside the guest against that
+      # guest-built PostgreSQL; never execute a host-built csd_pg.so there.
+      - ./code/postgres-csd:/workspace/code/postgres-csd
+      - ./data:/workspace/data
+      - ./results:/workspace/results
+      - ./scripts:/workspace/scripts
+      - ./tests:/workspace/tests
+      # Preserve the guest qcow2 overlay across compose recreations, including
+      # the provisioned non-root csdpg account.
+      - cemu_guest_disk:/workspace/code/dqib_amd64-pc
+
+volumes:
+  cemu_guest_disk:

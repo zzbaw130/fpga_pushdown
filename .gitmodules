@@ -1,0 +1,4 @@
+[submodule "code/postgres"]
+	path = code/postgres
+	url = https://github.com/postgres/postgres.git
+	branch = REL_12_STABLE

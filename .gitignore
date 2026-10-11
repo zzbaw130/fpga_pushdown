@@ -1,0 +1,11 @@
+code/dqib_amd64-pc
+build/
+__pycache__/
+*.pyc
+code/test-cemu/build/
+.pgsock_*/
+results/**/*.log
+results/**/*.pid
+results/csd_planner_sf*/
+results/tpch_*_validation/
+data

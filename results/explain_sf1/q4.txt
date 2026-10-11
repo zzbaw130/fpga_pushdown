@@ -1,0 +1,23 @@
+Timing is on.
+                                                                              QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=60158.88..60166.38 rows=1 width=24)
+   ->  Finalize GroupAggregate  (cost=60158.88..60196.37 rows=5 width=24)
+         Group Key: orders.o_orderpriority
+         ->  Gather Merge  (cost=60158.88..60196.27 rows=10 width=24)
+               Workers Planned: 2
+               ->  Partial GroupAggregate  (cost=59158.85..59195.09 rows=5 width=24)
+                     Group Key: orders.o_orderpriority
+                     ->  Sort  (cost=59158.85..59170.92 rows=4825 width=16)
+                           Sort Key: orders.o_orderpriority
+                           ->  Nested Loop Semi Join  (cost=1290.90..58863.65 rows=4825 width=16)
+                                 ->  Parallel Bitmap Heap Scan on orders  (cost=1290.47..27764.76 rows=25286 width=20)
+                                       Recheck Cond: ((o_orderdate >= '1997-10-01'::date) AND (o_orderdate < '1998-01-01 00:00:00'::timestamp without time zone))
+                                       ->  Bitmap Index Scan on idx_orders_orderdate  (cost=0.00..1275.30 rows=60687 width=0)
+                                             Index Cond: ((o_orderdate >= '1997-10-01'::date) AND (o_orderdate < '1998-01-01 00:00:00'::timestamp without time zone))
+                                 ->  Index Scan using idx_lineitem_orderkey on lineitem  (cost=0.43..5.29 rows=7 width=4)
+                                       Index Cond: (l_orderkey = orders.o_orderkey)
+                                       Filter: (l_commitdate < l_receiptdate)
+(17 rows)
+
+Time: 3.071 ms

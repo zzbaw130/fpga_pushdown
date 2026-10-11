@@ -1,0 +1,13 @@
+Timing is on.
+                                                                                                           QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=213069.21..213069.22 rows=1 width=32)
+   ->  Finalize Aggregate  (cost=213069.21..213069.22 rows=1 width=32)
+         ->  Gather  (cost=213068.99..213069.20 rows=2 width=32)
+               Workers Planned: 2
+               ->  Partial Aggregate  (cost=212068.99..212069.00 rows=1 width=32)
+                     ->  Parallel Seq Scan on lineitem  (cost=0.00..211823.90 rows=49017 width=12)
+                           Filter: ((l_shipdate >= '1995-01-01'::date) AND (l_shipdate < '1996-01-01 00:00:00'::timestamp without time zone) AND (l_discount >= 0.05) AND (l_discount <= 0.07) AND (l_quantity < '25'::numeric))
+(7 rows)
+
+Time: 2.752 ms

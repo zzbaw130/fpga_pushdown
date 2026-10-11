@@ -1,0 +1,36 @@
+Timing is on.
+                                                         QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=12772.81..12772.81 rows=1 width=36)
+   InitPlan 1 (returns $2)
+     ->  Aggregate  (cost=4682.47..4682.48 rows=1 width=32)
+           ->  Nested Loop  (cost=11.81..4442.46 rows=32000 width=10)
+                 ->  Nested Loop  (cost=11.38..248.58 rows=400 width=4)
+                       ->  Seq Scan on nation nation_1  (cost=0.00..1.31 rows=1 width=4)
+                             Filter: (n_name = 'GERMANY'::bpchar)
+                       ->  Bitmap Heap Scan on supplier supplier_1  (cost=11.38..243.27 rows=400 width=8)
+                             Recheck Cond: (s_nationkey = nation_1.n_nationkey)
+                             ->  Bitmap Index Scan on idx_supplier_nation_key  (cost=0.00..11.29 rows=400 width=0)
+                                   Index Cond: (s_nationkey = nation_1.n_nationkey)
+                 ->  Index Scan using idx_partsupp_suppkey on partsupp partsupp_1  (cost=0.42..9.68 rows=80 width=14)
+                       Index Cond: (ps_suppkey = supplier_1.s_suppkey)
+   ->  Sort  (cost=8090.33..8116.99 rows=10667 width=36)
+         Sort Key: (sum((partsupp.ps_supplycost * (partsupp.ps_availqty)::numeric))) DESC
+         ->  GroupAggregate  (cost=6836.99..8036.99 rows=10667 width=36)
+               Group Key: partsupp.ps_partkey
+               Filter: (sum((partsupp.ps_supplycost * (partsupp.ps_availqty)::numeric)) > $2)
+               ->  Sort  (cost=6836.99..6916.99 rows=32000 width=14)
+                     Sort Key: partsupp.ps_partkey
+                     ->  Nested Loop  (cost=11.81..4442.46 rows=32000 width=14)
+                           ->  Nested Loop  (cost=11.38..248.58 rows=400 width=4)
+                                 ->  Seq Scan on nation  (cost=0.00..1.31 rows=1 width=4)
+                                       Filter: (n_name = 'GERMANY'::bpchar)
+                                 ->  Bitmap Heap Scan on supplier  (cost=11.38..243.27 rows=400 width=8)
+                                       Recheck Cond: (s_nationkey = nation.n_nationkey)
+                                       ->  Bitmap Index Scan on idx_supplier_nation_key  (cost=0.00..11.29 rows=400 width=0)
+                                             Index Cond: (s_nationkey = nation.n_nationkey)
+                           ->  Index Scan using idx_partsupp_suppkey on partsupp  (cost=0.42..9.68 rows=80 width=18)
+                                 Index Cond: (ps_suppkey = supplier.s_suppkey)
+(30 rows)
+
+Time: 7.666 ms

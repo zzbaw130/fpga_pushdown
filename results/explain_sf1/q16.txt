@@ -1,0 +1,25 @@
+Timing is on.
+                                                                                             QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=41097.41..41097.42 rows=1 width=44)
+   ->  Sort  (cost=41097.41..41136.99 rows=15832 width=44)
+         Sort Key: (count(DISTINCT partsupp.ps_suppkey)) DESC, part.p_brand, part.p_type, part.p_size
+         ->  GroupAggregate  (cost=40134.16..41018.25 rows=15832 width=44)
+               Group Key: part.p_brand, part.p_type, part.p_size
+               ->  Sort  (cost=40134.16..40279.31 rows=58062 width=40)
+                     Sort Key: part.p_brand, part.p_type, part.p_size
+                     ->  Gather  (cost=7678.54..35539.91 rows=58062 width=40)
+                           Workers Planned: 2
+                           ->  Parallel Hash Join  (cost=6678.54..28733.71 rows=24192 width=40)
+                                 Hash Cond: (partsupp.ps_partkey = part.p_partkey)
+                                 ->  Parallel Seq Scan on partsupp  (cost=347.00..21964.67 rows=166667 width=8)
+                                       Filter: (NOT (hashed SubPlan 1))
+                                       SubPlan 1
+                                         ->  Seq Scan on supplier  (cost=0.00..347.00 rows=1 width=4)
+                                               Filter: ((s_comment)::text ~~ '%Customer%Complaints%'::text)
+                                 ->  Parallel Hash  (cost=6180.33..6180.33 rows=12096 width=40)
+                                       ->  Parallel Seq Scan on part  (cost=0.00..6180.33 rows=12096 width=40)
+                                             Filter: ((p_brand <> 'Brand#35'::bpchar) AND ((p_type)::text !~~ 'LARGE POLISHED%'::text) AND (p_size = ANY ('{34,19,32,29,25,31,45,46}'::integer[])))
+(19 rows)
+
+Time: 5.103 ms

@@ -1,0 +1,21 @@
+Timing is on.
+                                                                                                                                        QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=254775.17..254809.71 rows=1 width=27)
+   ->  Finalize GroupAggregate  (cost=254775.17..255016.91 rows=7 width=27)
+         Group Key: lineitem.l_shipmode
+         ->  Gather Merge  (cost=254775.17..255016.74 rows=14 width=27)
+               Workers Planned: 2
+               ->  Partial GroupAggregate  (cost=253775.15..254015.10 rows=7 width=27)
+                     Group Key: lineitem.l_shipmode
+                     ->  Sort  (cost=253775.15..253805.14 rows=11994 width=27)
+                           Sort Key: lineitem.l_shipmode
+                           ->  Parallel Hash Join  (cost=211973.82..252962.55 rows=11994 width=27)
+                                 Hash Cond: (orders.o_orderkey = lineitem.l_orderkey)
+                                 ->  Parallel Seq Scan on orders  (cost=0.00..32345.00 rows=625000 width=20)
+                                 ->  Parallel Hash  (cost=211823.90..211823.90 rows=11994 width=15)
+                                       ->  Parallel Seq Scan on lineitem  (cost=0.00..211823.90 rows=11994 width=15)
+                                             Filter: ((l_shipmode = ANY ('{AIR,TRUCK}'::bpchar[])) AND (l_commitdate < l_receiptdate) AND (l_shipdate < l_commitdate) AND (l_receiptdate >= '1996-01-01'::date) AND (l_receiptdate < '1997-01-01 00:00:00'::timestamp without time zone))
+(15 rows)
+
+Time: 3.575 ms

@@ -1,0 +1,42 @@
+Timing is on.
+                                                                 QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=56256.30..56256.31 rows=1 width=192)
+   ->  Sort  (cost=56256.30..56256.31 rows=1 width=192)
+         Sort Key: supplier.s_acctbal DESC, nation.n_name, supplier.s_name, part.p_partkey
+         ->  Hash Join  (cost=28756.75..56256.29 rows=1 width=192)
+               Hash Cond: ((part.p_partkey = partsupp.ps_partkey) AND ((SubPlan 1) = partsupp.ps_supplycost))
+               ->  Gather  (cost=1000.00..6430.50 rows=835 width=30)
+                     Workers Planned: 2
+                     ->  Parallel Seq Scan on part  (cost=0.00..5347.00 rows=348 width=30)
+                           Filter: (((p_type)::text ~~ '%NICKEL'::text) AND (p_size = 19))
+               ->  Hash  (cost=21449.75..21449.75 rows=160000 width=172)
+                     ->  Nested Loop  (cost=1.99..21449.75 rows=160000 width=172)
+                           ->  Nested Loop  (cost=1.56..480.32 rows=2000 width=166)
+                                 Join Filter: (nation.n_regionkey = region.r_regionkey)
+                                 ->  Seq Scan on region  (cost=0.00..1.06 rows=1 width=4)
+                                       Filter: (r_name = 'MIDDLE EAST'::bpchar)
+                                 ->  Hash Join  (cost=1.56..354.26 rows=10000 width=170)
+                                       Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+                                       ->  Seq Scan on supplier  (cost=0.00..322.00 rows=10000 width=144)
+                                       ->  Hash  (cost=1.25..1.25 rows=25 width=34)
+                                             ->  Seq Scan on nation  (cost=0.00..1.25 rows=25 width=34)
+                           ->  Index Scan using idx_partsupp_suppkey on partsupp  (cost=0.42..9.68 rows=80 width=14)
+                                 Index Cond: (ps_suppkey = supplier.s_suppkey)
+               SubPlan 1
+                 ->  Aggregate  (cost=43.45..43.46 rows=1 width=32)
+                       ->  Nested Loop  (cost=0.85..43.45 rows=1 width=6)
+                             Join Filter: (nation_1.n_regionkey = region_1.r_regionkey)
+                             ->  Seq Scan on region region_1  (cost=0.00..1.06 rows=1 width=4)
+                                   Filter: (r_name = 'MIDDLE EAST'::bpchar)
+                             ->  Nested Loop  (cost=0.85..42.33 rows=4 width=10)
+                                   ->  Nested Loop  (cost=0.71..41.71 rows=4 width=10)
+                                         ->  Index Scan using idx_partsupp_partkey on partsupp partsupp_1  (cost=0.42..8.50 rows=4 width=10)
+                                               Index Cond: (ps_partkey = part.p_partkey)
+                                         ->  Index Scan using supplier_pkey on supplier supplier_1  (cost=0.29..8.30 rows=1 width=8)
+                                               Index Cond: (s_suppkey = partsupp_1.ps_suppkey)
+                                   ->  Index Scan using nation_pkey on nation nation_1  (cost=0.14..0.16 rows=1 width=8)
+                                         Index Cond: (n_nationkey = supplier_1.s_nationkey)
+(36 rows)
+
+Time: 7.647 ms

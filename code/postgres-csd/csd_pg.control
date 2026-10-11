@@ -1,0 +1,4 @@
+comment = 'CEMU computational-storage paths and plan lowering'
+default_version = '0.1'
+module_pathname = '$libdir/csd_pg'
+relocatable = true
