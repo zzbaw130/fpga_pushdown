@@ -82,9 +82,14 @@ capacity exceeds the arena, build FIFO batches instead write directly to radix
 Flash partitions. Exact partition bytes can double the initial fan-out before
 probe replay when skew is detected. An oversized build from any other subtree
 is still classified from its complete `Batch`, while its eligible left Scan
-writes each FIFO batch directly to Flash with a global ordinal. Uncertain,
-DISTINCT, or oversized grouped Aggregate inputs still use the accumulating
-compatibility path, so the full operator pipeline is not yet hard-bounded.
+writes each FIFO batch directly to Flash with a global ordinal. Uncertain or
+DISTINCT grouped Aggregate inputs still use the accumulating compatibility
+path. A partitioned Join's final Flash run has a stronger fallback: if its
+downstream non-DISTINCT Aggregate state unexpectedly exceeds the arena, the
+intact run is reread into direct-to-Flash radix chains and one partition is
+aggregated at a time. Oversized replay partitions recursively use higher hash
+bits. Other plan shapes still keep compatibility paths, so the full operator
+pipeline is not yet hard-bounded.
 The visibility contract is
 intentionally strict: only planner-proven frozen/all-visible pages may use
 this path.  External/TOASTed or compressed varlena values and unsupported
@@ -114,7 +119,7 @@ CEMU:
 | Operator | Functional model | Blocking / spill rule |
 | --- | --- | --- |
 | Filter, project | SIMD-like lanes executing bounded expression bytecode | Never blocks; output compacts valid lanes |
-| Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state; eligible direct Scan chains update state per FIFO batch | Oversized or uncertain grouped state radix-partitions input rows by the complete group key and replays each partition |
+| Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state; eligible direct Scan and partitioned-Join chains update state per bounded batch | Oversized or uncertain grouped state radix-partitions input rows by the complete group key and replays each partition; eligible Join-fed non-DISTINCT state can write partitions directly from the intact final run |
 | Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE; an eligible left Scan chain probes one resident build hash per FIFO batch | Eligible two-sided Scan chains stream an oversized build and probe directly to Flash; other oversized builds use complete-input classification before probe batches stream, then matching pairs replay one at a time |
 | Sort | multi-key bounded run generation followed by stable merge passes | A direct Scan pipeline grows one arena-accounted run row by row, flushes before exceeding the lease, retains only Flash handles, and reads pairs back for stable merge |
 
@@ -151,10 +156,13 @@ either probes that one resident hash table or writes directly to radix
 partitions batch by batch. If the right side is itself a sole Scan pipeline and
 its conservative capacity exceeds the arena, it is also consumed batch by
 batch into build partitions. Other blocking consumers still accumulate FIFO
-output before execution. The task layer remains DAG-level concurrency;
-direct-to-Flash streaming Aggregate partitions and double-buffering decode
-against consumption remain separate steps rather than being conflated with
-thread-level parallelism.
+output before execution. A partitioned Join final run can feed a sole
+non-DISTINCT Aggregate in bounded chunks; if the Aggregate state crosses the
+arena limit, those chunks are written directly to group-key radix chains and
+recursively replayed without a complete Join output batch. The task layer
+remains DAG-level concurrency; double-buffering decode against consumption
+remains a separate step rather than being conflated with thread-level
+parallelism.
 
 CEMU currently retains a shared-library mapping after its unload control
 command even when the CSD kernel itself has no TLS segment. Normal repeated

@@ -248,7 +248,9 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   Flash 反向链 handle 结束时强制 flush，以保证每个 leaf run 的 ordinal 单调性。若最终
   run 的唯一后继是任意 Filter/Project 链加 non-DISTINCT Aggregate，则按 staging-bounded
   chunk 直接更新聚合状态，不再恢复完整 visible Join `Batch`；聚合 state 实际超出 arena
-  时释放 partial state、重读仍完整的 final run，并进入原 materialized/radix 兼容路径。
+  时释放 partial state、重读仍完整的 final run，并把有界 chunk 按完整 group key 直接写入
+  Flash handle chain。之后每次只 replay 一个 partition，仍超限时使用更高 hash bits 递归
+  repartition，不再回到完整 Join 输出物化路径。
 - Grouped Aggregate：每个 group 永远落入一个 partition，保留 DISTINCT 与 AVG
   sum/count 语义；collision partition 使用更高 hash bits 递归 partition。新 group 和
   DISTINCT item 在插入前原子计费，一旦过 arena threshold 就丢弃 partial table 并按
@@ -262,17 +264,19 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
 
 必须诚实保留的当前边界：直接 Scan-to-Sort、符合准入条件的 Scan-to-Aggregate，以及
 Join 左/probe 链已消除对应完整 Scan `Batch`；符合两侧 Scan 准入的超大 Join build 也
-直接逐 batch 分区。非 Scan build 子树、超大/不确定/含 DISTINCT Aggregate 输入以及最终
-阻塞输出仍会累计。cursor chunk、hash state 仍是普通 STL container，而非真实 FDM
+直接逐 batch 分区。非 Scan build 子树、不能从完整 Flash run 重放的超大/不确定/含
+DISTINCT Aggregate 输入以及最终阻塞输出仍会累计。cursor chunk、hash state 仍是普通
+STL container，而非真实 FDM
 arena allocator；streamed Join 的句柄 payload 已由 Flash 链约束为 O(partition count)，
 但 descriptor vector 仍有 STL allocator 开销，adaptive repartition 也不会在 query 内
 回收旧 data/chain scratch record。partitioned Join 的 ordinal reorder payload 已约束为
 O(log run count)，probe fan-out 暂存已由 spill staging 容量约束，但最终 visible output
 仅在 Join-to-Join、最终返回、DISTINCT/不支持 Aggregate 或容量回退时仍完整物化；符合
-sole-consumer non-DISTINCT Aggregate 形状的 final run 已按 chunk 直连。
+sole-consumer non-DISTINCT Aggregate 形状的 final run 已按 chunk 直连，runtime state
+超限也已由直接 Aggregate partition writer + recursive replay 约束。
 虽然 scan window、FIFO、run generation、cursor merge、部分 Aggregate/Join state、spill
 I/O 和 blocking lease 已有界，但在实现 Join-to-Join/final-result consumer、
-Aggregate streaming partition writer 与 arena-backed container 前，不能声称 SF=32
+其他 Aggregate 输入形状的 streaming partition writer 与 arena-backed container 前，不能声称 SF=32
 端到端物理内存已严格有界。global Aggregate 的大型
 DISTINCT 仍保留 compatibility/protection-copy 路径。
 
@@ -355,6 +359,12 @@ varlena 两组低内存 Flash spill 均 exact，最终 kernel 的 forced-CSD Q1-
 Scan-to-Aggregate 流式驻留验证位于
 `results/tpch_sf1_streaming_aggregate_validation.md`；最终 v3 kernel 的 Q1/Q6 profile、
 forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归与 ASan/UBSan 均通过。
+Join-to-Aggregate 的 runtime 聚合状态超限不再恢复完整 Join 输出，而是直接写入 Flash
+radix chain 并递归 replay；验证位于
+`results/tpch_sf1_stream_aggregate_partition_validation.md`。192 B arena 的定向测试触发
+fallback/repartition 并得到 3 个 exact group；1 MiB Q12 证明正常融合路径的 31,235 行由
+3 个有界 batch 消费，最终 forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归以及
+optimized/ASan/UBSan/guest 单元测试均通过。
 one-sided Scan-to-Join 验证位于
 `results/tpch_sf1_streaming_join_validation.md`；最终 v2 kernel 的 Q3/Q5 profile、
 build 超限回退、forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归与 ASan/UBSan

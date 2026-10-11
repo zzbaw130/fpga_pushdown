@@ -959,6 +959,7 @@
                             return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x436);
                         row->pop_back();
                     }
+                    chunk.columns = state.visible_columns;
                     const uint64_t rows = chunk.rows.size();
                     if (!checked_add(emitted_rows, rows, &emitted_rows))
                         return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x43b);
@@ -1012,8 +1013,8 @@
     /* A partitioned Join already owns a stable Flash run. Feed that run to a
      * compatible downstream Aggregate one decoded chunk at a time instead of
      * reconstructing the complete visible Join Batch. If the runtime hash
-     * state exceeds the shared arena, replay the still-intact run through the
-     * existing materialized compatibility path. */
+     * state exceeds the shared arena, replay the still-intact run into
+     * bounded Aggregate radix chains and aggregate one partition at a time. */
     bool apply_join_downstream_pipeline(
         Batch &input, const std::vector<uint32_t> &pipeline, Batch *output)
     {
@@ -1059,6 +1060,9 @@
 
         bool capacity_exceeded = false;
         uint64_t required_bytes = 0;
+        uint64_t processed_rows = 0;
+        uint16_t aggregate_input_columns = 0;
+        std::vector<uint16_t> group_columns;
         {
             StreamingAggregateState aggregate_state;
             Batch discarded;
@@ -1091,6 +1095,11 @@
             if (streamed)
                 streamed = finish_streaming_aggregate(aggregate_index,
                     aggregate_node, &aggregate_state, output);
+            if (capacity_exceeded && aggregate_state.configured) {
+                processed_rows = aggregate_state.input_rows;
+                aggregate_input_columns = aggregate_state.input_columns;
+                group_columns = aggregate_state.group_columns;
+            }
             release_streaming_aggregate_memory(&aggregate_state);
             if (streamed) return true;
         }
@@ -1099,19 +1108,39 @@
         {
             std::lock_guard<std::mutex> status_guard(status_mutex_);
             ++status_.stream_join_downstream_fallbacks;
+            ++status_.stream_aggregate_partitioned_calls;
         }
-        Batch materialized;
-        materialized.columns = runs->visible_columns;
+        uint64_t state_estimate = required_bytes;
+        if (processed_rows != 0 && runs->rows > processed_rows) {
+            uint64_t scaled = 0;
+            if (checked_mul(required_bytes, runs->rows, &scaled)) {
+                state_estimate = scaled / processed_rows;
+                if (scaled % processed_rows != 0 &&
+                    state_estimate != std::numeric_limits<uint64_t>::max())
+                    ++state_estimate;
+            } else {
+                state_estimate = std::numeric_limits<uint64_t>::max();
+            }
+        }
+        StreamingAggregatePartitions partitions;
+        if (!configure_streaming_aggregate_partitions(aggregate_index,
+                aggregate_input_columns, group_columns, state_estimate, 0,
+                &partitions))
+            return false;
+        Batch discarded;
+        discarded.columns = runs->visible_columns;
+        std::function<bool(Batch &)> partition_consumer = [&](Batch &chunk) {
+            Batch prepared;
+            if (!apply_join_downstream_pipeline(chunk, pipeline, &prepared))
+                return false;
+            return consume_streaming_aggregate_partition_batch(
+                aggregate_index, prepared, &partitions);
+        };
         if (have_final && !stream_join_ordinal_handle(join_index, *runs,
-                final_handle, &materialized))
+                final_handle, &discarded, &partition_consumer))
             return false;
-        Batch prepared;
-        if (!apply_join_downstream_pipeline(materialized, pipeline,
-                                            &prepared))
-            return false;
-        (void) required_bytes;
-        return execute_aggregate(aggregate_index, aggregate_node,
-                                 prepared, output);
+        return finish_streaming_aggregate_partitions(aggregate_index,
+            aggregate_node, &partitions, output);
     }
 
     struct StreamingPartitionedJoinState {

@@ -369,7 +369,8 @@
      * reverse traversal is harmless because probe rows carry global ordinals
      * and build hash insertion order is not observable. */
     bool append_spill_chain_handle(uint32_t index, const SpillHandle &handle,
-                                   SpillHandleChain *chain)
+                                   SpillHandleChain *chain,
+                                   bool account_join = true)
     {
         SpillChainRecord record = {};
         record.magic = kSpillChainMagic;
@@ -400,14 +401,18 @@
         {
             std::lock_guard<std::mutex> status_guard(status_mutex_);
             status_.spill_write_bytes += sizeof(record);
-            ++status_.stream_join_chain_records;
+            if (account_join)
+                ++status_.stream_join_chain_records;
+            else
+                ++status_.stream_aggregate_chain_records;
         }
         return true;
     }
 
     bool read_spill_chain_handle(uint32_t index, uint64_t record_offset,
                                  uint64_t *previous_offset,
-                                 SpillHandle *handle)
+                                 SpillHandle *handle,
+                                 bool account_join = true)
     {
         SpillChainRecord record = {};
         {
@@ -432,7 +437,10 @@
         {
             std::lock_guard<std::mutex> status_guard(status_mutex_);
             status_.spill_read_bytes += sizeof(record);
-            ++status_.stream_join_chain_record_reads;
+            if (account_join)
+                ++status_.stream_join_chain_record_reads;
+            else
+                ++status_.stream_aggregate_chain_record_reads;
         }
         return true;
     }
@@ -440,14 +448,16 @@
     template <typename Consumer>
     bool for_each_spill_chain_handle(uint32_t index,
                                      const SpillHandleChain &chain,
-                                     Consumer consumer)
+                                     Consumer consumer,
+                                     bool account_join = true)
     {
         uint64_t offset = chain.tail_offset;
         for (uint64_t item = 0; item < chain.count; ++item) {
             SpillHandle handle;
             uint64_t previous = 0;
             if (offset == std::numeric_limits<uint64_t>::max() ||
-                !read_spill_chain_handle(index, offset, &previous, &handle) ||
+                !read_spill_chain_handle(index, offset, &previous, &handle,
+                                         account_join) ||
                 !consumer(handle))
                 return false;
             offset = previous;

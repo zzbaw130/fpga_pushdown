@@ -131,6 +131,12 @@ Partition replay writes tagged result chunks as sorted Flash runs. A
 binary-carry merge retains at most one handle per level, so ordinal-reorder
 metadata is logarithmic rather than a complete output-sized vector. The final
 run is decoded in bounded chunks while its hidden ordinal is removed.
+When the sole successor is a Filter/Project chain ending in a non-DISTINCT
+Aggregate, those chunks update the Aggregate state directly. If the state
+exceeds the arena, the engine releases it and rereads the intact final run into
+group-key radix chains on Flash. It then aggregates one chain at a time and
+recursively repartitions a chain that remains too large, rather than restoring
+the complete visible Join result.
 The replay hash probe itself emits one joined row at a time into a buffer
 bounded by the reusable spill staging capacity; it no longer constructs a
 complete `partition_output` for a potentially high-fanout probe chunk. The

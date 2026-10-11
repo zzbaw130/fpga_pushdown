@@ -418,6 +418,13 @@ struct CsdSqlExecutionStatus {
     uint64_t stream_join_downstream_rows;
     uint64_t stream_join_downstream_peak_bytes;
     uint64_t stream_join_downstream_fallbacks;
+    uint64_t stream_aggregate_partitioned_calls;
+    uint64_t stream_aggregate_partition_batches;
+    uint64_t stream_aggregate_partition_rows;
+    uint64_t stream_aggregate_repartition_passes;
+    uint64_t stream_aggregate_chain_records;
+    uint64_t stream_aggregate_chain_record_reads;
+    uint64_t stream_aggregate_chain_peak_bytes;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

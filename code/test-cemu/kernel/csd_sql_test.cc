@@ -787,6 +787,26 @@ void test_streaming_scan_join_probe_batches(bool fit_build,
         reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
     if (aggregate_output) {
         if (aggregate_fallback) {
+            if (result->row_count != 3 || result->column_count != 2)
+                std::fprintf(stderr,
+                    "stream aggregate partition result rows=%u columns=%u "
+                    "status=%u node=%u detail=%u calls=%llu batches=%llu "
+                    "rows=%llu records=%llu reads=%llu repartitions=%llu\n",
+                    result->row_count, result->column_count,
+                    execution->status_code, execution->failed_node,
+                    execution->reserved32,
+                    static_cast<unsigned long long>(
+                        execution->stream_aggregate_partitioned_calls),
+                    static_cast<unsigned long long>(
+                        execution->stream_aggregate_partition_batches),
+                    static_cast<unsigned long long>(
+                        execution->stream_aggregate_partition_rows),
+                    static_cast<unsigned long long>(
+                        execution->stream_aggregate_chain_records),
+                    static_cast<unsigned long long>(
+                        execution->stream_aggregate_chain_record_reads),
+                    static_cast<unsigned long long>(
+                        execution->stream_aggregate_repartition_passes));
             assert(result->row_count == 3 && result->column_count == 2);
             bool found[6] = {};
             for (uint32_t row = 0; row < result->row_count; ++row) {
@@ -830,12 +850,31 @@ void test_streaming_scan_join_probe_batches(bool fit_build,
         assert(execution->stream_join_streamed_build_calls == 1);
         assert(execution->stream_join_ordinal_runs > 0);
         assert(execution->stream_join_downstream_calls == 1);
-        assert(execution->stream_join_downstream_batches == 1);
-        assert(execution->stream_join_downstream_rows == 3);
+        assert(execution->stream_join_downstream_batches ==
+               (aggregate_fallback ? 2U : 1U));
+        assert(execution->stream_join_downstream_rows ==
+               (aggregate_fallback ? 6U : 3U));
         assert(execution->stream_join_downstream_peak_bytes > 0);
         assert(execution->stream_join_downstream_peak_bytes <= spill.size());
         assert(execution->stream_join_downstream_fallbacks ==
                (aggregate_fallback ? 1U : 0U));
+        assert(execution->stream_aggregate_partitioned_calls ==
+               (aggregate_fallback ? 1U : 0U));
+        if (aggregate_fallback) {
+            assert(execution->stream_aggregate_partition_batches >= 1);
+            assert(execution->stream_aggregate_partition_rows >= 3);
+            assert(execution->stream_aggregate_repartition_passes > 0);
+            assert(execution->stream_aggregate_chain_records > 0);
+            assert(execution->stream_aggregate_chain_record_reads > 0);
+            assert(execution->stream_aggregate_chain_peak_bytes > 0);
+        } else {
+            assert(execution->stream_aggregate_partition_batches == 0);
+            assert(execution->stream_aggregate_partition_rows == 0);
+            assert(execution->stream_aggregate_repartition_passes == 0);
+            assert(execution->stream_aggregate_chain_records == 0);
+            assert(execution->stream_aggregate_chain_record_reads == 0);
+            assert(execution->stream_aggregate_chain_peak_bytes == 0);
+        }
         assert(execution->operator_peak_bytes <= header.operator_bytes);
         assert(execution->spill_write_bytes > 0);
         assert(execution->spill_read_bytes > 0);

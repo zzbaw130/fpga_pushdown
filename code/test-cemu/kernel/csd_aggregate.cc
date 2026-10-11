@@ -66,12 +66,22 @@
               input_rows(0), configured(false) {}
     };
 
-    /* A streaming aggregate cannot reconstruct already-consumed raw rows if
-     * its hash state unexpectedly outgrows the arena.  Select this path only
-     * for fixed-size global state or for a non-DISTINCT grouped state whose
-     * planner estimate has eightfold headroom.  Larger/uncertain grouped state
-     * retains the existing raw-row radix replay until direct streaming
-     * partition writers are installed. */
+    struct StreamingAggregatePartitions {
+        uint16_t columns;
+        uint8_t radix_shift;
+        uint8_t radix_bits;
+        uint64_t rows;
+        std::vector<uint16_t> group_columns;
+        std::vector<SpillHandleChain> chains;
+        StreamingAggregatePartitions()
+            : columns(0), radix_shift(0), radix_bits(0), rows(0) {}
+    };
+
+    /* Scan-to-Aggregate has no retained source run to replay if its hash state
+     * unexpectedly outgrows the arena. Select it only for fixed-size global
+     * state or a non-DISTINCT grouped state with eightfold planner headroom.
+     * Partitioned Join-to-Aggregate has an intact final Flash run and can use
+     * the streaming partition writer below as a runtime fallback. */
     bool can_replay_stream_aggregate(const CsdSqlPlanNode &node)
     {
         const CsdSqlAggregateSpec *spec = NULL;
@@ -439,6 +449,201 @@
         if (state->project_node != NULL)
             add_cycles(state->input_rows, *state->project_node);
         add_cycles(state->input_rows * 2 + output->rows.size(), node);
+        return true;
+    }
+
+    void note_streaming_aggregate_chain_memory(size_t chain_count)
+    {
+        uint64_t bytes = 0;
+        if (!checked_mul(chain_count, sizeof(SpillHandleChain), &bytes))
+            bytes = std::numeric_limits<uint64_t>::max();
+        std::lock_guard<std::mutex> status_guard(status_mutex_);
+        status_.stream_aggregate_chain_peak_bytes = std::max<uint64_t>(
+            status_.stream_aggregate_chain_peak_bytes, bytes);
+    }
+
+    bool choose_streaming_aggregate_partitions(
+        uint32_t index, uint64_t state_estimate, uint8_t radix_shift,
+        size_t *partition_count, uint8_t *radix_bits)
+    {
+        const uint64_t capacity = std::max<uint64_t>(
+            1, operator_memory_capacity_);
+        const uint64_t required = state_estimate == 0 ? 2 :
+            std::max<uint64_t>(2,
+                1 + (state_estimate - 1) / capacity);
+        if (radix_shift >= 16)
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x51e);
+        const size_t maximum = size_t(1) << (16 - radix_shift);
+        size_t count = 2;
+        while (count < required && count < maximum) count <<= 1;
+        if (count < required)
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x51f);
+        uint8_t bits = 0;
+        for (size_t value = count; value > 1; value >>= 1) ++bits;
+        *partition_count = count;
+        *radix_bits = bits;
+        return true;
+    }
+
+    bool configure_streaming_aggregate_partitions(
+        uint32_t index, uint16_t columns,
+        const std::vector<uint16_t> &group_columns,
+        uint64_t state_estimate, uint8_t radix_shift,
+        StreamingAggregatePartitions *partitions)
+    {
+        if (group_columns.empty())
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x520);
+        size_t partition_count = 0;
+        uint8_t radix_bits = 0;
+        if (!choose_streaming_aggregate_partitions(index, state_estimate,
+                radix_shift, &partition_count, &radix_bits))
+            return false;
+        partitions->columns = columns;
+        partitions->radix_shift = radix_shift;
+        partitions->radix_bits = radix_bits;
+        partitions->group_columns = group_columns;
+        partitions->chains.resize(partition_count);
+        note_streaming_aggregate_chain_memory(partition_count);
+        return true;
+    }
+
+    bool consume_streaming_aggregate_partition_batch(
+        uint32_t index, Batch &batch,
+        StreamingAggregatePartitions *partitions)
+    {
+        if (batch.columns != partitions->columns ||
+            partitions->chains.empty())
+            return fail(CSD_SQL_STATUS_BAD_NODE, index, 0x521);
+        std::vector<std::vector<size_t> > selected(
+            partitions->chains.size());
+        for (size_t row_index = 0; row_index < batch.rows.size();
+             ++row_index) {
+            const std::string key = group_key(batch.rows[row_index],
+                partitions->group_columns.data(),
+                partitions->group_columns.size());
+            const size_t partition =
+                (std::hash<std::string>()(key) >>
+                    partitions->radix_shift) &
+                (partitions->chains.size() - 1);
+            selected[partition].push_back(row_index);
+        }
+        for (size_t partition = 0; partition < selected.size(); ++partition) {
+            if (selected[partition].empty()) continue;
+            SpillHandle handle;
+            if (!spill_selected_rows(index, batch, selected[partition],
+                                     false, &handle) ||
+                !append_spill_chain_handle(index, handle,
+                    &partitions->chains[partition], false))
+                return false;
+        }
+        if (!checked_add(partitions->rows, batch.rows.size(),
+                         &partitions->rows))
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x522);
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_aggregate_partition_batches;
+            uint64_t total = 0;
+            status_.stream_aggregate_partition_rows = checked_add(
+                status_.stream_aggregate_partition_rows,
+                batch.rows.size(), &total) ? total :
+                std::numeric_limits<uint64_t>::max();
+        }
+        return true;
+    }
+
+    bool replay_streaming_aggregate_chain(
+        uint32_t index, const CsdSqlPlanNode &node,
+        const SpillHandleChain &chain, uint16_t columns,
+        const std::vector<uint16_t> &group_columns,
+        uint8_t radix_shift, Batch *output)
+    {
+        StreamingAggregateState aggregate_state;
+        if (!configure_streaming_aggregate(index, node, columns, NULL,
+                                            &aggregate_state))
+            return false;
+        bool capacity_exceeded = false;
+        uint64_t required_bytes = 0;
+        const bool streamed = for_each_spill_chain_handle(index, chain,
+            [&](const SpillHandle &handle) {
+                return stream_spill_batch(index, handle, [&](Batch &chunk) {
+                    return consume_streaming_aggregate_batch(index, node,
+                        chunk, NULL, &aggregate_state, true,
+                        &capacity_exceeded, &required_bytes);
+                });
+            }, false);
+        if (streamed) {
+            Batch partial;
+            const bool finished = finish_streaming_aggregate(index, node,
+                &aggregate_state, &partial);
+            release_streaming_aggregate_memory(&aggregate_state);
+            if (!finished) return false;
+            output->columns = partial.columns;
+            output->rows.insert(output->rows.end(),
+                std::make_move_iterator(partial.rows.begin()),
+                std::make_move_iterator(partial.rows.end()));
+            return true;
+        }
+        const bool oversized_single_group = capacity_exceeded &&
+            aggregate_state.groups.empty() &&
+            aggregate_state.held_bytes == 0;
+        release_streaming_aggregate_memory(&aggregate_state);
+        if (failed_ || !capacity_exceeded) return false;
+        if (oversized_single_group)
+            return fail(CSD_SQL_STATUS_UNSUPPORTED, index, 0x523);
+
+        StreamingAggregatePartitions children;
+        if (!configure_streaming_aggregate_partitions(index, columns,
+                group_columns, required_bytes, radix_shift, &children))
+            return false;
+        {
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.stream_aggregate_repartition_passes;
+        }
+        if (!for_each_spill_chain_handle(index, chain,
+                [&](const SpillHandle &handle) {
+                    return stream_spill_batch(index, handle,
+                        [&](Batch &chunk) {
+                            return consume_streaming_aggregate_partition_batch(
+                                index, chunk, &children);
+                        });
+                }, false))
+            return false;
+        uint64_t repartition_work = 0;
+        if (!checked_mul(children.rows, 2, &repartition_work))
+            repartition_work = std::numeric_limits<uint64_t>::max();
+        add_cycles(repartition_work, node);
+        const uint8_t next_shift = static_cast<uint8_t>(
+            radix_shift + children.radix_bits);
+        for (size_t partition = 0; partition < children.chains.size();
+             ++partition) {
+            if (children.chains[partition].count == 0) continue;
+            if (!replay_streaming_aggregate_chain(index, node,
+                    children.chains[partition], columns, group_columns,
+                    next_shift, output))
+                return false;
+        }
+        return true;
+    }
+
+    bool finish_streaming_aggregate_partitions(
+        uint32_t index, const CsdSqlPlanNode &node,
+        StreamingAggregatePartitions *partitions, Batch *output)
+    {
+        output->columns = 0;
+        const uint8_t next_shift = static_cast<uint8_t>(
+            partitions->radix_shift + partitions->radix_bits);
+        for (size_t partition = 0;
+             partition < partitions->chains.size(); ++partition) {
+            if (partitions->chains[partition].count == 0) continue;
+            if (!replay_streaming_aggregate_chain(index, node,
+                    partitions->chains[partition], partitions->columns,
+                    partitions->group_columns, next_shift, output))
+                return false;
+        }
+        uint64_t partition_work = 0;
+        if (!checked_mul(partitions->rows, 2, &partition_work))
+            partition_work = std::numeric_limits<uint64_t>::max();
+        add_cycles(partition_work, node);
         return true;
     }
 
