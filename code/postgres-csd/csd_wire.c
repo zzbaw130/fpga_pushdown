@@ -724,6 +724,7 @@ csd_wire_append_sort_payload(CsdWireBuilder *builder, CsdSqlPlanNode *node,
 	List *payload = (List *) list_nth(metadata, 7);
 	List *clauses = (List *) list_nth(payload, 3);
 	List *target_list = (List *) list_nth(payload, 5);
+	int top_n_est = intVal(list_nth(payload, 9));
 	CsdSqlSortSpec sort = {0};
 	ListCell *cell;
 
@@ -732,6 +733,8 @@ csd_wire_append_sort_payload(CsdWireBuilder *builder, CsdSqlPlanNode *node,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("CSD Sort requires between 1 and 65535 keys")));
 	sort.key_count = list_length(clauses);
+	if (top_n_est > 0)
+		sort.top_n = (uint64) top_n_est;
 	node->expression_offset = builder->bytes.len;
 	csd_wire_append(&builder->bytes, &sort, sizeof(sort));
 	foreach(cell, clauses)
@@ -815,8 +818,10 @@ csd_wire_emit_node(CsdWireBuilder *builder, List *metadata)
 	{
 		List *payload = (List *) list_nth(metadata, 7);
 		int count_est = intVal(list_nth(payload, 9));
+		int offset_est = intVal(list_nth(payload, 10));
 
 		node.arg0 = count_est < 0 ? PG_UINT64_MAX : (uint64) count_est;
+		node.reserved = offset_est <= 0 ? 0 : (uint32) offset_est;
 	}
 	if (strcmp(name, "Right Hash Join") == 0)
 	{

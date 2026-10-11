@@ -18,8 +18,11 @@
             output->columns = input.columns;
             output->rows.swap(input.rows);
         } else *output = input;
+        const size_t offset = std::min<size_t>(node.reserved, output->rows.size());
+        if (offset != 0)
+            output->rows.erase(output->rows.begin(), output->rows.begin() + offset);
         if (node.arg0 < output->rows.size()) output->rows.resize(node.arg0);
-        add_cycles(output->rows.size(), node);
+        add_cycles(static_cast<uint64_t>(offset) + output->rows.size(), node);
         (void) index;
         return true;
     }

@@ -941,6 +941,8 @@ csd_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	const char *name;
 	double output_rows;
 	List *payload;
+	int wire_count_est = -1;
+	int wire_offset_est = 0;
 
 	if (csd_exe_path == CSD_EXE_HOST || input_rel == NULL || output_rel == NULL)
 		return;
@@ -961,6 +963,29 @@ csd_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 	if (stage == UPPERREL_FINAL)
 		final_extra = (FinalPathExtraData *) extra;
+	if (final_extra != NULL)
+	{
+		if (final_extra->limit_needed &&
+			(final_extra->count_est < 0 || final_extra->offset_est < 0 ||
+			 final_extra->count_est > PG_INT32_MAX ||
+			 final_extra->offset_est > PG_INT32_MAX))
+		{
+			csd_reject_if_forced("LIMIT/OFFSET must have a constant value representable by the CSD plan");
+			return;
+		}
+		/* PostgreSQL uses zero to mean that LIMIT is absent (LIMIT ALL).
+		 * The wire sentinel for the same condition is -1. */
+		wire_count_est = final_extra->count_est > 0 ?
+			(int) final_extra->count_est : -1;
+		wire_offset_est = (int) final_extra->offset_est;
+	}
+	else if (stage == UPPERREL_ORDERED && root->limit_tuples > 0.0 &&
+			 root->limit_tuples <= (double) PG_INT32_MAX)
+	{
+		/* PostgreSQL's bound already includes OFFSET. The Limit stage remains
+		 * responsible for discarding OFFSET rows after the CSD Sort. */
+		wire_count_est = (int) ceil(root->limit_tuples);
+	}
 	output_rows = stage == UPPERREL_FINAL ? 0.0 :
 		csd_output_rows(output_rel);
 	name = csd_upper_stage_name(stage);
@@ -978,10 +1003,8 @@ csd_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	payload = lappend(payload, copyObject(root->parse->distinctClause));
 	payload = lappend(payload, copyObject(root->parse->limitCount));
 	payload = lappend(payload, copyObject(root->parse->limitOffset));
-	payload = lappend(payload, makeInteger(final_extra != NULL ?
-		final_extra->count_est : -1));
-	payload = lappend(payload, makeInteger(final_extra != NULL ?
-		final_extra->offset_est : 0));
+	payload = lappend(payload, makeInteger(wire_count_est));
+	payload = lappend(payload, makeInteger(wire_offset_est));
 	foreach(input_cell, input_paths)
 	{
 		Path *input = (Path *) lfirst(input_cell);

@@ -1368,7 +1368,8 @@ void test_tpch_expression_and_multikey_pipeline()
     sort_group.key_column = 0; append(&plan, sort_group);
     nodes[4].expression_length = sizeof(sort) + 2 * sizeof(CsdSqlSortKey);
     nodes[5].left_input = 4;
-    nodes[5].arg0 = 2;
+    nodes[5].arg0 = 1;
+    nodes[5].reserved = 1;
 
     CsdSqlPlanHeader header = {};
     header.magic = CSD_SQL_PLAN_MAGIC;
@@ -1399,20 +1400,17 @@ void test_tpch_expression_and_multikey_pipeline()
     args.numr = 5; args.mr_addr = ranges; args.mr_len = lengths;
     args.cparam1 = plan.size(); args.cparam2 = 3;
     const long long execution_result = csd_sql(&args);
-    if (execution_result != 2)
+    if (execution_result != 1)
         std::fprintf(stderr, "feature execution failed: return=%lld status=%u node=%u\n", execution_result,
                      reinterpret_cast<const CsdSqlExecutionStatus *>(status.data())->status_code,
                      reinterpret_cast<const CsdSqlExecutionStatus *>(status.data())->failed_node);
-    assert(execution_result == 2);
+    assert(execution_result == 1);
     const CsdSqlResultHeader *result = reinterpret_cast<const CsdSqlResultHeader *>(output.data());
-    assert(result->row_count == 2 && result->column_count == 8);
+    assert(result->row_count == 1 && result->column_count == 8);
     const CsdSqlResultCell *cells = reinterpret_cast<const CsdSqlResultCell *>(output.data() + result->cells_offset);
-    assert(cells[0].integer == 2 && cells[1].integer == 1 && cells[2].integer == 1995);
-    assert(cells[3].integer == 60 && cells[4].integer == 1 && cells[5].integer == 60);
-    assert(cells[6].integer == 60 && cells[7].integer == 60);
-    assert(cells[8].integer == 1 && cells[9].integer == 2 && cells[10].integer == 1995);
-    assert(cells[11].integer == 40 && cells[12].integer == 1 && cells[13].integer == 20);
-    assert(cells[14].integer == 20 && cells[15].integer == 20);
+    assert(cells[0].integer == 1 && cells[1].integer == 2 && cells[2].integer == 1995);
+    assert(cells[3].integer == 40 && cells[4].integer == 1 && cells[5].integer == 20);
+    assert(cells[6].integer == 20 && cells[7].integer == 20);
     const CsdSqlExecutionStatus *execution =
         reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
     assert(execution->spill_write_bytes > 0);

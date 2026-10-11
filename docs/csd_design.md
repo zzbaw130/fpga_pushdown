@@ -193,9 +193,12 @@ plus payload block, and writes descriptors and variable payload directly to
 their final Flash offsets. It never constructs an intermediate merged `Batch`.
 When two runs remain, the same stable cursors merge directly into the
 planner-checked output boundary, so no final Flash record is written and
-immediately read back. Top-N sorts stop the cursor merge after N
-rows and reserve conservatively for the two input payloads, which bounds their
-actual Flash traffic without changing the global top-N result. Spill records
+immediately read back. PostgreSQL passes a finite SQL LIMIT to this descriptor;
+the bound includes OFFSET, so Top-N sorts stop every run/merge after
+`LIMIT + OFFSET` rows and the following Limit node skips OFFSET before applying
+LIMIT. Unbounded sorts leave the descriptor at zero. Cursor merge reserves
+conservatively for the two input payloads, which bounds the actual Flash
+traffic without changing the global top-N result. Spill records
 and every read are range-checked before deserialization. Status exposes cursor
 and writer peak bytes plus total rows emitted by merge passes.
 

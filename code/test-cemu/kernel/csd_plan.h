@@ -222,7 +222,7 @@ struct CsdSqlPlanNode {
     uint64_t estimated_bytes;
     uint64_t arg0; /* LIMIT count; Aggregate output bytes; Join build bytes */
     uint64_t arg1;
-    uint32_t reserved;
+    uint32_t reserved; /* LIMIT offset; zero for other nodes. */
 } __attribute__((packed));
 
 /* SCAN expression: CsdSqlScanSpec immediately followed by attr_count columns. */
