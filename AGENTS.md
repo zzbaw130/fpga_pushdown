@@ -70,6 +70,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `9ffae8781` | partitioned Join binary-carry ordinal merge、Q3 常驻 handle 150 B 与 22/22 回归 |
 | `7ce97b472` | partitioned Join 逐行扇出输出、Q3 pending peak 598,680 B 与 22/22 回归 |
 | `57b3c607d` | partitioned Join 最终 Flash run 直连 non-DISTINCT Aggregate、Q12/Q14/Q19 32 MiB 与 22/22 回归 |
+| `1a16674e3` | Join-to-Aggregate 超限直接写 Flash radix chain、递归 replay 与 22/22 回归 |
 
 ## 3. 环境不变量
 
