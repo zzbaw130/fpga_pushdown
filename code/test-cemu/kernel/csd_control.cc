@@ -608,8 +608,9 @@
         return true;
     }
 
-    bool init_spill_cursor(uint32_t index, const SpillHandle &handle,
-                           SpillRowCursor *cursor)
+    bool init_spill_cursor_bounded(uint32_t index, const SpillHandle &handle,
+                                   uint64_t requested_chunk_capacity,
+                                   SpillRowCursor *cursor)
     {
         cursor->handle = handle;
         cursor->initialized = true;
@@ -653,12 +654,24 @@
             return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x322);
         cursor->payload_start = handle.offset + sizeof(cursor->record) +
                                 cursor->cells_bytes;
-        const uint64_t quarter_stage = std::max<uint64_t>(
-            1, stage_capacity / 4);
-        cursor->chunk_capacity = std::min<uint64_t>(stage_capacity,
-            std::max<uint64_t>(cursor->row_cells_bytes, quarter_stage));
+        const uint64_t quarter_stage = std::max<uint64_t>(1,
+            stage_capacity / 4);
+        const uint64_t desired = requested_chunk_capacity == 0 ?
+            quarter_stage : requested_chunk_capacity;
+        if (desired > stage_capacity ||
+            (cursor->record.row_count != 0 &&
+             desired < cursor->row_cells_bytes))
+            return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x327);
+        cursor->chunk_capacity = std::max<uint64_t>(
+            cursor->row_cells_bytes, desired);
         cursor->chunk.columns = cursor->record.column_count;
         return true;
+    }
+
+    bool init_spill_cursor(uint32_t index, const SpillHandle &handle,
+                           SpillRowCursor *cursor)
+    {
+        return init_spill_cursor_bounded(index, handle, 0, cursor);
     }
 
     bool load_spill_cursor_descriptors(uint32_t index,
@@ -878,9 +891,11 @@
         return true;
     }
 
-    bool init_spill_writer(uint32_t index, uint16_t columns,
-                           uint64_t row_count, uint64_t max_payload_bytes,
-                           SpillRowWriter *writer)
+    bool init_spill_writer_bounded(uint32_t index, uint16_t columns,
+                                   uint64_t row_count,
+                                   uint64_t max_payload_bytes,
+                                   uint64_t requested_chunk_capacity,
+                                   SpillRowWriter *writer)
     {
         if (columns == 0 || row_count > std::numeric_limits<uint32_t>::max() ||
             max_payload_bytes > std::numeric_limits<uint32_t>::max())
@@ -897,6 +912,12 @@
             args_->mr_addr[header_->spill_range] == NULL ||
             args_->mr_len[header_->spill_range] <= 0)
             return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x22f);
+        const uint64_t stage_capacity = static_cast<uint64_t>(
+            args_->mr_len[header_->spill_range]);
+        const uint64_t chunk_capacity = requested_chunk_capacity == 0 ?
+            stage_capacity : requested_chunk_capacity;
+        if (chunk_capacity == 0 || chunk_capacity > stage_capacity)
+            return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x336);
         const uint64_t storage_capacity =
             (header_->flags & CSD_SQL_PLAN_FLASH_SPILL) ?
                 header_->spill_bytes : static_cast<uint64_t>(
@@ -914,10 +935,17 @@
         writer->row_count = static_cast<uint32_t>(row_count);
         writer->columns = columns;
         writer->reserved_length = reserved;
-        writer->chunk_capacity = static_cast<uint64_t>(
-            args_->mr_len[header_->spill_range]);
+        writer->chunk_capacity = chunk_capacity;
         writer->initialized = true;
         return true;
+    }
+
+    bool init_spill_writer(uint32_t index, uint16_t columns,
+                           uint64_t row_count, uint64_t max_payload_bytes,
+                           SpillRowWriter *writer)
+    {
+        return init_spill_writer_bounded(index, columns, row_count,
+                                         max_payload_bytes, 0, writer);
     }
 
     bool flush_spill_writer(uint32_t index, SpillRowWriter *writer)

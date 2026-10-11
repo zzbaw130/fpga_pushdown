@@ -32,13 +32,335 @@
         return true;
     }
 
+    struct SortRun {
+        SpillHandle handle;
+        uint64_t max_row_bytes;
+        SortRun() : max_row_bytes(0) {}
+        SortRun(const SpillHandle &run_handle, uint64_t row_bytes)
+            : handle(run_handle), max_row_bytes(row_bytes) {}
+    };
+
+    bool sort_batch_max_row_bytes(uint32_t index, const Batch &batch,
+                                  uint64_t *maximum)
+    {
+        *maximum = 0;
+        for (std::vector<Row>::const_iterator row = batch.rows.begin();
+             row != batch.rows.end(); ++row) {
+            uint64_t bytes = 0;
+            if (!streaming_sort_row_bytes(index, *row, batch.columns, &bytes))
+                return false;
+            *maximum = std::max<uint64_t>(*maximum, bytes);
+        }
+        return true;
+    }
+
+    size_t sort_kway_fan_in(const std::vector<SortRun> &runs) const
+    {
+        if (runs.size() <= 2 || header_->spill_range == CSD_SQL_INVALID_RANGE ||
+            header_->spill_range >= static_cast<uint32_t>(args_->numr) ||
+            args_->mr_len[header_->spill_range] <= 0)
+            return 2;
+        const uint64_t stage_capacity = static_cast<uint64_t>(
+            args_->mr_len[header_->spill_range]);
+        uint64_t max_row_bytes = 0;
+        for (std::vector<SortRun>::const_iterator run = runs.begin();
+             run != runs.end(); ++run) {
+            if (run->max_row_bytes == 0) return 2;
+            max_row_bytes = std::max<uint64_t>(max_row_bytes,
+                                               run->max_row_bytes);
+        }
+        const size_t maximum = std::min<size_t>(128, runs.size());
+        for (size_t fan_in = maximum; fan_in > 2; --fan_in) {
+            const uint64_t cursor_capacity = stage_capacity /
+                (8 * static_cast<uint64_t>(fan_in));
+            if (cursor_capacity >= max_row_bytes &&
+                stage_capacity / 2 >= max_row_bytes)
+                return fan_in;
+        }
+        return 2;
+    }
+
+    void finish_sort_cursors(std::vector<SpillRowCursor> *cursors)
+    {
+        for (std::vector<SpillRowCursor>::iterator cursor = cursors->begin();
+             cursor != cursors->end(); ++cursor)
+            finish_spill_cursor(&*cursor);
+    }
+
+    void note_sort_merge_rows(uint64_t rows)
+    {
+        uint64_t total = 0;
+        std::lock_guard<std::mutex> status_guard(status_mutex_);
+        status_.sort_merge_rows = checked_add(status_.sort_merge_rows, rows,
+            &total) ? total : std::numeric_limits<uint64_t>::max();
+    }
+
+    void note_sort_kway(size_t fan_in, uint64_t staging_reserved)
+    {
+        uint64_t total = 0;
+        std::lock_guard<std::mutex> status_guard(status_mutex_);
+        ++status_.sort_kway_merge_calls;
+        status_.sort_kway_input_runs = checked_add(
+            status_.sort_kway_input_runs, fan_in, &total) ? total :
+            std::numeric_limits<uint64_t>::max();
+        status_.sort_kway_max_fan_in = std::max<uint64_t>(
+            status_.sort_kway_max_fan_in, fan_in);
+        status_.sort_kway_staging_reserved_peak_bytes = std::max<uint64_t>(
+            status_.sort_kway_staging_reserved_peak_bytes, staging_reserved);
+    }
+
+    void note_sort_final_stream(const Batch &output, uint16_t columns,
+                                uint64_t output_rows)
+    {
+        uint64_t cell_count = 0, serialized_bytes = sizeof(SpillRecordHeader);
+        if (!checked_mul(output_rows, columns, &cell_count) ||
+            !checked_mul(cell_count, sizeof(CsdSqlResultCell), &cell_count) ||
+            !checked_add(serialized_bytes, cell_count, &serialized_bytes))
+            serialized_bytes = std::numeric_limits<uint64_t>::max();
+        if (serialized_bytes != std::numeric_limits<uint64_t>::max()) {
+            for (std::vector<Row>::const_iterator row = output.rows.begin();
+                 row != output.rows.end(); ++row)
+                for (Row::const_iterator value = row->begin();
+                     value != row->end(); ++value)
+                    if (!checked_add(serialized_bytes, value->bytes.size(),
+                                     &serialized_bytes)) {
+                        serialized_bytes =
+                            std::numeric_limits<uint64_t>::max();
+                        break;
+                    }
+        }
+        uint64_t total = 0;
+        std::lock_guard<std::mutex> status_guard(status_mutex_);
+        ++status_.sort_final_stream_calls;
+        status_.sort_final_stream_rows = checked_add(
+            status_.sort_final_stream_rows, output_rows, &total) ? total :
+            std::numeric_limits<uint64_t>::max();
+        status_.sort_final_stream_avoided_write_bytes = checked_add(
+            status_.sort_final_stream_avoided_write_bytes,
+            serialized_bytes, &total) ? total :
+            std::numeric_limits<uint64_t>::max();
+        status_.sort_final_stream_avoided_read_bytes = checked_add(
+            status_.sort_final_stream_avoided_read_bytes,
+            serialized_bytes, &total) ? total :
+            std::numeric_limits<uint64_t>::max();
+    }
+
+    bool sort_run_group_bounds(uint32_t index, uint16_t columns,
+                               const CsdSqlSortSpec *spec,
+                               const std::vector<SortRun> &runs,
+                               size_t begin, size_t end,
+                               uint64_t *input_rows,
+                               uint64_t *output_rows,
+                               uint64_t *max_payload,
+                               uint64_t *max_row_bytes)
+    {
+        *input_rows = 0;
+        *max_payload = 0;
+        *max_row_bytes = 0;
+        uint64_t total_payload = 0;
+        for (size_t run = begin; run < end; ++run) {
+            uint64_t cells = 0, fixed = sizeof(SpillRecordHeader);
+            const SortRun &current = runs[run];
+            if (current.handle.column_count != columns ||
+                current.max_row_bytes == 0 ||
+                !checked_add(*input_rows, current.handle.row_count,
+                             input_rows) ||
+                !checked_mul(current.handle.row_count, columns, &cells) ||
+                !checked_mul(cells, sizeof(CsdSqlResultCell), &cells) ||
+                !checked_add(fixed, cells, &fixed) ||
+                current.handle.length < fixed ||
+                !checked_add(total_payload,
+                    current.handle.length - fixed, &total_payload))
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x245);
+            *max_row_bytes = std::max<uint64_t>(*max_row_bytes,
+                                                current.max_row_bytes);
+        }
+        *output_rows = spec->top_n == 0 ? *input_rows :
+            std::min<uint64_t>(spec->top_n, *input_rows);
+        const uint64_t row_cells = static_cast<uint64_t>(columns) *
+                                   sizeof(CsdSqlResultCell);
+        const uint64_t max_row_payload = *max_row_bytes > row_cells ?
+            *max_row_bytes - row_cells : 0;
+        uint64_t payload_bound = 0;
+        if (!checked_mul(*output_rows, max_row_payload, &payload_bound))
+            payload_bound = total_payload;
+        *max_payload = std::min<uint64_t>(total_payload, payload_bound);
+        return true;
+    }
+
+    template <typename Emit>
+    bool merge_sort_run_group(uint32_t index, uint16_t columns,
+                              const CsdSqlSortSpec *spec,
+                              const CsdSqlSortKey *keys,
+                              const std::vector<SortRun> &runs,
+                              size_t begin, size_t end,
+                              uint64_t cursor_capacity,
+                              uint64_t output_rows, Emit emit)
+    {
+        const size_t fan_in = end - begin;
+        std::vector<SpillRowCursor> cursors(fan_in);
+        for (size_t run = 0; run < fan_in; ++run) {
+            if (!init_spill_cursor_bounded(index, runs[begin + run].handle,
+                                           cursor_capacity, &cursors[run]) ||
+                cursors[run].record.column_count != columns) {
+                finish_sort_cursors(&cursors);
+                return false;
+            }
+        }
+        const std::function<bool(size_t, size_t)> later =
+            [&](size_t left, size_t right) {
+                const Row &left_row = spill_cursor_row(cursors[left]);
+                const Row &right_row = spill_cursor_row(cursors[right]);
+                if (sort_less(right_row, left_row, keys, spec->key_count))
+                    return true;
+                if (sort_less(left_row, right_row, keys, spec->key_count))
+                    return false;
+                return left > right;
+            };
+        std::priority_queue<size_t, std::vector<size_t>,
+                            std::function<bool(size_t, size_t)> > heap(later);
+        for (size_t run = 0; run < fan_in; ++run) {
+            bool has_row = false;
+            if (!ensure_spill_cursor_row(index, &cursors[run], &has_row)) {
+                finish_sort_cursors(&cursors);
+                return false;
+            }
+            if (has_row) heap.push(run);
+        }
+        uint64_t emitted = 0;
+        while (emitted < output_rows) {
+            if (heap.empty()) {
+                finish_sort_cursors(&cursors);
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x246);
+            }
+            const size_t selected = heap.top();
+            heap.pop();
+            if (!emit(spill_cursor_row(cursors[selected]))) {
+                finish_sort_cursors(&cursors);
+                return false;
+            }
+            ++emitted;
+            advance_spill_cursor(&cursors[selected]);
+            bool has_row = false;
+            if (!ensure_spill_cursor_row(index, &cursors[selected],
+                                         &has_row)) {
+                finish_sort_cursors(&cursors);
+                return false;
+            }
+            if (has_row) heap.push(selected);
+        }
+        finish_sort_cursors(&cursors);
+        return true;
+    }
+
+    bool merge_spill_runs_kway(uint32_t index, uint16_t columns,
+                               const CsdSqlSortSpec *spec,
+                               const CsdSqlSortKey *keys,
+                               const std::vector<SortRun> &runs,
+                               size_t begin, size_t end,
+                               uint64_t cursor_capacity,
+                               uint64_t writer_capacity,
+                               SortRun *output_run)
+    {
+        uint64_t input_rows = 0, output_rows = 0, max_payload = 0;
+        uint64_t max_row_bytes = 0;
+        if (!sort_run_group_bounds(index, columns, spec, runs, begin, end,
+                                   &input_rows, &output_rows, &max_payload,
+                                   &max_row_bytes))
+            return false;
+        SpillRowWriter writer;
+        if (max_row_bytes > writer_capacity ||
+            !init_spill_writer_bounded(index, columns, output_rows,
+                                       max_payload, writer_capacity, &writer))
+            return false;
+        const std::function<bool(const Row &)> emit = [&](const Row &row) {
+            return append_spill_writer_row(index, &writer, row);
+        };
+        if (!merge_sort_run_group(index, columns, spec, keys, runs,
+                                  begin, end, cursor_capacity, output_rows,
+                                  emit) ||
+            !finish_spill_writer(index, &writer, &output_run->handle))
+            return false;
+        output_run->max_row_bytes = max_row_bytes;
+        note_sort_merge_rows(output_rows);
+        const uint64_t cursor_reserved = 4 * cursor_capacity * (end - begin);
+        note_sort_kway(end - begin, cursor_reserved + writer_capacity);
+        return true;
+    }
+
+    bool merge_spill_runs_to_batch_kway(uint32_t index, uint16_t columns,
+                                        const CsdSqlSortSpec *spec,
+                                        const CsdSqlSortKey *keys,
+                                        const std::vector<SortRun> &runs,
+                                        uint64_t cursor_capacity,
+                                        Batch *output)
+    {
+        uint64_t input_rows = 0, output_rows = 0, max_payload = 0;
+        uint64_t max_row_bytes = 0;
+        if (!sort_run_group_bounds(index, columns, spec, runs, 0, runs.size(),
+                                   &input_rows, &output_rows, &max_payload,
+                                   &max_row_bytes) ||
+            output_rows > std::numeric_limits<size_t>::max())
+            return false;
+        output->columns = columns;
+        output->rows.clear();
+        output->rows.reserve(static_cast<size_t>(output_rows));
+        const std::function<bool(const Row &)> emit = [&](const Row &row) {
+            output->rows.push_back(row);
+            return true;
+        };
+        if (!merge_sort_run_group(index, columns, spec, keys, runs, 0,
+                                  runs.size(), cursor_capacity, output_rows,
+                                  emit))
+            return false;
+        note_sort_merge_rows(output_rows);
+        note_sort_final_stream(*output, columns, output_rows);
+        note_sort_kway(runs.size(), 4 * cursor_capacity * runs.size());
+        return true;
+    }
+
     bool merge_sort_runs(uint32_t index, uint16_t columns,
                          const CsdSqlSortSpec *spec,
                          const CsdSqlSortKey *keys,
-                         std::vector<SpillHandle> *runs, Batch *output)
+                         std::vector<SortRun> *runs, Batch *output)
     {
+        size_t fan_in = sort_kway_fan_in(*runs);
+        if (fan_in > 2) {
+            const uint64_t stage_capacity = static_cast<uint64_t>(
+                args_->mr_len[header_->spill_range]);
+            const uint64_t cursor_capacity = stage_capacity /
+                (8 * static_cast<uint64_t>(fan_in));
+            const uint64_t writer_capacity = stage_capacity / 2;
+            while (runs->size() > fan_in) {
+                std::vector<SortRun> merged_runs;
+                for (size_t run = 0; run < runs->size(); run += fan_in) {
+                    const size_t end = std::min<size_t>(runs->size(),
+                                                       run + fan_in);
+                    if (end - run == 1) {
+                        merged_runs.push_back((*runs)[run]);
+                        continue;
+                    }
+                    SortRun merged;
+                    if (!merge_spill_runs_kway(index, columns, spec, keys,
+                                               *runs, run, end,
+                                               cursor_capacity,
+                                               writer_capacity, &merged))
+                        return false;
+                    merged_runs.push_back(merged);
+                }
+                runs->swap(merged_runs);
+                fan_in = sort_kway_fan_in(*runs);
+                if (fan_in <= 2) break;
+            }
+            if (runs->size() > 2) {
+                const uint64_t final_cursor_capacity = stage_capacity /
+                    (8 * static_cast<uint64_t>(runs->size()));
+                return merge_spill_runs_to_batch_kway(index, columns, spec,
+                    keys, *runs, final_cursor_capacity, output);
+            }
+        }
         while (runs->size() > 2) {
-            std::vector<SpillHandle> merged_runs;
+            std::vector<SortRun> merged_runs;
             for (size_t run = 0; run < runs->size(); run += 2) {
                 if (run + 1 == runs->size()) {
                     merged_runs.push_back((*runs)[run]);
@@ -46,19 +368,23 @@
                 }
                 SpillHandle handle;
                 if (!merge_spill_runs(index, columns, spec, keys,
-                                      (*runs)[run], (*runs)[run + 1],
+                                      (*runs)[run].handle,
+                                      (*runs)[run + 1].handle,
                                       &handle))
                     return false;
-                merged_runs.push_back(handle);
+                merged_runs.push_back(SortRun(handle,
+                    std::max<uint64_t>((*runs)[run].max_row_bytes,
+                                       (*runs)[run + 1].max_row_bytes)));
             }
             runs->swap(merged_runs);
         }
         output->columns = columns;
         if (runs->empty()) return true;
         if (runs->size() == 1)
-            return read_spill_batch(index, (*runs)[0], output);
+            return read_spill_batch(index, (*runs)[0].handle, output);
         return merge_spill_runs_to_batch(index, columns, spec, keys,
-                                         (*runs)[0], (*runs)[1], output);
+                                         (*runs)[0].handle,
+                                         (*runs)[1].handle, output);
     }
 
     /* The final external-sort merge is already in output order. Stream its
@@ -244,7 +570,7 @@
 
     struct StreamingSortState {
         Batch run;
-        std::vector<SpillHandle> runs;
+        std::vector<SortRun> runs;
         const CsdSqlSortSpec *spec;
         const CsdSqlSortKey *keys;
         uint64_t held_bytes;
@@ -302,13 +628,16 @@
         if (state->spec->top_n != 0 &&
             state->run.rows.size() > state->spec->top_n)
             state->run.rows.resize(state->spec->top_n);
+        uint64_t max_row_bytes = 0;
+        if (!sort_batch_max_row_bytes(index, state->run, &max_row_bytes))
+            return false;
         SpillHandle handle;
         const bool succeeded = spill_batch(index, state->run, &handle);
         release_streaming_sort_memory(state);
         std::vector<Row> released;
         state->run.rows.swap(released);
         if (!succeeded) return false;
-        state->runs.push_back(handle);
+        state->runs.push_back(SortRun(handle, max_row_bytes));
         return true;
     }
 
@@ -418,7 +747,7 @@
             const uint64_t average_row_bytes = input.rows.empty() ? 1 : std::max<uint64_t>(1, input_bytes / input.rows.size());
             const size_t run_rows = std::max<size_t>(1,
                 operator_memory_capacity_ / average_row_bytes);
-            std::vector<SpillHandle> runs;
+            std::vector<SortRun> runs;
             for (size_t start = 0; start < input.rows.size(); start += run_rows) {
                 const size_t end = std::min(input.rows.size(), start + run_rows);
                 Batch run;
@@ -429,9 +758,12 @@
                 });
                 if (spec->top_n != 0 && run.rows.size() > spec->top_n)
                     run.rows.resize(spec->top_n);
+                uint64_t max_row_bytes = 0;
+                if (!sort_batch_max_row_bytes(index, run, &max_row_bytes))
+                    return false;
                 SpillHandle handle;
                 if (!spill_batch(index, run, &handle)) return false;
-                runs.push_back(handle);
+                runs.push_back(SortRun(handle, max_row_bytes));
             }
             if (consume_input) {
                 std::vector<Row> released;

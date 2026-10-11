@@ -466,14 +466,138 @@ void test_streaming_scan_sort_batches(uint32_t top_n)
     assert(execution->spill_read_bytes > 0);
     assert(execution->spill_cursor_peak_bytes > 0);
     assert(execution->spill_cursor_peak_bytes <= spill.size());
-    assert(execution->spill_writer_peak_bytes > 0);
+    assert(execution->spill_writer_peak_bytes == 0);
     assert(execution->spill_writer_peak_bytes <= spill.size());
-    assert(execution->sort_merge_rows == (top_n == 0 ? 24 : 17));
+    assert(execution->sort_merge_rows == expected_rows);
     assert(execution->sort_final_stream_calls == 1);
     assert(execution->sort_final_stream_rows == expected_rows);
     assert(execution->sort_final_stream_avoided_write_bytes > 0);
     assert(execution->sort_final_stream_avoided_read_bytes ==
            execution->sort_final_stream_avoided_write_bytes);
+    assert(execution->sort_kway_merge_calls == 1);
+    assert(execution->sort_kway_input_runs == 8);
+    assert(execution->sort_kway_max_fan_in == 8);
+    assert(execution->sort_kway_staging_reserved_peak_bytes > 0);
+    assert(execution->sort_kway_staging_reserved_peak_bytes <= spill.size());
+}
+
+void test_streaming_scan_sort_kway_pass()
+{
+    const uint16_t row_count = 130;
+    std::vector<unsigned char> page(CSD_SQL_PAGE_BYTES, 0);
+    put_u16(page.data() + 12, 24 + row_count * 4);
+    for (uint16_t row = 0; row < row_count; ++row)
+        add_right_tuple(page.data(), row, 1024 + row * 32,
+                        (row_count - row + 1) / 2, row);
+
+    std::vector<unsigned char> plan(
+        sizeof(CsdSqlPlanHeader) + 2 * sizeof(CsdSqlPlanNode), 0);
+    CsdSqlPlanNode scan_node = make_node(0, CSD_SQL_OP_SCAN);
+    CsdSqlScanSpec scan = {};
+    scan.input_range = 0;
+    scan.page_count = 1;
+    scan.attr_count = 2;
+    scan.output_count = 2;
+    scan.flags = CSD_SQL_SCAN_FROZEN_PAGES;
+    scan_node.expression_offset = append(&plan, scan);
+    for (uint16_t attribute = 0; attribute < 2; ++attribute) {
+        CsdSqlColumnSpec column = {};
+        column.attnum = attribute + 1;
+        column.output_column = attribute;
+        column.attlen = 4;
+        column.alignment = 4;
+        column.datum_type = CSD_SQL_TYPE_INT32;
+        column.flags = CSD_SQL_COLUMN_OUTPUT;
+        append(&plan, column);
+    }
+    scan_node.expression_length = sizeof(scan) +
+                                  2 * sizeof(CsdSqlColumnSpec);
+
+    CsdSqlPlanNode sort_node = make_node(1, CSD_SQL_OP_SORT);
+    sort_node.left_input = 0;
+    sort_node.flags = CSD_SQL_NODE_BLOCKING | CSD_SQL_NODE_SPILLABLE;
+    CsdSqlSortSpec sort = {};
+    sort.key_count = 1;
+    sort_node.expression_offset = append(&plan, sort);
+    CsdSqlSortKey key = {};
+    key.key_column = 0;
+    append(&plan, key);
+    sort_node.expression_length = sizeof(sort) + sizeof(key);
+
+    CsdSqlPlanHeader header = {};
+    header.magic = CSD_SQL_PLAN_MAGIC;
+    header.version = CSD_SQL_PLAN_VERSION;
+    header.header_bytes = sizeof(header);
+    header.node_count = 2;
+    header.node_bytes = sizeof(CsdSqlPlanNode);
+    header.plan_bytes = plan.size();
+    header.root_node = 1;
+    header.flags = CSD_SQL_PLAN_STATUS_LAST_RANGE |
+                   CSD_SQL_PLAN_FROZEN_SNAPSHOT |
+                   CSD_SQL_PLAN_FDM_FIFO | CSD_SQL_PLAN_FDM_ARENA;
+    header.output_range = 3;
+    header.spill_range = 4;
+    header.fifo_range_a = 1;
+    header.fifo_range_b = 2;
+    header.fifo_bytes = 96;
+    header.operator_range = 5;
+    header.operator_bytes = 64;
+    header.work_mem_bytes = 1;
+    header.parallel_workers = 1;
+    header.plan_id = 0x4b574159;
+    header.fdm_reserved_bytes = 2 * header.fifo_bytes + 8192 + 262144 +
+                                header.operator_bytes;
+    overwrite(&plan, 0, header);
+    overwrite(&plan, sizeof(header), scan_node);
+    overwrite(&plan, sizeof(header) + sizeof(scan_node), sort_node);
+
+    std::vector<unsigned char> fifo_a(header.fifo_bytes, 0);
+    std::vector<unsigned char> fifo_b(header.fifo_bytes, 0);
+    std::vector<unsigned char> output(8192, 0);
+    std::vector<unsigned char> spill(262144, 0);
+    std::vector<unsigned char> arena(header.operator_bytes, 0);
+    std::vector<unsigned char> status(sizeof(CsdSqlExecutionStatus), 0);
+    void *ranges[] = {page.data(), fifo_a.data(), fifo_b.data(), output.data(),
+                      spill.data(), arena.data(), status.data()};
+    long long lengths[] = {static_cast<long long>(page.size()),
+                           static_cast<long long>(fifo_a.size()),
+                           static_cast<long long>(fifo_b.size()),
+                           static_cast<long long>(output.size()),
+                           static_cast<long long>(spill.size()),
+                           static_cast<long long>(arena.size()),
+                           static_cast<long long>(status.size())};
+    cemu_args args = {};
+    args.numr = 7;
+    args.mr_addr = ranges;
+    args.mr_len = lengths;
+    args.data_buffer = plan.data();
+    args.buffer_len = plan.size();
+    assert(csd_sql(&args) == row_count);
+
+    const CsdSqlResultHeader *result =
+        reinterpret_cast<const CsdSqlResultHeader *>(output.data());
+    const CsdSqlResultCell *cells =
+        reinterpret_cast<const CsdSqlResultCell *>(
+            output.data() + result->cells_offset);
+    const CsdSqlExecutionStatus *execution =
+        reinterpret_cast<const CsdSqlExecutionStatus *>(status.data());
+    assert(result->row_count == row_count && result->column_count == 2);
+    for (uint16_t row = 0; row < row_count; ++row) {
+        const uint16_t group = row / 2;
+        const uint16_t slot = row % 2;
+        assert(cells[row * 2].integer == group + 1);
+        assert(cells[row * 2 + 1].integer == 128 - 2 * group + slot);
+    }
+    assert(execution->status_code == CSD_SQL_STATUS_OK);
+    assert(execution->operator_spill_count == 132);
+    assert(execution->sort_merge_rows == 260);
+    assert(execution->sort_kway_merge_calls == 2);
+    assert(execution->sort_kway_input_runs == 130);
+    assert(execution->sort_kway_max_fan_in == 128);
+    assert(execution->sort_kway_staging_reserved_peak_bytes == spill.size());
+    assert(execution->spill_writer_peak_bytes > 0);
+    assert(execution->sort_final_stream_calls == 1);
+    assert(execution->sort_final_stream_rows == row_count);
 }
 
 void test_streaming_scan_aggregate_batches()
@@ -1825,6 +1949,7 @@ int main()
     test_chunked_nvm_scan();
     test_streaming_scan_sort_batches(0);
     test_streaming_scan_sort_batches(3);
+    test_streaming_scan_sort_kway_pass();
     test_streaming_scan_aggregate_batches();
     test_streaming_scan_join_probe_batches(true);
     test_streaming_scan_join_probe_batches(false);

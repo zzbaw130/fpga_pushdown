@@ -184,14 +184,16 @@ counts, cell descriptors, and byte payloads.
 `SORT` emits bounded runs and merge intermediates to the designated spill
 range. For a direct Scan pipeline, rows are charged to the operator arena as
 they arrive; failure to grow the lease closes and sorts the current run before
-writing it. Once a run is written, the sort keeps only its offset/length
-handle. Each merge pass opens two row cursors. A cursor reads descriptor and
-payload blocks on demand through the bounded FDM staging window; the stable
-comparison retains only the two current decoded chunks. A bounded row writer
-reserves the next record, buffers at most one staging-window-sized descriptor
-plus payload block, and writes descriptors and variable payload directly to
-their final Flash offsets. It never constructs an intermediate merged `Batch`.
-When two runs remain, the same stable cursors merge directly into the
+writing it. Once a run is written, the sort keeps only its offset/length and
+maximum-row-size descriptor. Merge fan-in is selected from 3 through 128 using
+the actual staging capacity. Each cursor receives `stage/(8*k)` for fan-in
+`k`; a conservative fourfold cursor reservation consumes at most half the
+stage, and an intermediate writer receives the other half. If one row cannot
+fit at a higher fan-in, Sort retains the compatible two-cursor path. Cursors
+read descriptors and payload on demand, while a stable heap uses original run
+order to break equal-key ties. The writer appends descriptors and variable
+payload directly to their final Flash offsets without constructing an
+intermediate merged `Batch`. A final k-way merge streams directly into the
 planner-checked output boundary, so no final Flash record is written and
 immediately read back. PostgreSQL passes a finite SQL LIMIT to this descriptor;
 the bound includes OFFSET, so Top-N sorts stop every run/merge after

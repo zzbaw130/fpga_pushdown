@@ -429,6 +429,11 @@ struct CsdSqlExecutionStatus {
     uint64_t sort_final_stream_rows;
     uint64_t sort_final_stream_avoided_write_bytes;
     uint64_t sort_final_stream_avoided_read_bytes;
+    /* Append-only diagnostics for staging-bounded adaptive k-way Sort. */
+    uint64_t sort_kway_merge_calls;
+    uint64_t sort_kway_input_runs;
+    uint64_t sort_kway_max_fan_in;
+    uint64_t sort_kway_staging_reserved_peak_bytes;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

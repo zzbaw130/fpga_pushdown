@@ -11,6 +11,7 @@
 #include <limits>
 #include <mutex>
 #include <pthread.h>
+#include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
