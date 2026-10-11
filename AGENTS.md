@@ -72,6 +72,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `57b3c607d` | partitioned Join 最终 Flash run 直连 non-DISTINCT Aggregate、Q12/Q14/Q19 32 MiB 与 22/22 回归 |
 | `1a16674e3` | Join-to-Aggregate 超限直接写 Flash radix chain、递归 replay 与 22/22 回归 |
 | `1bd92f9ca` | external Sort 最终 merge-and-stream、spill I/O 降低 35.68% 与 22/22 回归 |
+| `d3a586cd8` | SQL LIMIT/OFFSET 下推 external Sort Top-N、spill I/O 降低 99.27% 与 22/22 回归 |
 
 ## 3. 环境不变量
 
@@ -231,7 +232,10 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   Flash 上只保留 handle。merge 使用左右两个 on-demand row cursor 和一个 bounded
   writer，直接向下一层 record 的 descriptor/payload offset 写入，不再恢复完整 run 或
   构造 merged `Batch`。只剩两个 run 时不再写最后一个 Flash record，而由两个 cursor
-  stable merge 直出到已通过容量准入的结果边界；Top-N 在每个 run/merge 后截断。
+  stable merge 直出到已通过容量准入的结果边界；PostgreSQL 的有限 SQL LIMIT 会以
+  `LIMIT + OFFSET` 设置 Top-N，并在每个 run/merge 后截断，后继 Limit 再跳过 OFFSET。
+  OFFSET-only/无界排序保持 `top_n=0`。无法估算或超出当前 wire 整数范围的 LIMIT/OFFSET
+  不得用 planner estimate 冒充 SQL 语义：AUTO 保留 HOST，forced CSD 显式拒绝。
 - Hash Join：完整 canonical key 做 power-of-two radix partition；build/probe selection
   直接从 source row ordinal 两遍序列化到 Flash，不创建 partition `Batch`。一次只
   restore 一个 build partition 并申请 arena lease；probe record 按 staging capacity
@@ -364,6 +368,14 @@ Sort 最后一轮采用旧 AOE 的 merge-and-stream 思想，不再写出后立�
 30,209 行 varlena 查询 exact，spill 总读写由 14,646,232 B 降至 9,420,282 B（-35.68%），
 forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归与 optimized/ASan/UBSan/guest
 单元测试均通过。
+SQL LIMIT/OFFSET 到 external Sort Top-N 的端到端 lowering 验证位于
+`results/tpch_sf1_sort_topn_validation.md`。同一 1 MiB arena/staging、30,209 行 varlena
+查询在 `LIMIT 100` 下仅保留 100 行，spill 总读写由 9,420,282 B 降至 69,190 B
+（-99.2655%，136.15x）；`LIMIT 100 OFFSET 50` 保留 150 行后正确返回 100 行，
+OFFSET-only 的 30,159 行与 `LIMIT 0` 也均与 HOST exact。最终 forced-CSD 22/22 exact、
+planner 22/22、AUTO 定向回归与 optimized/ASan/UBSan/guest 单元测试均通过；原始证据
+归档 SHA-256 为
+`e4cdd50e20861205b43eda547342f676981aa8811d536c246559c05448ca77df`。
 Scan-to-Aggregate 流式驻留验证位于
 `results/tpch_sf1_streaming_aggregate_validation.md`；最终 v3 kernel 的 Q1/Q6 profile、
 forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归与 ASan/UBSan 均通过。
