@@ -469,6 +469,11 @@ void test_streaming_scan_sort_batches(uint32_t top_n)
     assert(execution->spill_writer_peak_bytes > 0);
     assert(execution->spill_writer_peak_bytes <= spill.size());
     assert(execution->sort_merge_rows == (top_n == 0 ? 24 : 17));
+    assert(execution->sort_final_stream_calls == 1);
+    assert(execution->sort_final_stream_rows == expected_rows);
+    assert(execution->sort_final_stream_avoided_write_bytes > 0);
+    assert(execution->sort_final_stream_avoided_read_bytes ==
+           execution->sort_final_stream_avoided_write_bytes);
 }
 
 void test_streaming_scan_aggregate_batches()

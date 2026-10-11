@@ -121,13 +121,15 @@ CEMU:
 | Filter, project | SIMD-like lanes executing bounded expression bytecode | Never blocks; output compacts valid lanes |
 | Aggregate | multi-key banked hash table with `SUM/COUNT/MIN/MAX/AVG` and `DISTINCT` state; eligible direct Scan and partitioned-Join chains update state per bounded batch | Oversized or uncertain grouped state radix-partitions input rows by the complete group key and replays each partition; eligible Join-fed non-DISTINCT state can write partitions directly from the intact final run |
 | Equi-join | multi-key build/probe hash join with residual filter, modeled after GQE; an eligible left Scan chain probes one resident build hash per FIFO batch | Eligible two-sided Scan chains stream an oversized build and probe directly to Flash; other oversized builds use complete-input classification before probe batches stream, then matching pairs replay one at a time |
-| Sort | multi-key bounded run generation followed by stable merge passes | A direct Scan pipeline grows one arena-accounted run row by row, flushes before exceeding the lease, retains only Flash handles, and reads pairs back for stable merge |
+| Sort | multi-key bounded run generation followed by stable merge passes | A direct Scan pipeline grows one arena-accounted run row by row, flushes before exceeding the lease, and retains only Flash handles; intermediate pairs write a new run, while the last pair merges directly to the checked output boundary |
 
 The choices follow the streaming filter/project and hash GQE direction in the
 [Xilinx Vitis Database Library](https://github.com/Xilinx/Vitis_Libraries/tree/master/database).
 Sort must instead be external because its working set is unbounded; its run
 generation and merge stages are modeled independently so a near-storage sort
-pipeline can overlap Flash I/O and comparison lanes.
+pipeline can overlap Flash I/O and comparison lanes. The last merge adopts
+AOE's merge-and-stream handoff: it does not write a final Flash run only to
+read that same record immediately into the result.
 
 ## Three-level parallel execution
 
@@ -188,8 +190,10 @@ payload blocks on demand through the bounded FDM staging window; the stable
 comparison retains only the two current decoded chunks. A bounded row writer
 reserves the next record, buffers at most one staging-window-sized descriptor
 plus payload block, and writes descriptors and variable payload directly to
-their final Flash offsets. It never constructs a merged `Batch`. A final read
-reconstructs the operator output. Top-N sorts stop the cursor merge after N
+their final Flash offsets. It never constructs an intermediate merged `Batch`.
+When two runs remain, the same stable cursors merge directly into the
+planner-checked output boundary, so no final Flash record is written and
+immediately read back. Top-N sorts stop the cursor merge after N
 rows and reserve conservatively for the two input payloads, which bounds their
 actual Flash traffic without changing the global top-N result. Spill records
 and every read are range-checked before deserialization. Status exposes cursor

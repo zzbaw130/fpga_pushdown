@@ -107,7 +107,10 @@ Sort grows one arena-accounted run row by row, flushes before the lease would
 overflow, writes bounded runs to Flash, and retains only handles. Stable merge
 passes use two on-demand row cursors and one bounded writer; descriptors and
 variable payload are read and written through the spill staging range without
-constructing either complete input run or a merged `Batch`. Oversized
+constructing either complete input run or an intermediate merged `Batch`.
+When two Sort runs remain, the stable cursors merge directly into the
+planner-checked output boundary, avoiding a final Flash write followed by an
+immediate read. Oversized
 Hash Join build sides radix-partition both inputs, lease one restored build
 partition, and stream the matching probe record in staging-bounded chunks;
 probe ordinals preserve deterministic output order. Join and

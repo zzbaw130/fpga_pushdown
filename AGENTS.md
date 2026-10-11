@@ -229,7 +229,8 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   累积完整 Scan `Batch`；current run 逐行增长 arena lease，无法增长时排序并写 Flash，
   Flash 上只保留 handle。merge 使用左右两个 on-demand row cursor 和一个 bounded
   writer，直接向下一层 record 的 descriptor/payload offset 写入，不再恢复完整 run 或
-  构造 merged `Batch`。最终读结果，Top-N 在每个 run/merge 后截断。
+  构造 merged `Batch`。只剩两个 run 时不再写最后一个 Flash record，而由两个 cursor
+  stable merge 直出到已通过容量准入的结果边界；Top-N 在每个 run/merge 后截断。
 - Hash Join：完整 canonical key 做 power-of-two radix partition；build/probe selection
   直接从 source row ordinal 两遍序列化到 Flash，不创建 partition `Batch`。一次只
   restore 一个 build partition 并申请 arena lease；probe record 按 staging capacity
@@ -357,6 +358,11 @@ replay 的模型增量为 460.718 ms，两轮 guest executor 实测均值增量�
 cursor-based merge 验证位于 `results/tpch_sf1_cursor_merge_validation.md`；整数与
 varlena 两组低内存 Flash spill 均 exact，最终 kernel 的 forced-CSD Q1-Q22、planner
 22/22 与 AUTO 定向回归全部通过。
+Sort 最后一轮采用旧 AOE 的 merge-and-stream 思想，不再写出后立刻读回最终 Flash run；
+验证位于 `results/tpch_sf1_sort_final_stream_validation.md`。1 MiB arena/staging 的
+30,209 行 varlena 查询 exact，spill 总读写由 14,646,232 B 降至 9,420,282 B（-35.68%），
+forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归与 optimized/ASan/UBSan/guest
+单元测试均通过。
 Scan-to-Aggregate 流式驻留验证位于
 `results/tpch_sf1_streaming_aggregate_validation.md`；最终 v3 kernel 的 Q1/Q6 profile、
 forced-CSD 22/22 exact、planner 22/22、AUTO 定向回归与 ASan/UBSan 均通过。

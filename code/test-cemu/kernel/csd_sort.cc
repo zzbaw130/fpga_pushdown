@@ -37,7 +37,7 @@
                          const CsdSqlSortKey *keys,
                          std::vector<SpillHandle> *runs, Batch *output)
     {
-        while (runs->size() > 1) {
+        while (runs->size() > 2) {
             std::vector<SpillHandle> merged_runs;
             for (size_t run = 0; run < runs->size(); run += 2) {
                 if (run + 1 == runs->size()) {
@@ -54,7 +54,116 @@
             runs->swap(merged_runs);
         }
         output->columns = columns;
-        return runs->empty() || read_spill_batch(index, (*runs)[0], output);
+        if (runs->empty()) return true;
+        if (runs->size() == 1)
+            return read_spill_batch(index, (*runs)[0], output);
+        return merge_spill_runs_to_batch(index, columns, spec, keys,
+                                         (*runs)[0], (*runs)[1], output);
+    }
+
+    /* The final external-sort merge is already in output order. Stream its
+     * rows directly into the existing DAG/result boundary instead of writing
+     * one last Flash run and immediately reading that run back. This follows
+     * the merge-and-stream handoff in AOE while retaining the bounded two
+     * cursor working set and PostgreSQL's pre-reserved result capacity. */
+    bool merge_spill_runs_to_batch(uint32_t index, uint16_t columns,
+                                   const CsdSqlSortSpec *spec,
+                                   const CsdSqlSortKey *keys,
+                                   const SpillHandle &left_handle,
+                                   const SpillHandle &right_handle,
+                                   Batch *output)
+    {
+        SpillRowCursor left, right;
+        if (!init_spill_cursor(index, left_handle, &left)) {
+            finish_spill_cursor(&left);
+            return false;
+        }
+        if (!init_spill_cursor(index, right_handle, &right)) {
+            finish_spill_cursor(&left);
+            finish_spill_cursor(&right);
+            return false;
+        }
+        uint64_t input_rows = 0;
+        if (left.record.column_count != columns ||
+            right.record.column_count != columns ||
+            !checked_add(left.record.row_count, right.record.row_count,
+                         &input_rows)) {
+            finish_spill_cursor(&left);
+            finish_spill_cursor(&right);
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x242);
+        }
+        const uint64_t output_rows = spec->top_n == 0 ? input_rows :
+            std::min<uint64_t>(spec->top_n, input_rows);
+        if (output_rows > std::numeric_limits<size_t>::max()) {
+            finish_spill_cursor(&left);
+            finish_spill_cursor(&right);
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x243);
+        }
+        output->columns = columns;
+        output->rows.clear();
+        output->rows.reserve(static_cast<size_t>(output_rows));
+        bool left_has = false, right_has = false;
+        while (output->rows.size() < output_rows) {
+            if (!ensure_spill_cursor_row(index, &left, &left_has) ||
+                !ensure_spill_cursor_row(index, &right, &right_has)) {
+                finish_spill_cursor(&left);
+                finish_spill_cursor(&right);
+                return false;
+            }
+            if (!left_has && !right_has) {
+                finish_spill_cursor(&left);
+                finish_spill_cursor(&right);
+                return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x244);
+            }
+            const bool take_right = right_has &&
+                (!left_has || sort_less(spill_cursor_row(right),
+                                        spill_cursor_row(left), keys,
+                                        spec->key_count));
+            output->rows.push_back(take_right ? spill_cursor_row(right) :
+                                                spill_cursor_row(left));
+            if (take_right) advance_spill_cursor(&right);
+            else advance_spill_cursor(&left);
+        }
+        finish_spill_cursor(&left);
+        finish_spill_cursor(&right);
+
+        uint64_t cell_count = 0, serialized_bytes = sizeof(SpillRecordHeader);
+        if (!checked_mul(output_rows, columns, &cell_count) ||
+            !checked_mul(cell_count, sizeof(CsdSqlResultCell), &cell_count) ||
+            !checked_add(serialized_bytes, cell_count, &serialized_bytes))
+            serialized_bytes = std::numeric_limits<uint64_t>::max();
+        if (serialized_bytes != std::numeric_limits<uint64_t>::max()) {
+            for (std::vector<Row>::const_iterator row = output->rows.begin();
+                 row != output->rows.end(); ++row)
+                for (Row::const_iterator value = row->begin();
+                     value != row->end(); ++value)
+                    if (!checked_add(serialized_bytes, value->bytes.size(),
+                                     &serialized_bytes)) {
+                        serialized_bytes =
+                            std::numeric_limits<uint64_t>::max();
+                        break;
+                    }
+        }
+        {
+            uint64_t total = 0;
+            std::lock_guard<std::mutex> status_guard(status_mutex_);
+            ++status_.sort_final_stream_calls;
+            status_.sort_final_stream_rows = checked_add(
+                status_.sort_final_stream_rows, output_rows, &total) ? total :
+                std::numeric_limits<uint64_t>::max();
+            status_.sort_final_stream_avoided_write_bytes = checked_add(
+                status_.sort_final_stream_avoided_write_bytes,
+                serialized_bytes, &total) ? total :
+                std::numeric_limits<uint64_t>::max();
+            status_.sort_final_stream_avoided_read_bytes = checked_add(
+                status_.sort_final_stream_avoided_read_bytes,
+                serialized_bytes, &total) ? total :
+                std::numeric_limits<uint64_t>::max();
+            status_.sort_merge_rows = checked_add(status_.sort_merge_rows,
+                output_rows, &total) ? total :
+                std::numeric_limits<uint64_t>::max();
+        }
+        return true;
     }
 
     bool merge_spill_runs(uint32_t index, uint16_t columns,
