@@ -79,8 +79,8 @@ or unsupported downstream shapes still materialize ordinary C++ STL `Batch`
 objects: Q17 and Q18 reported conservative resident peaks of 22,194,284,144 B
 and 15,550,897,984 B respectively.  These allocations explain why the
 pure-memory CEMU process needs much more host RAM than the modeled 4 GiB FDM.
-They must be converted to a final-result/Join-to-Join streaming consumer before
-claiming strict end-to-end FDM-bounded execution.
+The remaining final-result and Aggregate shapes must be converted to bounded
+streaming consumers before claiming strict end-to-end FDM-bounded execution.
 
 The SF=1 AUTO calibration test deliberately asserts `hot=HOST`.  At SF=16 its
 cached `count(lineitem)` still chooses CSD because FPGA aggregation cost is

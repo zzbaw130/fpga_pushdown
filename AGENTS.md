@@ -74,6 +74,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `1bd92f9ca` | external Sort 最终 merge-and-stream、spill I/O 降低 35.68% 与 22/22 回归 |
 | `d3a586cd8` | SQL LIMIT/OFFSET 下推 external Sort Top-N、spill I/O 降低 99.27% 与 22/22 回归 |
 | `f549976cc` | staging-bounded adaptive 3--128-way external Sort、229-run spill I/O 降低 67.84% 与 22/22 回归 |
+| `04f44df08` | 复用式 Flash extent、Join chain/wave replay、SF=16 forced-CSD 22/22 exact |
 
 ## 3. 环境不变量
 
@@ -86,14 +87,17 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
   guest 中运行主机编译产物。
 - 9P 仅用于源码共享和一次性数据装载，不进入性能关键路径。PGDATA 从 9P 复制到
   CEMU NVMe 后运行，禁止每次查询复制整表或 cluster。
-- 当前 CEMU FTL 的 LPN->PPA 映射没有随容器/控制器重启持久化；即使 backing volume
-  仍存在，重启后的 namespace 也会表现为空盘。镜像重建后需重新执行
+- 当前使用 CEMU 原版纯内存 NVM backend，不使用稀疏文件或持久 backing volume；FTL
+  映射和 namespace 数据均不跨容器/控制器重启保留。重启后需重新执行
   `stage_tpch_nvme.sh`，不能把这段 9P->NVMe 恢复时间计入查询实验。
 - `csd.execute_timeout_ms` 默认 600,000，只控制 host NVMe ioctl 对 TCG 功能模型的
   watchdog，不进入 FPGA/Flash 时延模型。VM-Freeze kernel 超时后 Linux abort/reset
   目前不能协作取消仍在 QEMU 中运行的 C++ worker；一旦发生超时，应重启 CEMU、重新
   stage PGDATA 后再测，不能继续使用可能带遗留热线程的环境。
-- 默认先用 SF=1 做功能和快速回归，再用 SF=32 验证内存边界和可扩展性。
+- 默认先用 SF=1 做功能和快速回归，再用 SF=16 验证内存边界和可扩展性。服务器物理
+  内存不足以同时容纳原版 pure-memory CEMU 的更大 namespace 与 SF=32 功能模型，故
+  当前最大规模固定为 SF=16，不再使用此前试验过的 sparse backend。验证配置是
+  48 GiB NVM namespace、4 GiB FDM、16 GiB guest RAM。
 - FDMFS 表示 CSD 内存，不是无限磁盘。默认总容量 4 GiB。表数据按默认 32 MiB
   scan window 从 NVMe 分块进入 FDM；不得把大表整体复制到 FDMFS。
 - FIFO 也消耗 FDMFS。每个 query 的 scan windows、两个 tuple FIFO、结果区、plan、
@@ -126,6 +130,8 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 - socket：`/tmp/csdpg_nvme_tpch_s1`
 - port：`57432`
 - database/user：`tpch_s1` / `dengyao`
+- SF=16 对应路径/套接字/database 为 `/mnt/nvme0/pgdata/tpch_s16`、
+  `/tmp/csdpg_nvme_tpch_s16`、`tpch_s16`，端口仍为 `57432`。
 - guest 源码：`/root/CEMU/code/CEMU/tests/cemu` 或 `/mnt/cemu`
 - CEMU 可见 kernel：`/workspace/code/CEMU/tests/cemu/build/<version>.so`
 
@@ -137,7 +143,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 git submodule update --init code/postgres
 ./scripts/build_postgres.sh
 ./scripts/gen_data/create_tpch_db.sh --sf 1
-./scripts/gen_data/create_tpch_db.sh --sf 32 --keep-running
+./scripts/gen_data/create_tpch_db.sh --sf 16 --keep-running
 ```
 
 镜像和 guest：
@@ -192,7 +198,8 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   comparison、SQL 三值逻辑、NULL、`LIKE`、`CASE` mux、`substring`、date year、
   常量数组 `IN`。`BETWEEN`/`IN` 展开为 comparison tree。
 - Numeric 用带 scale 的 `int64`，AVG/division 保留动态 scale；overflow 和除零必须
-  显式失败，不能 wrap。
+  显式失败，不能 wrap。乘法结果仅在尾随十进制零可被无损除去时降低 scale，再判断
+  `int64` overflow；这保证 Q11 的 `SUM(...) * 0.0001000000` 不因声明尾零误报溢出。
 - 只允许 frozen/all-visible snapshot raw heap scan。TOAST external/compressed varlena、
   未支持 Numeric 编码、collation、任意 PostgreSQL function 必须拒绝 lowering，不能
   返回部分结果或静默退回 HOST。
@@ -209,7 +216,7 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   及 grouped DISTINCT；完整 group key 做 radix partition。
 - Sort 采用 NASCENT2 更适合本项目的 near-storage external-sort 思路：有界 run
   generation、Flash run、stable merge pass、top-N 截断。相比完全片上 Vitis Sort，
-  它更自然地处理 SF=32 和有限 FDM。
+  它更自然地处理 SF=16 这类超过 4 GiB FDM 的数据集。
 - 一般非等值/相关 Nested Loop、任意函数/UDF、复杂 locale collation、TOAST 解压、
   MVCC visibility 判断、索引 AM 遍历和事务控制不适合伪装成 FPGA primitive。
   `NL_JOIN` 仅作功能 fallback 并计入 `software_fallback_nodes`。规划器应优先改写为
@@ -260,7 +267,11 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   chunk 直接更新聚合状态，不再恢复完整 visible Join `Batch`；聚合 state 实际超出 arena
   时释放 partial state、重读仍完整的 final run，并把有界 chunk 按完整 group key 直接写入
   Flash handle chain。之后每次只 replay 一个 partition，仍超限时使用更高 hash bits 递归
-  repartition，不再回到完整 Join 输出物化路径。
+  repartition，不再回到完整 Join 输出物化路径。query-local Flash 使用可合并 free extent
+  重用已经消费的 data/link/run 空间；超大 probe 在达到 spill 容量四分之一后分 wave
+  replay，保留 build partition 并把带全局 ordinal 的结果并入同一 run merge，避免必须
+  先容纳完整 probe。partitioned Join 还可按 staging-bounded chunk 直连后续 Join 的
+  probe 或 build 侧，不再为 Join-to-Join 强制恢复完整可见 `Batch`。
 - Grouped Aggregate：每个 group 永远落入一个 partition，保留 DISTINCT 与 AVG
   sum/count 语义；collision partition 使用更高 hash bits 递归 partition。新 group 和
   DISTINCT item 在插入前原子计费，一旦过 arena threshold 就丢弃 partial table 并按
@@ -274,20 +285,21 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
 
 必须诚实保留的当前边界：直接 Scan-to-Sort、符合准入条件的 Scan-to-Aggregate，以及
 Join 左/probe 链已消除对应完整 Scan `Batch`；符合两侧 Scan 准入的超大 Join build 也
-直接逐 batch 分区。非 Scan build 子树、不能从完整 Flash run 重放的超大/不确定/含
-DISTINCT Aggregate 输入以及最终阻塞输出仍会累计。cursor chunk、hash state 仍是普通
+直接逐 batch 分区。不能从完整 Flash run 重放的超大/不确定 Aggregate、直接 Scan
+输入的 DISTINCT Aggregate 以及最终阻塞输出仍会累计。cursor chunk、hash state 仍是普通
 STL container，而非真实 FDM
 arena allocator；streamed Join 的句柄 payload 已由 Flash 链约束为 O(partition count)，
-但 descriptor vector 仍有 STL allocator 开销，adaptive repartition 也不会在 query 内
-回收旧 data/chain scratch record。partitioned Join 的 ordinal reorder payload 已约束为
-O(log run count)，probe fan-out 暂存已由 spill staging 容量约束，但最终 visible output
-仅在 Join-to-Join、最终返回、DISTINCT/不支持 Aggregate 或容量回退时仍完整物化；符合
+但 descriptor vector 仍有 STL allocator 开销。partitioned Join 的 ordinal reorder
+payload 已约束为 O(log run count)，probe fan-out 暂存已由 spill staging 容量约束，
+但最终 visible output
+仅在最终返回、DISTINCT/不支持 Aggregate 或容量回退时仍可能完整物化；符合
 sole-consumer non-DISTINCT Aggregate 形状的 final run 已按 chunk 直连，runtime state
 超限也已由直接 Aggregate partition writer + recursive replay 约束。
 虽然 scan window、FIFO、run generation、cursor merge、部分 Aggregate/Join state、spill
-I/O 和 blocking lease 已有界，但在实现 Join-to-Join/final-result consumer、
-其他 Aggregate 输入形状的 streaming partition writer 与 arena-backed container 前，不能声称 SF=32
-端到端物理内存已严格有界。global Aggregate 的大型
+I/O 和 blocking lease 已有界，但在实现 final-result consumer、其他 Aggregate 输入形状
+的 streaming partition writer 与 arena-backed container 前，不能声称 SF=16 端到端
+物理内存已严格有界。SF=16 profile 中 Q17/Q18 的普通 STL `Batch` 保守峰值仍分别为
+22,194,284,144 B 和 15,550,897,984 B。global Aggregate 的大型
 DISTINCT 仍保留 compatibility/protection-copy 路径。
 
 ## 9. 时延模型和已测性能
@@ -435,6 +447,16 @@ partitioned Join 最终 run 到 Aggregate 的 bounded handoff 验证位于
 `5beda81163615312135ca69e936d8f92234939f21152ca7ec4a940b1fb865082`、
 `1f773d85941895d002864dd1e272c84d5f8b3e1563d438bac8d152d883d8c87e`。
 
+SF=16 可扩展性与正确性验证位于 `results/tpch_sf16_validation.{md,csv}`，原始证据归档
+为 `results/tpch_sf16_validation_raw.tar.gz`，SHA-256
+`4ae3b446c59d37268f9a35ccf25dc58f70b7fe031e60705e49b7d541f3adb42d`。原版
+pure-memory backend、48 GiB NVM、4 GiB FDM、13,312 MiB query-local spill 下，forced
+CSD Q1--Q22 全部与 HOST byte-for-byte exact，forced planner 22/22、pending expression
+为 0，optimized 与 ASan/UBSan 单元测试通过。25 个 CSD 子计划均为零 spill allocation
+failure；最大 spill high-water 是 Q21 的 9,137,763,384 B，Q9 probe-wave replay 为
+7,830,014,467 B。该实验只证明超过 4 GiB FDM 的数据与中间结果可正确执行，不能用作
+HOST/CSD speedup 数据，也不能掩盖上一节记录的 Q17/Q18 STL 物化峰值。
+
 ## 10. 回归命令与通过标准
 
 主机单元测试：
@@ -463,6 +485,18 @@ cd /mnt/cemu
   --output-dir /tmp/<run-name>
 ```
 
+SF=16 最终验证使用预生成 HOST golden，避免在 16 GiB guest 中为每条查询重复执行 HOST：
+
+```bash
+tar -xzf /mnt/cemu/results/tpch_sf16_validation_raw.tar.gz -C /mnt/cemu
+./tests/test_csd_tpch_execution.sh --sf 16 --mode csd \
+  --socket-dir /tmp/csdpg_nvme_tpch_s16 --port 57432 \
+  --shared-library /workspace/code/CEMU/tests/cemu/build/<version>.so \
+  --host-golden-dir /mnt/cemu/results/tpch_sf16_host_golden \
+  --output-dir /tmp/<run-name> --profile --cache-fill off \
+  --spill-mb 13312 --execute-timeout-ms 3600000
+```
+
 通过标准是 Q1-Q22 全部报告 `EXACT`，不能只检查成功退出。规划器回归同时要求 forced
 CSD plan 中没有 host scan/join/aggregate/sort，允许顶层 PostgreSQL `Limit` 作为控制
 编排。性能回归需固定 cache 状态、runtime、parallel workers、FDM/spill 参数，保留
@@ -477,6 +511,9 @@ PG_CONFIG=/opt/pgsql12/bin/pg_config \
   CSD_AUTO_PORT=57432 \
   ./tests/test_csd_auto_planner.sh
 ```
+
+该脚本的 `hot=HOST` 是 SF=1 校准断言，不应直接改用 SF=16：在 SF=16 即使 base table
+全部命中主机缓存，`count(lineitem)` 的 FPGA 聚合收益仍可能使 AUTO 正确选择 CSD。
 
 ## 11. AER 与缓存回填（2026-10-04 已实现）
 
