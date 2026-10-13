@@ -285,6 +285,11 @@ void sched_init(NvmeNamespace *ns)
                        sched_thread, cns, QEMU_THREAD_JOINABLE);
 }
 
+static uint32_t clamp_stat_u32(uint64_t value)
+{
+    return value > UINT32_MAX ? UINT32_MAX : (uint32_t)value;
+}
+
 static void job_finish(ComputeEngine *ce, CsfScheduler *scheduler,
                        ComputeJob *job, uint64_t finish_time)
 {
@@ -296,11 +301,14 @@ static void job_finish(ComputeEngine *ce, CsfScheduler *scheduler,
 
     // update statistics
     job->stat.finish_time = finish_time;
-    req->stat.reqlat = finish_time - req->stat.stime;
+    req->stat.reqlat = clamp_stat_u32(finish_time - req->stat.stime);
     req->stat.expire_time = finish_time;
-    req->stat.exec.queueing_time += job->stat.start_time - req->stat.stime;
+    req->stat.exec.queueing_time = clamp_stat_u32(
+        (uint64_t)req->stat.exec.queueing_time +
+        job->stat.start_time - req->stat.stime);
     req->stat.exec.nr_context_switch += job->stat.nr_context_switch;
-    req->stat.exec.runtime += job->runtime;
+    req->stat.exec.runtime = clamp_stat_u32(
+        (uint64_t)req->stat.exec.runtime + job->runtime);
     req->cqe.n.rsvd += req->stat.exec.queueing_time;
 
     // job group statistics

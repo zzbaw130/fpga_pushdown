@@ -247,6 +247,17 @@
                     return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
                 value /= divisor;
             }
+			/* PostgreSQL NUMERIC keeps declared trailing fractional zeros, but
+			 * the FPGA wire value is an int64 plus a per-value scale.  Large
+			 * products such as Q11's SUM(...) * 0.0001000000 may overflow the
+			 * int64 representation even though removing only exact trailing
+			 * zeros represents the identical number.  Renormalize only while
+			 * division by ten is lossless; never round a significant digit. */
+			while (!fits_i64(value) && result->numeric_scale > 0 &&
+			       value % 10 == 0) {
+				value /= 10;
+				--result->numeric_scale;
+			}
 		} else {
 			if (right.integer == 0) return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index);
 			const int left_scale = left.type == CSD_SQL_TYPE_NUMERIC ? left.numeric_scale : 0;

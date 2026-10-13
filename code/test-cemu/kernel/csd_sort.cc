@@ -281,6 +281,9 @@
                                   emit) ||
             !finish_spill_writer(index, &writer, &output_run->handle))
             return false;
+        for (size_t run = begin; run < end; ++run)
+            if (!release_spill_handle(index, runs[run].handle))
+                return false;
         output_run->max_row_bytes = max_row_bytes;
         note_sort_merge_rows(output_rows);
         const uint64_t cursor_reserved = 4 * cursor_capacity * (end - begin);
@@ -313,6 +316,9 @@
                                   runs.size(), cursor_capacity, output_rows,
                                   emit))
             return false;
+        for (size_t run = 0; run < runs.size(); ++run)
+            if (!release_spill_handle(index, runs[run].handle))
+                return false;
         note_sort_merge_rows(output_rows);
         note_sort_final_stream(*output, columns, output_rows);
         note_sort_kway(runs.size(), 4 * cursor_capacity * runs.size());
@@ -380,8 +386,11 @@
         }
         output->columns = columns;
         if (runs->empty()) return true;
-        if (runs->size() == 1)
-            return read_spill_batch(index, (*runs)[0].handle, output);
+        if (runs->size() == 1) {
+            if (!read_spill_batch(index, (*runs)[0].handle, output))
+                return false;
+            return release_spill_handle(index, (*runs)[0].handle);
+        }
         return merge_spill_runs_to_batch(index, columns, spec, keys,
                                          (*runs)[0].handle,
                                          (*runs)[1].handle, output);
@@ -452,6 +461,10 @@
         }
         finish_spill_cursor(&left);
         finish_spill_cursor(&right);
+
+        if (!release_spill_handle(index, left_handle) ||
+            !release_spill_handle(index, right_handle))
+            return false;
 
         uint64_t cell_count = 0, serialized_bytes = sizeof(SpillRecordHeader);
         if (!checked_mul(output_rows, columns, &cell_count) ||
@@ -561,6 +574,9 @@
         finish_spill_cursor(&left);
         finish_spill_cursor(&right);
         if (!finish_spill_writer(index, &writer, output_handle)) return false;
+        if (!release_spill_handle(index, left_handle) ||
+            !release_spill_handle(index, right_handle))
+            return false;
         {
             std::lock_guard<std::mutex> status_guard(status_mutex_);
             status_.sort_merge_rows += emitted;

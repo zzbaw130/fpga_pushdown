@@ -49,6 +49,25 @@ struct Batch {
     std::vector<Row> rows;
     Batch() : columns(0) {}
 };
+struct StreamingJoinChainStep {
+    uint32_t join_index;
+    const CsdSqlPlanNode *join_node;
+    const Batch *right;
+    std::vector<uint32_t> pipeline;
+    StreamingJoinChainStep()
+        : join_index(CSD_SQL_INVALID_NODE), join_node(NULL), right(NULL) {}
+};
+struct StreamingJoinBuildHandoff {
+    uint32_t join_index;
+    const CsdSqlPlanNode *join_node;
+    std::vector<uint32_t> pipeline;
+    StreamingJoinBuildHandoff()
+        : join_index(CSD_SQL_INVALID_NODE), join_node(NULL) {}
+    bool valid() const
+    {
+        return join_index != CSD_SQL_INVALID_NODE && join_node != NULL;
+    }
+};
 struct SpillRecordHeader {
     uint32_t magic;
     uint32_t node_id;
@@ -66,6 +85,12 @@ struct SpillHandle {
     uint16_t column_count;
     uint16_t reserved16;
     SpillHandle() : offset(0), length(0), row_count(0), column_count(0), reserved16(0) {}
+};
+struct SpillFreeExtent {
+    uint64_t offset;
+    uint64_t length;
+    SpillFreeExtent(uint64_t extent_offset, uint64_t extent_length)
+        : offset(extent_offset), length(extent_length) {}
 };
 struct SpillChainRecord {
     uint32_t magic;
@@ -190,6 +215,35 @@ static uint64_t batch_bytes(const Batch &batch)
         for (Row::const_iterator value = row->begin(); value != row->end(); ++value) total += value->bytes.size();
     return total;
 }
+static uint64_t batch_storage_bytes(const Batch &batch)
+{
+    /* Conservative resident STL storage, including spare vector/string
+     * capacity and a small allocator header per possible allocation. */
+    const uint64_t allocator_header = 16;
+    uint64_t total = sizeof(Batch);
+    uint64_t bytes = 0;
+    if (!checked_mul(batch.rows.capacity(), sizeof(Row), &bytes) ||
+        !checked_add(total, bytes, &total) ||
+        (batch.rows.capacity() != 0 &&
+         !checked_add(total, allocator_header, &total)))
+        return std::numeric_limits<uint64_t>::max();
+    for (std::vector<Row>::const_iterator row = batch.rows.begin();
+         row != batch.rows.end(); ++row) {
+        if (!checked_mul(row->capacity(), sizeof(Value), &bytes) ||
+            !checked_add(total, bytes, &total) ||
+            (row->capacity() != 0 &&
+             !checked_add(total, allocator_header, &total)))
+            return std::numeric_limits<uint64_t>::max();
+        for (Row::const_iterator value = row->begin();
+             value != row->end(); ++value) {
+            if (value->bytes.capacity() == 0) continue;
+            if (!checked_add(total, value->bytes.capacity() + 1, &total) ||
+                !checked_add(total, allocator_header, &total))
+                return std::numeric_limits<uint64_t>::max();
+        }
+    }
+    return total;
+}
 static std::string value_key(const Value &value)
 {
     std::string key;
@@ -239,6 +293,7 @@ public:
         status_.magic = CSD_SQL_PLAN_MAGIC;
         status_.version = CSD_SQL_PLAN_VERSION;
         status_.failed_node = CSD_SQL_INVALID_NODE;
+        status_.materialized_batch_peak_node = CSD_SQL_INVALID_NODE;
     }
 
     ~Engine()
@@ -279,6 +334,14 @@ public:
             add_consumer(node.left_input, index, consumers, sole_consumer);
             add_consumer(node.right_input, index, consumers, sole_consumer);
             add_consumer(node.aux_input, index, consumers, sole_consumer);
+            if (header_->flags & CSD_SQL_PLAN_PROFILE)
+                std::fprintf(stderr,
+                    "CSD_PLAN plan=%llu node=%u opcode=%u left=%u right=%u aux=%u flags=%u arg0=%llu arg1=%llu\n",
+                    static_cast<unsigned long long>(header_->plan_id), index,
+                    node.opcode, node.left_input, node.right_input,
+                    node.aux_input, node.flags,
+                    static_cast<unsigned long long>(node.arg0),
+                    static_cast<unsigned long long>(node.arg1));
         }
         uint32_t completed = 0;
         while (completed < header_->node_count) {
@@ -295,7 +358,8 @@ public:
                      * directly. Resolve the build subtree first; nested Join
                      * trees apply the same rule recursively. */
                     if (join_index != CSD_SQL_INVALID_NODE &&
-                        !complete[nodes_[join_index].right_input])
+                        !streaming_join_chain_builds_ready(join_index, complete,
+                            consumers, sole_consumer))
                         continue;
                 }
                 ready.push_back(index);
@@ -310,8 +374,10 @@ public:
                                              complete, consumers, sole_consumer,
                                              precomputed) ? 1 : 0;
             });
-            for (size_t slot = 0; slot < ready.size(); ++slot) {
+            for (size_t slot = 0; slot < ready.size(); ++slot)
                 if (!success[slot]) return error_return();
+            note_materialized_results(results);
+            for (size_t slot = 0; slot < ready.size(); ++slot) {
                 const uint32_t node_index = ready[slot];
                 const CsdSqlPlanNode &node = nodes_[node_index];
                 complete[node_index] = 1;
@@ -322,6 +388,7 @@ public:
                 release_input(node.right_input, consumers, results);
                 release_input(node.aux_input, consumers, results);
             }
+            note_materialized_results(results);
         }
         const Batch &root = results[header_->root_node];
         if (!write_result(root)) return error_return();
@@ -447,6 +514,38 @@ private:
     {
         return input == CSD_SQL_INVALID_NODE || complete[input] != 0;
     }
+    void note_materialized_results(const std::vector<Batch> &results)
+    {
+        uint64_t bytes = 0;
+        uint64_t wire_bytes = 0;
+        uint64_t rows = 0;
+        uint64_t largest = 0;
+        uint32_t largest_node = CSD_SQL_INVALID_NODE;
+        for (uint32_t index = 0; index < results.size(); ++index) {
+            const uint64_t result_bytes = batch_storage_bytes(results[index]);
+            const uint64_t result_wire_bytes = batch_bytes(results[index]);
+            if (!checked_add(bytes, result_bytes, &bytes))
+                bytes = std::numeric_limits<uint64_t>::max();
+            if (!checked_add(wire_bytes, result_wire_bytes, &wire_bytes))
+                wire_bytes = std::numeric_limits<uint64_t>::max();
+            const uint64_t result_rows = results[index].rows.size();
+            if (!checked_add(rows, result_rows, &rows))
+                rows = std::numeric_limits<uint64_t>::max();
+            if (result_bytes > largest) {
+                largest = result_bytes;
+                largest_node = index;
+            }
+        }
+        std::lock_guard<std::mutex> guard(status_mutex_);
+        status_.materialized_batch_current_bytes = bytes;
+        if (bytes > status_.materialized_batch_peak_bytes) {
+            status_.materialized_batch_peak_bytes = bytes;
+            status_.materialized_batch_peak_wire_bytes = wire_bytes;
+            status_.materialized_batch_peak_rows = rows;
+            status_.materialized_batch_peak_node = largest_node;
+        }
+    }
+
     static void release_input(uint32_t input, std::vector<uint32_t> &consumers,
                               std::vector<Batch> &results)
     {
@@ -656,9 +755,10 @@ private:
             if (succeeded) status_.operator_rows[opcode] += output->rows.size();
             if (header_->flags & CSD_SQL_PLAN_PROFILE)
                 std::fprintf(stderr,
-                    "CSD_NODE plan=%llu node=%u opcode=%u rows=%llu elapsed_ms=%.3f\n",
+                    "CSD_NODE plan=%llu node=%u opcode=%u rows=%llu bytes=%llu elapsed_ms=%.3f\n",
                     static_cast<unsigned long long>(header_->plan_id), index, opcode,
                     static_cast<unsigned long long>(succeeded ? output->rows.size() : 0),
+                    static_cast<unsigned long long>(succeeded ? batch_bytes(*output) : 0),
                     static_cast<double>(elapsed_ns) / 1000000.0);
         }
         return succeeded;
@@ -720,6 +820,11 @@ private:
                 consumers, sole_consumer);
             const uint32_t build_join_index = streaming_join_build_target(
                 index, pipeline, consumers, sole_consumer);
+            std::vector<StreamingJoinChainStep> join_chain;
+            if (join_index != CSD_SQL_INVALID_NODE)
+                streaming_join_chain(join_index, consumers, sole_consumer,
+                                     &results, &join_chain);
+            StreamingJoinBuildHandoff join_build_handoff;
             /* Actual build bytes, rather than a planner estimate, select a
              * resident hash or a Flash-partitioned build. A spillable
              * oversized build still consumes its probe Scan by FIFO batch. */
@@ -732,23 +837,33 @@ private:
             std::vector<uint32_t> join_aggregate_pipeline;
             uint32_t join_aggregate_index = CSD_SQL_INVALID_NODE;
             bool stream_join_aggregate = false;
+            bool force_partitioned_join = !join_chain.empty();
             if (stream_join) {
                 const bool streamed_build_ready =
                     join_index < streamed_join_builds_.size() &&
                     streamed_join_builds_[join_index].complete &&
                     !streamed_join_builds_[join_index].consumed;
-                const bool partitioned_join = streamed_build_ready ||
+                const uint32_t final_join = join_chain.empty() ? join_index :
+                    join_chain.back().join_index;
+                join_build_handoff.pipeline = stateless_pipeline(
+                    final_join, consumers, sole_consumer);
+                join_build_handoff.join_index = streaming_join_build_target(
+                    final_join, join_build_handoff.pipeline, consumers,
+                    sole_consumer, false);
+                if (join_build_handoff.join_index != CSD_SQL_INVALID_NODE)
+                    join_build_handoff.join_node =
+                        &nodes_[join_build_handoff.join_index];
+                join_aggregate_index = streaming_join_aggregate_target(
+                    final_join, consumers, sole_consumer,
+                    &join_aggregate_pipeline);
+                stream_join_aggregate =
+                    join_aggregate_index != CSD_SQL_INVALID_NODE;
+                force_partitioned_join = force_partitioned_join ||
+                    stream_join_aggregate || streamed_build_ready ||
+                    join_build_handoff.valid() ||
                     batch_bytes(input_batch(nodes_[join_index].right_input,
                                              results)) >
                         operator_memory_capacity_;
-                if (partitioned_join) {
-                    join_aggregate_index =
-                        streaming_join_aggregate_target(join_index,
-                            consumers, sole_consumer,
-                            &join_aggregate_pipeline);
-                    stream_join_aggregate =
-                        join_aggregate_index != CSD_SQL_INVALID_NODE;
-                }
             }
             bool succeeded = false;
             if (build_join_index != CSD_SQL_INVALID_NODE)
@@ -770,7 +885,10 @@ private:
                     stream_join_aggregate ?
                         &nodes_[join_aggregate_index] : NULL,
                     stream_join_aggregate ?
-                        &join_aggregate_pipeline : NULL);
+                        &join_aggregate_pipeline : NULL,
+                    force_partitioned_join,
+                    join_chain.empty() ? NULL : &join_chain,
+                    join_build_handoff.valid() ? &join_build_handoff : NULL);
             else
                 succeeded = execute_scan(index, node, output, &pipeline);
             if (succeeded) {
@@ -785,6 +903,22 @@ private:
                 }
                 if (stream_join) {
                     precomputed[join_index] = 1;
+                    for (std::vector<StreamingJoinChainStep>::const_iterator
+                             step = join_chain.begin();
+                         step != join_chain.end(); ++step) {
+                        for (std::vector<uint32_t>::const_iterator stage =
+                                 step->pipeline.begin();
+                             stage != step->pipeline.end(); ++stage)
+                            precomputed[*stage] = 1;
+                        precomputed[step->join_index] = 1;
+                    }
+                    if (join_build_handoff.valid()) {
+                        for (std::vector<uint32_t>::const_iterator stage =
+                                 join_build_handoff.pipeline.begin();
+                             stage != join_build_handoff.pipeline.end();
+                             ++stage)
+                            precomputed[*stage] = 1;
+                    }
                     if (stream_join_aggregate) {
                         for (std::vector<uint32_t>::const_iterator stage =
                                  join_aggregate_pipeline.begin();
@@ -883,10 +1017,54 @@ private:
         return join_index;
     }
 
+    void streaming_join_chain(
+        uint32_t first_join, const std::vector<uint32_t> &consumers,
+        const std::vector<uint32_t> &sole_consumer,
+        const std::vector<Batch> *results,
+        std::vector<StreamingJoinChainStep> *chain) const
+    {
+        chain->clear();
+        uint32_t current = first_join;
+        while (current != CSD_SQL_INVALID_NODE) {
+            const std::vector<uint32_t> pipeline = stateless_pipeline(
+                current, consumers, sole_consumer);
+            const uint32_t next = streaming_join_target(
+                current, pipeline, consumers, sole_consumer);
+            if (next == CSD_SQL_INVALID_NODE) break;
+            StreamingJoinChainStep step;
+            step.join_index = next;
+            step.join_node = &nodes_[next];
+            step.pipeline = pipeline;
+            if (results != NULL)
+                step.right = &input_batch(nodes_[next].right_input, *results);
+            chain->push_back(step);
+            current = next;
+        }
+    }
+
+    bool streaming_join_chain_builds_ready(
+        uint32_t first_join, const std::vector<uint8_t> &complete,
+        const std::vector<uint32_t> &consumers,
+        const std::vector<uint32_t> &sole_consumer) const
+    {
+        if (first_join == CSD_SQL_INVALID_NODE ||
+            !complete[nodes_[first_join].right_input])
+            return false;
+        std::vector<StreamingJoinChainStep> chain;
+        streaming_join_chain(first_join, consumers, sole_consumer, NULL,
+                             &chain);
+        for (std::vector<StreamingJoinChainStep>::const_iterator step =
+                 chain.begin(); step != chain.end(); ++step)
+            if (!complete[nodes_[step->join_index].right_input])
+                return false;
+        return true;
+    }
+
     uint32_t streaming_join_build_target(
         uint32_t input, const std::vector<uint32_t> &pipeline,
         const std::vector<uint32_t> &consumers,
-        const std::vector<uint32_t> &sole_consumer) const
+        const std::vector<uint32_t> &sole_consumer,
+        bool require_oversized_estimate = true) const
     {
         const uint32_t tail = pipeline.empty() ? input : pipeline.back();
         if (consumers[tail] != 1 ||
@@ -901,7 +1079,8 @@ private:
             !has_streaming_scan_source(join.left_input, consumers,
                                        sole_consumer) ||
             !(join.flags & CSD_SQL_NODE_SPILLABLE) ||
-            join.arg0 <= operator_memory_capacity_)
+            (require_oversized_estimate &&
+             join.arg0 <= operator_memory_capacity_))
             return CSD_SQL_INVALID_NODE;
         return join_index;
     }
@@ -938,17 +1117,25 @@ private:
         const std::vector<uint32_t> &sole_consumer) const
     {
         uint32_t current = tail;
-        while (current != CSD_SQL_INVALID_NODE &&
-               (nodes_[current].opcode == CSD_SQL_OP_FILTER ||
-                nodes_[current].opcode == CSD_SQL_OP_PROJECT)) {
+        while (current != CSD_SQL_INVALID_NODE) {
+            const uint16_t opcode = nodes_[current].opcode;
+            if (opcode == CSD_SQL_OP_SCAN) return true;
+            if (opcode != CSD_SQL_OP_FILTER &&
+                opcode != CSD_SQL_OP_PROJECT &&
+                opcode != CSD_SQL_OP_HASH_JOIN &&
+                opcode != CSD_SQL_OP_MERGE_JOIN)
+                return false;
+            if ((opcode == CSD_SQL_OP_HASH_JOIN ||
+                 opcode == CSD_SQL_OP_MERGE_JOIN) &&
+                !(nodes_[current].flags & CSD_SQL_NODE_SPILLABLE))
+                return false;
             const uint32_t input = nodes_[current].left_input;
             if (input == CSD_SQL_INVALID_NODE || consumers[input] != 1 ||
                 sole_consumer[input] != current)
                 return false;
             current = input;
         }
-        return current != CSD_SQL_INVALID_NODE &&
-               nodes_[current].opcode == CSD_SQL_OP_SCAN;
+        return false;
     }
 
 #include "csd_fifo.cc"
@@ -1063,6 +1250,24 @@ private:
                     static_cast<unsigned long long>(snapshot.operator_calls[opcode]),
                     static_cast<unsigned long long>(snapshot.operator_rows[opcode]),
                     static_cast<double>(snapshot.operator_ns[opcode]) / 1000000.0);
+        std::fprintf(stderr,
+            "CSD_MODEL plan=%llu cycles=%llu flash_read=%llu flash_write=%llu "
+            "spill_read=%llu spill_write=%llu materialized_peak=%llu "
+            "materialized_wire=%llu materialized_rows=%llu materialized_node=%u "
+            "spill_capacity=%llu spill_peak=%llu spill_failed_required=%llu\n",
+            static_cast<unsigned long long>(snapshot.plan_id),
+            static_cast<unsigned long long>(snapshot.modeled_cycles),
+            static_cast<unsigned long long>(snapshot.flash_read_bytes),
+            static_cast<unsigned long long>(snapshot.flash_write_bytes),
+            static_cast<unsigned long long>(snapshot.spill_read_bytes),
+            static_cast<unsigned long long>(snapshot.spill_write_bytes),
+            static_cast<unsigned long long>(snapshot.materialized_batch_peak_bytes),
+            static_cast<unsigned long long>(snapshot.materialized_batch_peak_wire_bytes),
+            static_cast<unsigned long long>(snapshot.materialized_batch_peak_rows),
+            snapshot.materialized_batch_peak_node,
+            static_cast<unsigned long long>(snapshot.spill_capacity_bytes),
+            static_cast<unsigned long long>(snapshot.spill_peak_bytes),
+            static_cast<unsigned long long>(snapshot.spill_failed_required_bytes));
         std::fflush(stderr);
     }
     long long error_return()
@@ -1082,6 +1287,7 @@ private:
     uint64_t work_mem_bytes_;
     uint32_t parallel_workers_;
     uint64_t spill_offset_;
+    std::vector<SpillFreeExtent> spill_free_extents_;
     uint32_t spill_run_id_;
     uint32_t fifo_generation_;
     uint64_t operator_memory_capacity_;

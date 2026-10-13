@@ -179,6 +179,143 @@
         return true;
     }
 
+    void note_spill_allocation(uint64_t capacity, uint64_t required_end,
+                               bool allocated)
+    {
+        std::lock_guard<std::mutex> status_guard(status_mutex_);
+        status_.spill_capacity_bytes = std::max<uint64_t>(
+            status_.spill_capacity_bytes, capacity);
+        if (allocated)
+            status_.spill_peak_bytes = std::max<uint64_t>(
+                status_.spill_peak_bytes, required_end);
+        else
+            status_.spill_failed_required_bytes = std::max<uint64_t>(
+                status_.spill_failed_required_bytes, required_end);
+    }
+
+    uint64_t spill_storage_capacity() const
+    {
+        return (header_->flags & CSD_SQL_PLAN_FLASH_SPILL) ?
+            header_->spill_bytes : static_cast<uint64_t>(
+                args_->mr_len[header_->spill_range]);
+    }
+
+    /* Query-local Flash records have explicit lifetimes.  Reuse extents from
+     * consumed merge inputs instead of treating spill as an append-only log;
+     * this bounds multi-pass Sort/ordinal merge space by live runs.  Caller
+     * holds spill_mutex_. */
+    bool allocate_spill_extent_unlocked(uint32_t index, uint64_t length,
+                                        uint64_t *offset,
+                                        uint32_t detail)
+    {
+        const uint64_t capacity = spill_storage_capacity();
+        size_t selected = spill_free_extents_.size();
+        for (size_t extent = 0; extent < spill_free_extents_.size();
+             ++extent) {
+            if (spill_free_extents_[extent].length < length) continue;
+            if (selected == spill_free_extents_.size() ||
+                spill_free_extents_[extent].length <
+                    spill_free_extents_[selected].length)
+                selected = extent;
+        }
+        if (selected != spill_free_extents_.size()) {
+            SpillFreeExtent &extent = spill_free_extents_[selected];
+            *offset = extent.offset;
+            extent.offset += length;
+            extent.length -= length;
+            if (extent.length == 0)
+                spill_free_extents_.erase(
+                    spill_free_extents_.begin() + selected);
+            note_spill_allocation(capacity, *offset + length, true);
+            return true;
+        }
+        uint64_t required_end = 0;
+        if (!checked_add(spill_offset_, length, &required_end))
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, detail);
+        if (spill_offset_ > capacity || length > capacity - spill_offset_) {
+            if (header_->flags & CSD_SQL_PLAN_PROFILE) {
+                uint64_t free_total = 0, free_largest = 0;
+                for (size_t extent = 0; extent < spill_free_extents_.size();
+                     ++extent) {
+                    uint64_t total = 0;
+                    free_largest = std::max<uint64_t>(free_largest,
+                        spill_free_extents_[extent].length);
+                    free_total = checked_add(free_total,
+                        spill_free_extents_[extent].length, &total) ? total :
+                        std::numeric_limits<uint64_t>::max();
+                }
+                std::fprintf(stderr,
+                    "CSD_SPILL_OOM plan=%llu node=%u detail=%u request=%llu cursor=%llu capacity=%llu free_total=%llu free_largest=%llu free_extents=%llu\n",
+                    static_cast<unsigned long long>(header_->plan_id), index,
+                    detail, static_cast<unsigned long long>(length),
+                    static_cast<unsigned long long>(spill_offset_),
+                    static_cast<unsigned long long>(capacity),
+                    static_cast<unsigned long long>(free_total),
+                    static_cast<unsigned long long>(free_largest),
+                    static_cast<unsigned long long>(spill_free_extents_.size()));
+            }
+            note_spill_allocation(capacity, required_end, false);
+            return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, detail);
+        }
+        *offset = spill_offset_;
+        spill_offset_ = required_end;
+        note_spill_allocation(capacity, required_end, true);
+        return true;
+    }
+
+    bool release_spill_extent_unlocked(uint32_t index, uint64_t offset,
+                                       uint64_t length)
+    {
+        if (length == 0) return true;
+        uint64_t end = 0;
+        if (!checked_add(offset, length, &end) || end > spill_offset_)
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x24a);
+        size_t position = 0;
+        while (position < spill_free_extents_.size() &&
+               spill_free_extents_[position].offset < offset)
+            ++position;
+        if ((position > 0 &&
+             spill_free_extents_[position - 1].offset +
+                 spill_free_extents_[position - 1].length > offset) ||
+            (position < spill_free_extents_.size() &&
+             end > spill_free_extents_[position].offset))
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x24b);
+        spill_free_extents_.insert(spill_free_extents_.begin() + position,
+                                   SpillFreeExtent(offset, length));
+        if (position > 0 &&
+            spill_free_extents_[position - 1].offset +
+                spill_free_extents_[position - 1].length ==
+                    spill_free_extents_[position].offset) {
+            spill_free_extents_[position - 1].length +=
+                spill_free_extents_[position].length;
+            spill_free_extents_.erase(spill_free_extents_.begin() + position);
+            --position;
+        }
+        if (position + 1 < spill_free_extents_.size() &&
+            spill_free_extents_[position].offset +
+                spill_free_extents_[position].length ==
+                    spill_free_extents_[position + 1].offset) {
+            spill_free_extents_[position].length +=
+                spill_free_extents_[position + 1].length;
+            spill_free_extents_.erase(spill_free_extents_.begin() +
+                                      position + 1);
+        }
+        while (!spill_free_extents_.empty()) {
+            const SpillFreeExtent &last = spill_free_extents_.back();
+            if (last.offset + last.length != spill_offset_) break;
+            spill_offset_ = last.offset;
+            spill_free_extents_.pop_back();
+        }
+        return true;
+    }
+
+    bool release_spill_handle(uint32_t index, const SpillHandle &handle)
+    {
+        std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+        return release_spill_extent_unlocked(index, handle.offset,
+                                             handle.length);
+    }
+
     /* Serialize either a complete Batch or a row-ordinal selection directly.
      * Selection mode avoids constructing a copied partition Batch. An ordinal
      * base lets independently consumed FIFO batches share one global probe
@@ -231,11 +368,11 @@
         record.cell_count = static_cast<uint64_t>(row_count) * column_count;
         record.bytes_length = payload_bytes;
 
-        const uint64_t record_offset = spill_offset_;
+        uint64_t record_offset = 0;
+        if (!allocate_spill_extent_unlocked(index, total_bytes,
+                                            &record_offset, 0x206))
+            return false;
         if (header_->flags & CSD_SQL_PLAN_FLASH_SPILL) {
-            if (spill_offset_ > header_->spill_bytes ||
-                total_bytes > header_->spill_bytes - spill_offset_)
-                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x206);
             unsigned char *stage = static_cast<unsigned char *>(
                 args_->mr_addr[header_->spill_range]);
             const uint64_t capacity = static_cast<uint64_t>(
@@ -293,11 +430,8 @@
                 return false;
         } else {
             /* ABI test/compatibility path: the complete run resides in FDM. */
-            if (spill_offset_ > static_cast<uint64_t>(args_->mr_len[header_->spill_range]) ||
-                total_bytes > static_cast<uint64_t>(args_->mr_len[header_->spill_range]) - spill_offset_)
-                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index);
             unsigned char *target = static_cast<unsigned char *>(
-                args_->mr_addr[header_->spill_range]) + spill_offset_;
+                args_->mr_addr[header_->spill_range]) + record_offset;
             std::memcpy(target, &record, sizeof(record));
             CsdSqlResultCell *cells = reinterpret_cast<CsdSqlResultCell *>(
                 target + sizeof(record));
@@ -337,7 +471,6 @@
                 }
             }
         }
-        spill_offset_ += total_bytes;
         if (handle != NULL) {
             handle->offset = record_offset;
             handle->length = total_bytes;
@@ -386,18 +519,12 @@
         uint64_t record_offset = 0;
         {
             std::lock_guard<std::mutex> spill_guard(spill_mutex_);
-            const uint64_t capacity =
-                (header_->flags & CSD_SQL_PLAN_FLASH_SPILL) ?
-                    header_->spill_bytes : static_cast<uint64_t>(
-                        args_->mr_len[header_->spill_range]);
-            if (spill_offset_ > capacity ||
-                sizeof(record) > capacity - spill_offset_)
-                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x23c);
-            record_offset = spill_offset_;
+            if (!allocate_spill_extent_unlocked(index, sizeof(record),
+                                                &record_offset, 0x23c))
+                return false;
             if (!write_spill_storage_unlocked(index, record_offset, &record,
                                               sizeof(record)))
                 return false;
-            spill_offset_ += sizeof(record);
         }
         chain->tail_offset = record_offset;
         ++chain->count;
@@ -467,6 +594,38 @@
         }
         if (offset != std::numeric_limits<uint64_t>::max())
             return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x23f);
+        return true;
+    }
+
+    /* Release both the data records and the backwards-link records once a
+     * chain has been fully consumed.  Reading the link a second time is a
+     * small, bounded cost and lets all callers keep only the 16-byte chain
+     * descriptor rather than an in-memory handle vector. */
+    bool release_spill_chain(uint32_t index, SpillHandleChain *chain,
+                             bool account_join = true)
+    {
+        uint64_t offset = chain->tail_offset;
+        for (uint64_t item = 0; item < chain->count; ++item) {
+            SpillHandle handle;
+            uint64_t previous = 0;
+            const uint64_t record_offset = offset;
+            if (offset == std::numeric_limits<uint64_t>::max() ||
+                !read_spill_chain_handle(index, offset, &previous, &handle,
+                                         account_join) ||
+                !release_spill_handle(index, handle))
+                return false;
+            {
+                std::lock_guard<std::mutex> spill_guard(spill_mutex_);
+                if (!release_spill_extent_unlocked(index, record_offset,
+                                                   sizeof(SpillChainRecord)))
+                    return false;
+            }
+            offset = previous;
+        }
+        if (offset != std::numeric_limits<uint64_t>::max())
+            return fail(CSD_SQL_STATUS_BAD_ABI, index, 0x24c);
+        chain->tail_offset = std::numeric_limits<uint64_t>::max();
+        chain->count = 0;
         return true;
     }
 
@@ -918,17 +1077,11 @@
             stage_capacity : requested_chunk_capacity;
         if (chunk_capacity == 0 || chunk_capacity > stage_capacity)
             return fail(CSD_SQL_STATUS_FIFO_TOO_SMALL, index, 0x336);
-        const uint64_t storage_capacity =
-            (header_->flags & CSD_SQL_PLAN_FLASH_SPILL) ?
-                header_->spill_bytes : static_cast<uint64_t>(
-                    args_->mr_len[header_->spill_range]);
         {
             std::lock_guard<std::mutex> spill_guard(spill_mutex_);
-            if (spill_offset_ > storage_capacity ||
-                reserved > storage_capacity - spill_offset_)
-                return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index, 0x230);
-            writer->offset = spill_offset_;
-            spill_offset_ += reserved;
+            if (!allocate_spill_extent_unlocked(index, reserved,
+                                                &writer->offset, 0x230))
+                return false;
             writer->run_id = spill_run_id_++;
         }
         writer->node_id = index;
@@ -1062,7 +1215,13 @@
             if (!write_spill_storage_unlocked(index, writer->offset,
                                               &record, sizeof(record)))
                 return false;
+            if (writer->reserved_length > actual_length &&
+                !release_spill_extent_unlocked(index,
+                    writer->offset + actual_length,
+                    writer->reserved_length - actual_length))
+                return false;
         }
+        writer->reserved_length = actual_length;
         handle->offset = writer->offset;
         handle->length = actual_length;
         handle->row_count = writer->row_count;

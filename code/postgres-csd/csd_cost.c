@@ -39,6 +39,24 @@ static List *csd_device_paths = NIL;
 static bool csd_metadata_has_subplan(Node *node);
 
 static bool
+csd_constant_limit_value(PlannerInfo *root, Node *expression, int64 *value)
+{
+	Node *estimated;
+	Const *constant;
+
+	if (expression == NULL)
+		return false;
+	estimated = estimate_expression_value(root, expression);
+	if (!IsA(estimated, Const))
+		return false;
+	constant = (Const *) estimated;
+	if (constant->constisnull || constant->consttype != INT8OID)
+		return false;
+	*value = DatumGetInt64(constant->constvalue);
+	return *value >= 0;
+}
+
+static bool
 csd_is_path(const Path *path)
 {
 	return path != NULL && IsA(path, CustomPath) &&
@@ -985,6 +1003,23 @@ csd_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		/* PostgreSQL's bound already includes OFFSET. The Limit stage remains
 		 * responsible for discarding OFFSET rows after the CSD Sort. */
 		wire_count_est = (int) ceil(root->limit_tuples);
+	}
+	else if (stage == UPPERREL_ORDERED && root->parse->limitCount != NULL)
+	{
+		int64 count_value;
+		int64 offset_value = 0;
+
+		/* Some PostgreSQL 12 upper-path shapes leave limit_tuples unset even
+		 * for a literal LIMIT.  Recover the exact SQL bound from the folded
+		 * parse expressions so external Sort can still retain LIMIT+OFFSET
+		 * rows.  Non-constant values remain unbounded and are never guessed. */
+		if (csd_constant_limit_value(root, root->parse->limitCount,
+				&count_value) &&
+			(root->parse->limitOffset == NULL ||
+			 csd_constant_limit_value(root, root->parse->limitOffset,
+				 &offset_value)) &&
+			count_value > 0 && offset_value <= PG_INT32_MAX - count_value)
+			wire_count_est = (int) (count_value + offset_value);
 	}
 	output_rows = stage == UPPERREL_FINAL ? 0.0 :
 		csd_output_rows(output_rel);

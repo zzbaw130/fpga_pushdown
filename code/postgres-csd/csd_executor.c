@@ -1213,13 +1213,17 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 			ereport(ERROR,
 					(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
 					 errmsg("CSD SQL execution failed with status %u at node %u (detail %u)",
-							status.status_code, status.failed_node, status.reserved32)));
+							status.status_code, status.failed_node, status.reserved32),
+					 errdetail("Flash spill capacity=%llu bytes, peak=%llu bytes, failed allocation end=%llu bytes.",
+							   (unsigned long long) status.spill_capacity_bytes,
+							   (unsigned long long) status.spill_peak_bytes,
+							   (unsigned long long) status.spill_failed_required_bytes)));
 		if (csd_profile)
 		{
 			uint32 opcode;
 
 			ereport(NOTICE,
-					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f flash_read_bytes=%llu flash_write_bytes=%llu input_chunks=%llu spill_write_bytes=%llu spill_read_bytes=%llu fifo_batches=%llu fifo_write_bytes=%llu fifo_read_bytes=%llu fdm_reserved_bytes=%llu operator_memory_bytes=%llu operator_peak_bytes=%llu operator_allocations=%llu operator_spill_count=%llu stream_input_batches=%llu stream_input_rows=%llu stream_input_peak_bytes=%llu spill_cursor_peak_bytes=%llu spill_writer_peak_bytes=%llu sort_merge_rows=%llu stream_join_calls=%llu stream_join_batches=%llu stream_join_rows=%llu stream_join_build_bytes=%llu stream_join_partitioned_calls=%llu stream_join_streamed_build_calls=%llu stream_join_build_batches=%llu stream_join_build_rows=%llu stream_join_build_repartition_passes=%llu stream_join_chain_records=%llu stream_join_chain_record_reads=%llu stream_join_chain_peak_bytes=%llu stream_join_ordinal_runs=%llu stream_join_ordinal_merge_records=%llu stream_join_ordinal_merge_rows=%llu stream_join_ordinal_peak_bytes=%llu stream_join_output_buffers=%llu stream_join_output_rows=%llu stream_join_output_peak_bytes=%llu stream_join_downstream_calls=%llu stream_join_downstream_batches=%llu stream_join_downstream_rows=%llu stream_join_downstream_peak_bytes=%llu stream_join_downstream_fallbacks=%llu stream_aggregate_partitioned_calls=%llu stream_aggregate_partition_batches=%llu stream_aggregate_partition_rows=%llu stream_aggregate_repartition_passes=%llu stream_aggregate_chain_records=%llu stream_aggregate_chain_record_reads=%llu stream_aggregate_chain_peak_bytes=%llu sort_final_stream_calls=%llu sort_final_stream_rows=%llu sort_final_stream_avoided_write_bytes=%llu sort_final_stream_avoided_read_bytes=%llu sort_kway_merge_calls=%llu sort_kway_input_runs=%llu sort_kway_max_fan_in=%llu sort_kway_staging_reserved_peak_bytes=%llu",
+					(errmsg("CSD profile status scan_calls=%llu scan_ms=%.3f flash_read_bytes=%llu flash_write_bytes=%llu input_chunks=%llu spill_write_bytes=%llu spill_read_bytes=%llu fifo_batches=%llu fifo_write_bytes=%llu fifo_read_bytes=%llu fdm_reserved_bytes=%llu operator_memory_bytes=%llu operator_peak_bytes=%llu operator_allocations=%llu operator_spill_count=%llu stream_input_batches=%llu stream_input_rows=%llu stream_input_peak_bytes=%llu spill_cursor_peak_bytes=%llu spill_writer_peak_bytes=%llu sort_merge_rows=%llu stream_join_calls=%llu stream_join_batches=%llu stream_join_rows=%llu stream_join_build_bytes=%llu stream_join_partitioned_calls=%llu stream_join_streamed_build_calls=%llu stream_join_build_batches=%llu stream_join_build_rows=%llu stream_join_build_repartition_passes=%llu stream_join_chain_records=%llu stream_join_chain_record_reads=%llu stream_join_chain_peak_bytes=%llu stream_join_ordinal_runs=%llu stream_join_ordinal_merge_records=%llu stream_join_ordinal_merge_rows=%llu stream_join_ordinal_peak_bytes=%llu stream_join_output_buffers=%llu stream_join_output_rows=%llu stream_join_output_peak_bytes=%llu stream_join_downstream_calls=%llu stream_join_downstream_batches=%llu stream_join_downstream_rows=%llu stream_join_downstream_peak_bytes=%llu stream_join_downstream_fallbacks=%llu stream_aggregate_partitioned_calls=%llu stream_aggregate_partition_batches=%llu stream_aggregate_partition_rows=%llu stream_aggregate_repartition_passes=%llu stream_aggregate_chain_records=%llu stream_aggregate_chain_record_reads=%llu stream_aggregate_chain_peak_bytes=%llu sort_final_stream_calls=%llu sort_final_stream_rows=%llu sort_final_stream_avoided_write_bytes=%llu sort_final_stream_avoided_read_bytes=%llu sort_kway_merge_calls=%llu sort_kway_input_runs=%llu sort_kway_max_fan_in=%llu sort_kway_staging_reserved_peak_bytes=%llu materialized_batch_current_bytes=%llu materialized_batch_peak_bytes=%llu materialized_batch_peak_wire_bytes=%llu materialized_batch_peak_rows=%llu materialized_batch_peak_node=%u stream_join_chain_handoffs=%llu spill_capacity_bytes=%llu spill_peak_bytes=%llu spill_failed_required_bytes=%llu",
 							(unsigned long long) status.operator_calls[CSD_SQL_OP_SCAN],
 							(double) status.operator_ns[CSD_SQL_OP_SCAN] / 1000000.0,
 							(unsigned long long) status.flash_read_bytes,
@@ -1279,7 +1283,16 @@ csd_run_transport(CsdExecutorState *state, List *relations)
 							(unsigned long long) status.sort_kway_merge_calls,
 							(unsigned long long) status.sort_kway_input_runs,
 							(unsigned long long) status.sort_kway_max_fan_in,
-							(unsigned long long) status.sort_kway_staging_reserved_peak_bytes)));
+							(unsigned long long) status.sort_kway_staging_reserved_peak_bytes,
+							(unsigned long long) status.materialized_batch_current_bytes,
+							(unsigned long long) status.materialized_batch_peak_bytes,
+							(unsigned long long) status.materialized_batch_peak_wire_bytes,
+							(unsigned long long) status.materialized_batch_peak_rows,
+							status.materialized_batch_peak_node,
+							(unsigned long long) status.stream_join_chain_handoffs,
+							(unsigned long long) status.spill_capacity_bytes,
+							(unsigned long long) status.spill_peak_bytes,
+							(unsigned long long) status.spill_failed_required_bytes)));
 
 			for (opcode = CSD_SQL_OP_SCAN; opcode < CSD_SQL_PROFILE_SLOTS; ++opcode)
 				if (status.operator_calls[opcode] != 0)

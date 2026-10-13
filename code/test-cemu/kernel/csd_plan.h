@@ -434,6 +434,22 @@ struct CsdSqlExecutionStatus {
     uint64_t sort_kway_input_runs;
     uint64_t sort_kway_max_fan_in;
     uint64_t sort_kway_staging_reserved_peak_bytes;
+    /* Complete C++ Batch objects still resident between DAG nodes.  These
+     * counters expose paths that have not yet been converted to bounded
+     * FIFO/Flash consumers; they are diagnostics, not FDM allocations. */
+    uint64_t materialized_batch_current_bytes;
+    uint64_t materialized_batch_peak_bytes;
+    uint64_t materialized_batch_peak_wire_bytes;
+    uint64_t materialized_batch_peak_rows;
+    uint32_t materialized_batch_peak_node;
+    uint32_t materialized_batch_reserved32;
+    /* Partitioned Join final runs consumed by another Join without rebuilding
+     * a complete visible Batch. */
+    uint64_t stream_join_chain_handoffs;
+    /* Reusable query-local Flash extent allocator diagnostics. */
+    uint64_t spill_capacity_bytes;
+    uint64_t spill_peak_bytes;
+    uint64_t spill_failed_required_bytes;
 } __attribute__((packed));
 
 #endif /* CSD_SQL_PLAN_H */

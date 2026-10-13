@@ -44,8 +44,11 @@ typedef struct ComputeJob {
     pthread_spinlock_t lock;    // protect stat.exec_time
     ComputeJobStat stat;
     uint64_t last_sched_time;
-    uint32_t runtime;
-    uint32_t user_runtime;      // user specified runtime
+    /* Nanoseconds accumulated by the timing scheduler.  A 32-bit value wraps
+     * after 4.29 seconds, so a large-scale scan whose modeled Flash time
+     * exceeds that limit can never reach the uint64_t completion target. */
+    uint64_t runtime;
+    uint64_t user_runtime;      // user specified runtime (wire field is u32)
 
     struct JobGroup *group;
     QSIMPLEQ_ENTRY(ComputeJob) group_list;
@@ -59,6 +62,9 @@ typedef struct ComputeJob {
 
     struct ubpf_jit_args args;
 } ComputeJob;
+
+static_assert(sizeof(((ComputeJob *)0)->runtime) == sizeof(uint64_t),
+              "ComputeJob runtime must cover multi-second nanosecond models");
 
 static inline int job_permited_on_cu(ComputeJob *job, uint8_t cu_id)
 {

@@ -46,6 +46,7 @@
         std::vector<Value> minimum;
         std::vector<Value> maximum;
         std::vector<bool> has_value;
+        std::vector<std::unordered_set<std::string> > distinct;
     };
 
     struct StreamingAggregateState {
@@ -77,11 +78,10 @@
             : columns(0), radix_shift(0), radix_bits(0), rows(0) {}
     };
 
-    /* Scan-to-Aggregate has no retained source run to replay if its hash state
-     * unexpectedly outgrows the arena. Select it only for fixed-size global
-     * state or a non-DISTINCT grouped state with eightfold planner headroom.
-     * Partitioned Join-to-Aggregate has an intact final Flash run and can use
-     * the streaming partition writer below as a runtime fallback. */
+    /* Partitioned Join-to-Aggregate retains an intact final Flash run, so a
+     * grouped DISTINCT can be replayed after partitioning by its complete
+     * group key. A global DISTINCT cannot be split this way without a second
+     * distinct-key reduction and remains on the compatibility path. */
     bool can_replay_stream_aggregate(const CsdSqlPlanNode &node)
     {
         const CsdSqlAggregateSpec *spec = NULL;
@@ -105,7 +105,8 @@
                 group_begin + group_bytes);
         for (uint16_t aggregate = 0; aggregate < spec->aggregate_count;
              ++aggregate)
-            if (aggregates[aggregate].flags & CSD_SQL_AGG_DISTINCT)
+            if ((aggregates[aggregate].flags & CSD_SQL_AGG_DISTINCT) &&
+                spec->group_count == 0)
                 return false;
         return true;
     }
@@ -116,6 +117,19 @@
         const CsdSqlAggregateSpec *spec = NULL;
         if (!expression_as(node, sizeof(CsdSqlAggregateSpec), &spec))
             return false;
+        uint64_t group_bytes = 0;
+        if (!checked_mul(spec->group_count, sizeof(uint16_t), &group_bytes))
+            return false;
+        const CsdSqlAggregateColumn *aggregates =
+            reinterpret_cast<const CsdSqlAggregateColumn *>(
+                reinterpret_cast<const unsigned char *>(spec + 1) +
+                group_bytes);
+        /* A direct Scan has no retained input run if its DISTINCT set exceeds
+         * the estimate. Keep grouped DISTINCT on a replayable Flash path. */
+        for (uint16_t aggregate = 0; aggregate < spec->aggregate_count;
+             ++aggregate)
+            if (aggregates[aggregate].flags & CSD_SQL_AGG_DISTINCT)
+                return false;
         if (spec->group_count == 0) return true;
         uint64_t protected_estimate = 0;
         return node.arg0 != 0 &&
@@ -179,7 +193,8 @@
                 aggregate.operation < CSD_SQL_AGG_COUNT ||
                 aggregate.operation > CSD_SQL_AGG_AVG ||
                 aggregate.output_scale < -1 || aggregate.output_scale > 18 ||
-                (aggregate.flags & CSD_SQL_AGG_DISTINCT))
+                ((aggregate.flags & CSD_SQL_AGG_DISTINCT) &&
+                 spec->group_count == 0))
                 return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index, 0x511);
         }
         state->spec = spec;
@@ -279,6 +294,7 @@
                 group.minimum.assign(state->spec->aggregate_count, Value());
                 group.maximum.assign(state->spec->aggregate_count, Value());
                 group.has_value.assign(state->spec->aggregate_count, false);
+                group.distinct.resize(state->spec->aggregate_count);
                 state_index = state->groups.size();
                 state->group_map[key] = state_index;
                 state->groups.push_back(std::move(group));
@@ -295,6 +311,42 @@
                     CSD_SQL_NO_COLUMN ? NULL :
                     &(*row)[aggregate.input_column];
                 if (value != NULL && value->is_null) continue;
+                if (aggregate.flags & CSD_SQL_AGG_DISTINCT) {
+                    if (value == NULL)
+                        return fail(CSD_SQL_STATUS_BAD_EXPRESSION, index,
+                                    0x524);
+                    const std::string distinct_key = value_key(*value);
+                    if (group.distinct[aggregate_index].find(distinct_key) !=
+                        group.distinct[aggregate_index].end())
+                        continue;
+                    uint64_t distinct_bytes = 0;
+                    if (!checked_add(sizeof(uint64_t), distinct_key.size(),
+                                     &distinct_bytes))
+                        return fail(CSD_SQL_STATUS_SPILL_TOO_SMALL, index,
+                                    0x525);
+                    if (distinct_bytes > operator_memory_capacity_ -
+                                         state->held_bytes) {
+                        if (allow_capacity_fallback) {
+                            if (capacity_exceeded != NULL)
+                                *capacity_exceeded = true;
+                            if (required_bytes != NULL) {
+                                uint64_t total = 0;
+                                *required_bytes = checked_add(
+                                    state->held_bytes, distinct_bytes,
+                                    &total) ? total :
+                                    std::numeric_limits<uint64_t>::max();
+                            }
+                            return false;
+                        }
+                        return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
+                                    0x526);
+                    }
+                    if (!wait_acquire_operator_memory(distinct_bytes))
+                        return fail(CSD_SQL_STATUS_UNSUPPORTED, index,
+                                    0x526);
+                    state->held_bytes += distinct_bytes;
+                    group.distinct[aggregate_index].insert(distinct_key);
+                }
                 if (aggregate.operation == CSD_SQL_AGG_COUNT) {
                     ++group.count[aggregate_index];
                     group.has_value[aggregate_index] = true;

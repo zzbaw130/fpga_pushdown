@@ -20,6 +20,9 @@ services:
       # here so launch configuration changes do not require a full CEMU rebuild.
       - ./code/CEMU/femu-scripts/run-csd.sh:/workspace/code/CEMU/build/run-csd.sh:ro
       - ./code/CEMU/femu-scripts/cemu-mount.sh:/workspace/code/CEMU/femu-scripts/cemu-mount.sh:ro
+      # Keep the advertised NVM/FDM capacities reproducible without baking a
+      # stale copy of the JSON into an otherwise unchanged runtime image.
+      - ./code/CEMU/hw/femu/config_example.json:/workspace/code/CEMU/build/cemu_config.json:ro
       # PostgreSQL is compiled once inside the persistent CEMU guest from this
       # source tree, then installed in its qcow2 overlay.
       - ./code/postgres:/workspace/code/postgres
