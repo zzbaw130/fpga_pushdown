@@ -1,0 +1,7 @@
+database=tpch_s16 pgdata=/mnt/nvme0/pgdata/tpch_s16 socket=/tmp/csdpg_nvme_tpch_s16 port=57432
+shared_library=/workspace/code/CEMU/tests/cemu/build/csd_sql_sf16_bounded_v4.so mode=csd workers=32
+spill_mb=13312 execute_timeout_ms=3600000 cache_fill=off profile=on
+queries=6 program_runtime=0
+guest_raw_dir=/mnt/cemu/results/tpch_sf16_paired_q6_raw
+cache_policy=restart_postgres_and_drop_guest_page_cache_before_each_path
+timing=guest_psql_Time_excludes_TCG_VM_Freeze_functional_wall_time

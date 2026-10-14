@@ -813,9 +813,44 @@ private:
                 aggregate_project = next;
                 aggregate_index = sole_consumer[next];
             }
+            /* Consume aggregate groups through their sole stateless chain
+             * in bounded tiles. This avoids simultaneous full Aggregate and
+             * Project/HAVING Batches at high scale factors. */
+            std::vector<uint32_t> aggregate_downstream;
+            if (aggregate_index != CSD_SQL_INVALID_NODE)
+                aggregate_downstream = stateless_pipeline(aggregate_index,
+                    consumers, sole_consumer);
+            const CsdSqlAggregateSpec *aggregate_spec = NULL;
+            const CsdSqlScanSpec *scan_spec = NULL;
+            uint64_t scan_heap_bytes = 0;
+            const bool large_grouped_having =
+                aggregate_index != CSD_SQL_INVALID_NODE &&
+                !aggregate_downstream.empty() &&
+                nodes_[aggregate_downstream.front()].opcode ==
+                    CSD_SQL_OP_FILTER &&
+                expression_as(nodes_[aggregate_index],
+                    sizeof(CsdSqlAggregateSpec), &aggregate_spec) &&
+                aggregate_spec->group_count != 0 &&
+                expression_as(node, sizeof(CsdSqlScanSpec), &scan_spec) &&
+                checked_mul(scan_spec->page_count, CSD_SQL_PAGE_BYTES,
+                    &scan_heap_bytes) &&
+                scan_heap_bytes > operator_memory_capacity_;
+            /* An ANALYZE group estimate can miss a near-unique GROUP BY by
+             * orders of magnitude. A large Scan feeding HAVING therefore
+             * starts with Flash partitions, rather than filling one giant
+             * STL hash table before discovering the underestimation. */
             const bool stream_aggregate =
                 aggregate_index != CSD_SQL_INVALID_NODE &&
+                !large_grouped_having &&
                 can_stream_aggregate(nodes_[aggregate_index]);
+            const bool partition_aggregate =
+                aggregate_index != CSD_SQL_INVALID_NODE &&
+                !stream_aggregate &&
+                can_replay_stream_aggregate(nodes_[aggregate_index]) &&
+                (nodes_[aggregate_index].flags & CSD_SQL_NODE_SPILLABLE);
+            if (large_grouped_having && !partition_aggregate)
+                return fail(CSD_SQL_STATUS_UNSUPPORTED, aggregate_index,
+                            0x525);
             const uint32_t join_index = streaming_join_target(index, pipeline,
                 consumers, sole_consumer);
             const uint32_t build_join_index = streaming_join_build_target(
@@ -876,7 +911,16 @@ private:
                 succeeded = execute_scan_to_aggregate(index, node, pipeline,
                     aggregate_index, nodes_[aggregate_index],
                     aggregate_project == CSD_SQL_INVALID_NODE ? NULL :
-                        &nodes_[aggregate_project], output);
+                        &nodes_[aggregate_project], output,
+                    aggregate_downstream.empty() ? NULL :
+                        &aggregate_downstream);
+            else if (partition_aggregate)
+                succeeded = execute_scan_to_partitioned_aggregate(index, node,
+                    pipeline, aggregate_index, nodes_[aggregate_index],
+                    aggregate_project == CSD_SQL_INVALID_NODE ? NULL :
+                        &nodes_[aggregate_project], output,
+                    aggregate_downstream.empty() ? NULL :
+                        &aggregate_downstream);
             else if (stream_join)
                 succeeded = execute_scan_to_join(index, node, pipeline,
                     join_index, nodes_[join_index],
@@ -896,10 +940,14 @@ private:
                      stage != pipeline.end(); ++stage)
                     precomputed[*stage] = 1;
                 if (stream_sort) precomputed[next] = 1;
-                if (stream_aggregate) {
+                if (stream_aggregate || partition_aggregate) {
                     if (aggregate_project != CSD_SQL_INVALID_NODE)
                         precomputed[aggregate_project] = 1;
                     precomputed[aggregate_index] = 1;
+                    for (std::vector<uint32_t>::const_iterator stage =
+                             aggregate_downstream.begin();
+                         stage != aggregate_downstream.end(); ++stage)
+                        precomputed[*stage] = 1;
                 }
                 if (stream_join) {
                     precomputed[join_index] = 1;
@@ -1076,8 +1124,6 @@ private:
              join.opcode != CSD_SQL_OP_MERGE_JOIN) ||
             join.right_input != tail ||
             join.left_input == CSD_SQL_INVALID_NODE ||
-            !has_streaming_scan_source(join.left_input, consumers,
-                                       sole_consumer) ||
             !(join.flags & CSD_SQL_NODE_SPILLABLE) ||
             (require_oversized_estimate &&
              join.arg0 <= operator_memory_capacity_))

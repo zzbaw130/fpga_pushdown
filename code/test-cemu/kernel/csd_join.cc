@@ -1330,7 +1330,7 @@
     }
 
     bool consume_streaming_partitioned_join_batch(
-        uint32_t index, const CsdSqlPlanNode &node, Batch &left,
+        uint32_t index, const CsdSqlPlanNode &node, const Batch &left,
         const Batch &right, Batch *output,
         StreamingPartitionedJoinState *state)
     {
@@ -1341,7 +1341,7 @@
     }
 
     bool consume_streaming_partitioned_join_rows(
-        uint32_t index, Batch &left, StreamingPartitionedJoinState *state)
+        uint32_t index, const Batch &left, StreamingPartitionedJoinState *state)
     {
         const uint64_t wave_limit = std::max<uint64_t>(
             1, spill_storage_capacity() / 4);
@@ -1461,7 +1461,7 @@
     }
 
     bool consume_streaming_partitioned_join_build_batch(
-        uint32_t index, const CsdSqlPlanNode &node, Batch &left,
+        uint32_t index, const CsdSqlPlanNode &node, const Batch &left,
         StreamedJoinBuildState *build, Batch *output,
         StreamingPartitionedJoinState *state)
     {
@@ -2107,6 +2107,21 @@
     bool execute_join(uint32_t index, const CsdSqlPlanNode &node, const Batch &left,
                       const Batch &right, Batch *output, bool nested_loop)
     {
+        /* The build Scan may already have been written to bounded Flash
+         * partitions even when the probe side is an Aggregate or another
+         * non-Scan subtree. Such a probe is materialized only at its own
+         * output boundary; feed it to the same partitioned replay engine. */
+        if (!nested_loop && index < streamed_join_builds_.size() &&
+            streamed_join_builds_[index].complete &&
+            !streamed_join_builds_[index].consumed) {
+            StreamedJoinBuildState &build = streamed_join_builds_[index];
+            StreamingPartitionedJoinState state;
+            if (!consume_streaming_partitioned_join_build_batch(index, node,
+                    left, &build, output, &state))
+                return false;
+            return finish_streaming_partitioned_join(index, node, &state,
+                output);
+        }
         const CsdSqlJoinSpec *spec = NULL;
         uint64_t key_bytes = 0;
         if (!expression_as(node, sizeof(CsdSqlJoinSpec), &spec) ||

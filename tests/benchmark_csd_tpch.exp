@@ -28,19 +28,38 @@ set database_user [env_or CSD_DATABASE_USER dengyao]
 set query_dir [env_or CSD_QUERY_DIR /mnt/cemu/scripts/gen_data/queries]
 set shared_library [env_or CSD_SHARED_LIBRARY /workspace/code/CEMU/tests/cemu/build/csd_sql.so]
 set workers [env_or CSD_PARALLEL_WORKERS 32]
+set spill_mb [env_or CSD_BENCH_SPILL_MB 4096]
+set execute_timeout_ms [env_or CSD_BENCH_EXECUTE_TIMEOUT_MS 600000]
+set cache_fill [env_or CSD_BENCH_CACHE_FILL off]
+set profile [env_or CSD_BENCH_PROFILE off]
 set device_mode [env_or CSD_BENCH_MODE csd]
 set queries [env_or CSD_BENCH_QUERIES {1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22}]
 set output_path [env_or CSD_BENCH_OUTPUT /tmp/csd_tpch_cold.csv]
 set log_path "${output_path}.log"
+set raw_dir [env_or CSD_BENCH_GUEST_RAW_DIR /tmp/csd-benchmark-raw]
 
 if {$device_mode ne "csd" && $device_mode ne "auto"} {
     puts stderr "CSD_BENCH_MODE must be csd or auto"
+    exit 2
+}
+if {![regexp {^/[A-Za-z0-9_./-]+$} $raw_dir]} {
+    puts stderr "CSD_BENCH_GUEST_RAW_DIR must be a simple absolute path"
     exit 2
 }
 
 set output [open $output_path "w"]
 puts $output "query,mode,rc,wall_ms,guest_ms,match"
 flush $output
+set metadata [open "${output_path}.settings" "w"]
+puts $metadata "database=$database pgdata=$pgdata socket=$socket_dir port=$port"
+puts $metadata "shared_library=$shared_library mode=$device_mode workers=$workers"
+puts $metadata "spill_mb=$spill_mb execute_timeout_ms=$execute_timeout_ms cache_fill=$cache_fill profile=$profile"
+puts $metadata "queries=$queries program_runtime=0"
+puts $metadata "guest_raw_dir=$raw_dir"
+puts $metadata "cache_policy=restart_postgres_and_drop_guest_page_cache_before_each_path"
+puts $metadata "timing=guest_psql_Time_excludes_TCG_VM_Freeze_functional_wall_time"
+puts $metadata "interpretation=HOST_path_runs_under_TCG_CPU_emulation_not_native_HOST_baseline"
+close $metadata
 log_file -noappend $log_path
 
 spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/csd-known-hosts \
@@ -53,6 +72,14 @@ expect {
     "*# " {}
     timeout { exit 124 }
 }
+send "mkdir -p $raw_dir; echo __RAW__:\$?\r"
+expect {
+    -re {__RAW__:([0-9]+)} {
+        if {$expect_out(1,string) != 0} { exit 1 }
+    }
+    timeout { exit 124 }
+}
+expect "*# "
 
 proc restart_postgres {pg_os_user pg_ctl pgdata} {
     send "runuser -u $pg_os_user -- $pg_ctl -D $pgdata restart -m fast > /tmp/csd-bench-restart.log 2>&1; echo __RESTART__:\$?\r"
@@ -76,9 +103,9 @@ foreach query $queries {
     }
 
     restart_postgres $pg_os_user $pg_ctl $pgdata
-    set csd_setup "SET default_transaction_read_only=off; LOAD 'csd_pg'; SET csd.shared_library='$shared_library'; SET csd.exe_path='$device_mode'; SET csd.parallel_workers=$workers; SET csd.profile=off; SET csd.program_runtime=0;"
+    set csd_setup "SET default_transaction_read_only=off; LOAD 'csd_pg'; SET csd.shared_library='$shared_library'; SET csd.exe_path='$device_mode'; SET csd.parallel_workers=$workers; SET csd.profile=$profile; SET csd.program_runtime=0; SET csd.spill_mb=$spill_mb; SET csd.execute_timeout_ms=$execute_timeout_ms; SET csd.cache_fill=$cache_fill;"
     set csd_started [clock milliseconds]
-    send "sync; echo 3 > /proc/sys/vm/drop_caches; $psql -X -q -v ON_ERROR_STOP=1 -h $socket_dir -p $port -U $database_user -d $database -c \"$csd_setup\" -f $query_dir/$query.sql > /tmp/csd-bench-q$query-csd.raw 2>&1; echo __CSD__:\$?\r"
+    send "sync; echo 3 > /proc/sys/vm/drop_caches; $psql -X -q -v ON_ERROR_STOP=1 -h $socket_dir -p $port -U $database_user -d $database -c \"$csd_setup\" -f $query_dir/$query.sql > $raw_dir/q$query-csd.raw 2>&1; echo __CSD__:\$?\r"
     expect {
         -re {__CSD__:([0-9]+)} {
             set csd_rc $expect_out(1,string)
@@ -96,7 +123,7 @@ foreach query $queries {
     restart_postgres $pg_os_user $pg_ctl $pgdata
     set host_setup "SET default_transaction_read_only=off; LOAD 'csd_pg'; SET csd.exe_path='host';"
     set host_started [clock milliseconds]
-    send "sync; echo 3 > /proc/sys/vm/drop_caches; $psql -X -q -v ON_ERROR_STOP=1 -h $socket_dir -p $port -U $database_user -d $database -c \"$host_setup\" -f $query_dir/$query.sql > /tmp/csd-bench-q$query-host.raw 2>&1; echo __HOST__:\$?\r"
+    send "sync; echo 3 > /proc/sys/vm/drop_caches; $psql -X -q -v ON_ERROR_STOP=1 -h $socket_dir -p $port -U $database_user -d $database -c \"$host_setup\" -f $query_dir/$query.sql > $raw_dir/q$query-host.raw 2>&1; echo __HOST__:\$?\r"
     expect {
         -re {__HOST__:([0-9]+)} {
             set host_rc $expect_out(1,string)
@@ -111,7 +138,7 @@ foreach query $queries {
         expect "*# "
     }
 
-    send "awk '/^Time:/ {sum += \$2} END {printf \"__CSD_GUEST__:%.3f\\n\", sum}' /tmp/csd-bench-q$query-csd.raw; awk '/^Time:/ {sum += \$2} END {printf \"__HOST_GUEST__:%.3f\\n\", sum}' /tmp/csd-bench-q$query-host.raw\r"
+    send "awk '/^Time:/ {sum += \$2} END {printf \"__CSD_GUEST__:%.3f\\n\", sum}' $raw_dir/q$query-csd.raw; awk '/^Time:/ {sum += \$2} END {printf \"__HOST_GUEST__:%.3f\\n\", sum}' $raw_dir/q$query-host.raw\r"
     expect {
         -re {__CSD_GUEST__:([0-9.]+)} { set csd_guest_ms $expect_out(1,string) }
         timeout { exit 124 }
@@ -122,7 +149,7 @@ foreach query $queries {
     }
     expect "*# "
 
-    send "sed -e '/^SET\$/d' -e '/^Timing is on\.\$/d' -e '/^Time:/d' -e '/^CREATE VIEW\$/d' -e '/^DROP VIEW\$/d' -e '/^\$/d' /tmp/csd-bench-q$query-csd.raw > /tmp/csd-bench-q$query-csd.norm; sed -e '/^SET\$/d' -e '/^Timing is on\.\$/d' -e '/^Time:/d' -e '/^CREATE VIEW\$/d' -e '/^DROP VIEW\$/d' -e '/^\$/d' /tmp/csd-bench-q$query-host.raw > /tmp/csd-bench-q$query-host.norm; cmp -s /tmp/csd-bench-q$query-csd.norm /tmp/csd-bench-q$query-host.norm; echo __MATCH__:\$?\r"
+    send "sed -e '/^SET\$/d' -e '/^Timing is on\.\$/d' -e '/^Time:/d' -e '/NOTICE:.*CSD profile/d' -e '/^CREATE VIEW\$/d' -e '/^DROP VIEW\$/d' -e '/^\$/d' $raw_dir/q$query-csd.raw > $raw_dir/q$query-csd.norm; sed -e '/^SET\$/d' -e '/^Timing is on\.\$/d' -e '/^Time:/d' -e '/^CREATE VIEW\$/d' -e '/^DROP VIEW\$/d' -e '/^\$/d' $raw_dir/q$query-host.raw > $raw_dir/q$query-host.norm; cmp -s $raw_dir/q$query-csd.norm $raw_dir/q$query-host.norm; echo __MATCH__:\$?\r"
     expect {
         -re {__MATCH__:([0-9]+)} { set match $expect_out(1,string) }
         timeout { exit 124 }

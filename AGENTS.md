@@ -278,15 +278,18 @@ cp build/csd_sql.so build/csd_sql_<new_version>.so
   已处理比例估计 fan-out。
 - Aggregate 流式快路径：直接 `Scan -> [Filter/Project] -> Aggregate` 的无 DISTINCT
   global state 固定，始终逐 FIFO batch 更新；grouped state 仅当 PostgreSQL 通过
-  `arg0` 下发的保守输出容量再乘 8 仍可放入 arena 时启用。零/溢出/超限估计继续走
-  完整输入与 radix replay，runtime arena accounting 是最终保护。
+  `arg0` 下发的保守输出容量再乘 8 仍可放入 arena 时启用。超限的 spillable grouped
+  Scan 不再累计完整输入，而是逐 FIFO batch 写 Flash radix chain，再逐 partition replay。
+  大型 Scan 后接 HAVING 时还利用 heap 页容量防止严重低估的 group 数进入直接驻留路径；
+  sole Filter/Project 后继以 4,096 行 tile 消费聚合结果。其他输入形状及 DISTINCT
+  仍可能走兼容物化路径，runtime arena accounting 是最终保护。
 - 单行/单 group/极端 skew 无法落入 arena 时显式拒绝。并行 branch 暂占 arena 时，
   replay 等待 lease，而不是误报 OOM。
 
 必须诚实保留的当前边界：直接 Scan-to-Sort、符合准入条件的 Scan-to-Aggregate，以及
-Join 左/probe 链已消除对应完整 Scan `Batch`；符合两侧 Scan 准入的超大 Join build 也
-直接逐 batch 分区。不能从完整 Flash run 重放的超大/不确定 Aggregate、直接 Scan
-输入的 DISTINCT Aggregate 以及最终阻塞输出仍会累计。cursor chunk、hash state 仍是普通
+Join 左/probe 链已消除对应完整 Scan `Batch`；符合准入的超大 Join build 即使 probe
+侧是非 Scan 子树，也直接逐 batch 分区。其他输入形状的超大/不确定 Aggregate、直接
+Scan 输入的 DISTINCT Aggregate 以及最终阻塞输出仍可能累计。cursor chunk、hash state 仍是普通
 STL container，而非真实 FDM
 arena allocator；streamed Join 的句柄 payload 已由 Flash 链约束为 O(partition count)，
 但 descriptor vector 仍有 STL allocator 开销。partitioned Join 的 ordinal reorder
@@ -298,8 +301,11 @@ sole-consumer non-DISTINCT Aggregate 形状的 final run 已按 chunk 直连，r
 虽然 scan window、FIFO、run generation、cursor merge、部分 Aggregate/Join state、spill
 I/O 和 blocking lease 已有界，但在实现 final-result consumer、其他 Aggregate 输入形状
 的 streaming partition writer 与 arena-backed container 前，不能声称 SF=16 端到端
-物理内存已严格有界。SF=16 profile 中 Q17/Q18 的普通 STL `Batch` 保守峰值仍分别为
-22,194,284,144 B 和 15,550,897,984 B。global Aggregate 的大型
+物理内存已严格有界。旧版 SF=16 Q17/Q18/Q20 的普通 STL `Batch` 保守峰值分别为
+22,194,284,144 / 15,550,897,984 / 7,852,313,760 B；新路径在三条定向 exact
+测试以及新版 22-query 整套 exact 回归中均分别降为 714,716,656 /
+571,052,512 / 2,844,175,384 B。整套最大保守 `Batch` 峰值转为 Q22 的
+3,230,706,240 B；但这些统计不等于严格的物理内存上界。global Aggregate 的大型
 DISTINCT 仍保留 compatibility/protection-copy 路径。
 
 ## 9. 时延模型和已测性能
@@ -456,6 +462,37 @@ CSD Q1--Q22 全部与 HOST byte-for-byte exact，forced planner 22/22、pending 
 failure；最大 spill high-water 是 Q21 的 9,137,763,384 B，Q9 probe-wave replay 为
 7,830,014,467 B。该实验只证明超过 4 GiB FDM 的数据与中间结果可正确执行，不能用作
 HOST/CSD speedup 数据，也不能掩盖上一节记录的 Q17/Q18 STL 物化峰值。
+
+2026-10-14 bounded SF=16 复测使用版本化 kernel
+`csd_sql_sf16_bounded_v4.so`（SHA-256
+`888aa13914807f48d59d62d4f74cc1e9b85207314668542d92724571b33e1e24`）及
+同一 48 GiB NVM、4 GiB FDM、13,312 MiB spill 配置。原始结果位于
+`results/tpch_sf16_bounded_full_v4_final/`：forced-CSD Q1--Q22 全部 byte-exact，
+全部 profile 的 `spill_failed_required_bytes=0`。最大保守 `Batch` 峰值为 Q22 的
+3,230,706,240 B；最大“非 operator FDM 预留 + operator peak + Batch peak”的
+逐计划分离峰值和为 3,705,643,948 B；最大 spill high-water 仍是 Q21 的
+9,137,763,384 B。新 CSD guest modeled-path 总时间 863,532.928 ms，旧版
+850,480.919 ms；增加的 Flash partition/replay 使总模型时间上升约 1.53%，换来
+Q17/Q18/Q20 的大幅物化下降。该峰值和遗漏其他普通 STL 分配及瞬时副本，绝不
+证明 4 GiB 物理内存硬上界。性能对照必须使用冷缓存原生 HOST 基线并标注为
+跨 native HOST 与参数化 CEMU device model 的预测比值；同 guest TCG HOST 时间
+不能当作真实主机基线。
+
+对应的 SF=16 冷缓存对照和方法见
+`results/tpch_sf16_bounded_cold_validation.md`、
+`results/tpch_sf16_bounded_vs_native_cold.csv`。原生 HOST 独立轮按每条查询 restart
+PostgreSQL、定向逐出本 cluster `base/` 页缓存，逐出后最高驻留比例为 0.000778%，
+`autovacuum=off`，Q1--Q22 也全部与 golden exact。HOST 总计 1,039,543.923 ms，
+CSD modeled-path 总计 863,532.928 ms，跨平台预测总耗时比值 1.2038x、逐查询
+geomean 1.1372x，仅 12/22 单查询 CSD 较快；离线逐条取最小值的上限 1.5513x
+不是 `AUTO` 的实测结果。原始 HOST 记录在
+`results/tpch_sf16_native_host_cold_isolated_v2/`，之前并行探索轮在
+`results/tpch_sf16_native_host_cold_v1/`。所有本阶段原始目录与 paired guest Q6
+诊断归档为 `results/tpch_sf16_bounded_cold_raw.tar.gz`，SHA-256 为
+`dbf484d1055fc6b77b951ef6c642b8c077fb1ccbf97fea408695b9ddb50c69cb`；
+解压到 `results/` 即还原上述路径。CSD 完整轮曾与探索性 HOST 轮部分并行，
+但 Q17/Q18/Q20 单独 CSD 测量与完整轮 guest 时间相差均小于 1%；论文应继续标注
+TCG guest 控制开销、参数化 Flash/FPGA 时延以及物理内存上界未证明这三项限制。
 
 ## 10. 回归命令与通过标准
 
