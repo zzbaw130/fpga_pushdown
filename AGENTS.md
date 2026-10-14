@@ -75,6 +75,7 @@ PostgreSQL 12 的 SQL 计划，只向主机返回结果，并完整支持 TPC-H 
 | `d3a586cd8` | SQL LIMIT/OFFSET 下推 external Sort Top-N、spill I/O 降低 99.27% 与 22/22 回归 |
 | `f549976cc` | staging-bounded adaptive 3--128-way external Sort、229-run spill I/O 降低 67.84% 与 22/22 回归 |
 | `04f44df08` | 复用式 Flash extent、Join chain/wave replay、SF=16 forced-CSD 22/22 exact |
+| `aae326fee` | SF=16 Aggregate/Join 有界路径、22/22 exact、原生 cold-HOST 双时钟对照与原始证据归档 |
 
 ## 3. 环境不变量
 
