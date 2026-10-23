@@ -1,0 +1,75 @@
+{
+  "status": "analytical scenario, not measured; no physical CPU timing prediction",
+  "timing_source": "results/tpch_sf1_auto_global_search.csv",
+  "cache_source": "results/tpch_sf1_aer_cache_validation.csv",
+  "reference_host_total_s": 825.1144029999998,
+  "reference_auto_total_s": 183.019742,
+  "cache_latency_reduction_lambda": 0.5199960091041644,
+  "assumed_host_avoidable_fraction_alpha": 0.55,
+  "assumed_returned_fractions_sigma_by_query": [
+    0.98,
+    0.15,
+    0.25,
+    0.25,
+    0.35,
+    0.02,
+    0.35,
+    0.45,
+    0.6,
+    0.3,
+    0.5,
+    0.3,
+    0.75,
+    0.5,
+    0.65,
+    0.6,
+    0.45,
+    0.8,
+    0.15,
+    0.45,
+    0.7,
+    0.3
+  ],
+  "assumed_request_seconds": 0.02,
+  "assumed_refill_contention_delta": 0.03,
+  "assumed_forced_device_host_selected_multiplier": 1.2,
+  "assumed_forced_device_mixed_selected_multiplier": 1.25,
+  "assumed_mixed_host_cost_fraction": 0.3,
+  "traffic": {
+    "normalized_base_input": 1,
+    "assumed_result_fraction": 0.001,
+    "assumed_filter_return_fraction": 0.25,
+    "assumed_filter_cached_page_fraction": 0.2
+  },
+  "sort": {
+    "assumed_input_MiB": 256,
+    "assumed_AFDM_MiB": 16,
+    "work_budgets_MiB": [
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "assumed_internal_bandwidth_MiB_s": 1000,
+    "model": "one write/read pass for input beyond work budget; no extra merge passes"
+  },
+  "sequence": {
+    "kinds": [
+      "reduce",
+      "probe",
+      "probe",
+      "reduce",
+      "probe",
+      "probe"
+    ],
+    "probe_H_cold_s": 22.537964,
+    "probe_H_warm_s": 10.818312666666667,
+    "assumed_probe_device_fraction_of_cold_host": 0.65,
+    "assumed_probe_filter_fraction_of_host": 0.8,
+    "assumed_filter_warming_fraction": 0.2,
+    "assumption": "full relevant working set resident by next request; adequate asynchronous window"
+  },
+  "selection": "optimistic candidate minimum; not measured planner output"
+}

@@ -7,6 +7,10 @@
 \usepackage{pvldb}
 %%% VLDB block end %%%
 \usepackage{amsmath}
+\usepackage{listings}
+\lstdefinestyle{demo}{basicstyle=\ttfamily\scriptsize,breaklines=true,
+ columns=fullflexible,keepspaces=true,showstringspaces=false,
+ frame=single,aboveskip=5pt,belowskip=5pt}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning,fit,calc}
 \renewcommand\vldbdoi{XX.XX/XXX.XX}
@@ -15,7 +19,6 @@
 \newcommand{\sys}{\textsc{CoSQL}}
 \newcommand{\host}{\mathsf{H}}
 \newcommand{\csd}{\mathsf{D}}
-\newcommand{\pending}{\textemdash}
 \begin{document}
 \title{CoSQL: Composable SQL Offloading with Cache Refill on Computational Storage}
 % Working system name; replace authors and publication metadata before submission.
@@ -39,8 +42,8 @@ through ordinary reads. A bottom-up dynamic program chooses execution
 locations using operator cost, device memory, result transfer, and observed
 host cache residency. We organize evaluation around Host-only, Filter-only,
 CSD-only, CSD + Cache Refill, and the full system to separate operator coverage,
-cache reuse, and placement benefits. Preliminary SF=1 results provide reference
-points for the evaluation; the design emphasizes the interaction between
+cache reuse, and placement benefits. Archived SF=1 measurements anchor explicitly labeled analytical projections
+for the five-way evaluation; the design emphasizes the interaction between
 composable offloading and host cache reuse across queries.
 \end{abstract}
 \maketitle
@@ -126,7 +129,7 @@ separates application requests from the FEMU backend and supports memory,
 function management, storage I/O, computation, and dependency-aware batches.
 \item \textbf{Composable SQL execution on device CPUs.} A relational operator
 library supports the TPC-H operator families, vectorized processing,
-application-controlled pipelines, and shared-budget spill/replay.
+application-controlled pipelines, and reentrant spill/replay that preserves device execution under memory pressure.
 \item \textbf{Asynchronous host cache refill.} AER notifications and a range
 log connect device scans to ordinary host inode reads, enabling cache reuse
 without returning base data through the query result path.
@@ -138,60 +141,148 @@ cache costs, closing the loop between offload and subsequent host execution.
 Our evaluation separates these contributions through five configurations:
 Host-only, Filter-only, CSD-only, CSD + Cache Refill, and the full system.
 Single-query tests measure reduction and offload overhead; multi-query tests
-measure cache reuse and placement changes. Preliminary SF=1 data motivate the
-expected benefits and identify the remaining measurements needed for the
-complete comparison.
+measure cache reuse and placement changes. Archived SF=1 data anchor transparent theoretical comparisons, including
+cases where refill adds overhead; subsequent measurements can replace these
+projections directly.
 
 \section{Background and Motivation}
-\subsection{From Predicate Pushdown to Query Fragments}
-Predicate pushdown removes rejected rows before they reach the host. Its
-benefit depends on selectivity and on the amount of work left after the scan.
-For a query joining two moderately selective inputs and producing a small
-aggregate, filter-only execution still transfers both surviving inputs to
-the host. Executing the join and aggregate inside storage can return only
-the grouped result. Conversely, an unselective query with a large final
-output may gain little from full offload. The system therefore needs both
-richer device operators and a cost-based choice of their location.
+\label{sec:motivation}
+\subsection{Why Computation Belongs Near Storage}
+Faster flash does not eliminate the cost of moving and interpreting data.
+A conventional analytical scan carries stored bytes through the device
+interface, host memory, page and tuple decoding, and finally the relational
+operators that discard or summarize them. Increasing the number of SSDs
+increases aggregate internal bandwidth, but the host-facing interconnect and
+CPU must still receive and process their combined output. Moving a filter,
+join, or reduction into storage attacks this imbalance at its source: the
+device can consume raw data locally and export only useful output.
 
-Supporting these operators changes memory demand. Filtering is mostly a
-streaming transformation; a join retains build state, an aggregate retains
-groups, and a sort generates ordered runs. The design must handle each
-state transition under a shared budget rather than assume that the entire
-intermediate relation fits in device memory.
+This distinction separates computational storage from an accelerator that
+first receives its entire input through host memory. In the latter case,
+faster computation can leave the input movement intact. CSD execution instead
+changes the amount of data that must cross the interface. For a fragment
+that reads $B_{\mathrm{in}}$ bytes and returns $B_{\mathrm{out}}$ bytes, its
+potential host-transfer reduction is
+\begin{equation}
+ \rho=1-B_{\mathrm{out}}/B_{\mathrm{in}}.
+\end{equation}
+Here $\rho$ is the fraction of input traffic avoided, $B_{\mathrm{in}}$ is
+the fragment's base input size in bytes, and $B_{\mathrm{out}}$ is its
+serialized result size in bytes. This is a traffic opportunity rather than
+a speedup prediction: device CPU time, internal I/O, and temporary state
+still determine whether the placement is worthwhile.
 
-\subsection{Programming a CPU-Based CSD}
-Our CSD model consists of an NVM namespace, device-accessible memory, and CPU
-compute units. A CSF is a native function loaded on the device and invoked
-with memory handles and scalar arguments. The device CPU executes ordinary
-vectorized software. Concurrency comes from independent requests assigned
-to available CUs; SIMD accelerates suitable operations within a kernel.
-FEMU supplies the NVMe device backend \cite{femu}.
+YourSQL demonstrates early filtering inside a programmable SSD, returning
+match hints so its MariaDB-based host can bulk-fetch relevant pages. It also
+changes target-table selection and join order to exploit that reduction
+\cite{yoursql}. POLARDB's deployed design pushes scans through the database,
+PolarFS, and storage driver to computational drives, reducing movement and
+avoiding a centralized scan-processing hotspot \cite{polardb}. These systems
+make CSDs important as a data-path optimization, not simply additional CPU
+resources. They also motivate measuring both bytes avoided and complete
+query time in our evaluation.
 
-The SNIA API exposes resources and requests to the application \cite{snia}.
-The application describes which function should run, which buffers it should
-use, and which requests must complete first. The shared library implements
-that scheduling contract and invokes the backend adapter. Neither the SNIA
-API nor FEMU needs to understand SQL operators, a PostgreSQL Plan, or a
-relational DAG. Such metadata belongs to the database application.
+\subsection{Interface Diversity Becomes Integration Cost}
+The application-facing abstractions in these systems differ substantially.
+YourSQL uses ISC tasks and a filter/hint interface. Ibex extends a MySQL
+storage-engine interface and configures its FPGA processing pipeline through
+a register interface \cite{ibex}. POLARDB translates filesystem ranges and
+scan conditions through its specialized storage stack. AQUOMAN accepts Table
+Tasks describing static relational dataflow \cite{aquoman}. Their common
+purpose does not make these interfaces interchangeable: a database must
+adapt function invocation, buffer ownership, dependencies, and completion
+to each execution environment.
 
-\subsection{Cache Reuse after Offload}
-Consider two queries over the same relation. The first is selective and
-benefits from device execution; the second performs a host-side computation
-on much of the relation. A result-only offload leaves the second query with
-a cold host cache. With refill, the first query's scan also identifies useful
-base ranges for host reads. The second query can then exploit resident pages,
-and its best execution location may change.
+The problem is larger than renaming a submit function. A query fragment
+needs internal data loads, typed compute inputs, persistent blocking state,
+and result ownership across multiple invocations. If each operator embeds
+its own device protocol, adding an operator or changing the backend spreads
+transport changes throughout the executor. Our first requirement is therefore
+a uniform application contract for storage, computation, memory, and request
+dependencies. We use SNIA for that contract, leaving SQL descriptors and
+operator composition with the application. The device plugin implements
+transport; it does not become another database optimizer.
 
-This opportunity introduces a tradeoff. Refill spends bandwidth and cache
-capacity that offloading initially saved. It is attractive when reads can
-overlap compute and when future queries reuse the data. We therefore measure
-both the benefit of a warm cache and the end-to-end cost of producing it.
+\subsection{Device Memory Limits the Depth of Offload}
+Streaming scans need a bounded input window, but blocking operators retain
+state proportional to groups, join build input, or sorted runs. A workload
+can therefore scan a large table successfully yet exceed device memory in
+a later operator. Avoiding this situation by offloading only filters leaves
+the largest intermediate reductions on the host.
+
+Two concrete precedents illustrate the resulting host assistance. Ibex
+bypasses hash-colliding aggregate tuples to host software instead of resolving
+them in its hardware table. AQUOMAN supports broad operators and streaming
+execution, but its capacity limits still matter: excess aggregate buckets
+are accumulated on the host, and when join DRAM fills it exports sorted
+blocks for host merging. Thus the issue is not simply missing operators;
+capacity pressure can break an otherwise useful device fragment.
+
+Host continuation preserves progress but returns intermediates across the
+interface and reconnects them to a second execution engine. We instead ask:
+\emph{can an operator suspend for storage I/O and then continue on the same
+CSD CPU?} A reentrant operator exports a small NEED\_STORE completion value,
+retains its cursor and algorithm state, and lets the FEMU plugin allocate
+spill space and issue an internal STORE. The plugin supplies the resulting
+token on reentry; the operator resumes without restarting its input or
+moving the intermediate relation to the host. LOAD and FREE use the same
+pattern. Section~\ref{sec:reentrant} demonstrates this protocol with Sort.
+The contribution is this API/backend/operator continuation contract, rather
+than the external-sort algorithm itself.
+
+\subsection{Offload Can Lose the Opportunity to Warm Host Cache}
+A normal host read does two things: it supplies the current operator and
+leaves base pages available for future queries. A complete device fragment
+can return a tiny aggregate without bringing its scanned heap pages into
+host memory. This is a lost warming opportunity, even if no existing cache
+page is invalidated. A following host query may have to reread data the CSD
+has just consumed.
+
+Earlier work handles related but different parts of this problem. YourSQL's
+bulk prefetch brings matching pages needed by its host execution path.
+AQUOMAN's evaluation explicitly assumes cold page cache after discussing its
+limited reuse for the evaluated large dataset. Neither observation supplies
+the mechanism we need after \emph{result-only} execution: independently
+refill scanned base ranges into the proper host heap inode while returning
+only final query results. FlexPushdownDB establishes that caching and
+pushdown must be considered together \cite{fpdb}; our focus is how a local
+CSD actively produces that cache state.
+
+This leads to the final two requirements. First, scanned ranges must become
+asynchronous cache hints, with ordinary host reads performing the actual
+refill. Second, later plans must use measured residency rather than a fixed
+assumption that CSD execution always wins. Refilling a cache that the planner
+never exploits would spend bandwidth without realizing the intended reuse.
+
+\begin{table*}[t]
+\caption{Representative design choices motivating CoSQL. Host assistance is
+described for the particular mechanism reported by each paper; scan-oriented
+systems are not assigned an unreported oversized-join policy.}
+\label{tab:priorchoices}
+\small
+\begin{tabular}{@{}p{.11\textwidth}p{.25\textwidth}p{.29\textwidth}p{.26\textwidth}@{}}
+\toprule
+System & Integration / execution abstraction & Operator scope and capacity response & Cache implication motivating this work \\
+\midrule
+YourSQL & ISC tasks, match hints, bulk host reads & Early filtering; host completes later work & Matching-page prefetch serves current host consumption \\
+Ibex & Storage-engine extension, register-configured pipeline & Selection/projection/grouping; collisions bypass to host & Result reduction differs from base-page refill \\
+POLARDB & Database--PolarFS--driver scan requests & Scan pushdown with storage-stack integration & Scan locality alone does not define a host refill protocol \\
+AQUOMAN & Static Table Tasks on streaming hardware & Multi-way joins; oversized buckets/blocks use host assistance & Cold-page-cache evaluation leaves reuse as a separate concern \\
+CoSQL & SNIA requests composed by the application & CPU operator chains with reentrant internal spill & Explicit inode refill feeds later node-level placement \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Table~\ref{tab:priorchoices} connects these requirements: an integrated design
+needs a reusable interface, a device-local response to capacity pressure,
+and a cache/placement feedback loop. These are complementary requirements;
+implementing any one in isolation leaves the other offload boundaries intact.
 
 \section{System Architecture}
 \label{sec:architecture}
 \begin{figure*}[t]
 \centering
-\resizebox{\textwidth}{!}{\input{figures/architecture.tex}}
+\resizebox{\textwidth}{!}{\input{figures/architecture_cpu.tex}}
 \caption{CPU-based architecture. PostgreSQL composes operator and I/O requests
 through the SNIA API; the library schedules application-specified batch
 dependencies. FEMU maps individual requests to storage or CPU compute units.
@@ -292,19 +383,145 @@ reused by later pipelines after their consumers complete. This places
 scheduling policy with the application while allowing the library to manage
 request dependencies uniformly.
 
-\subsection{Reentrant Spill Requests}
-A device function can suspend work when it needs internal storage I/O. Its
-completion value requests STORE, LOAD, or FREE and identifies the amount or
-token involved. The FEMU adapter carries out the storage operation and
-reenters the same function with the completion token. The function's private
-state records its continuation. A logical batch node completes only after
-the function returns a normal result, so successors do not observe an
-unfinished spill operation.
+\subsection{A Minimal Scan--Filter--Aggregate Example}
+\label{sec:apidemo}
+Consider a scalar reduction:
+\begin{lstlisting}[style=demo,language=SQL]
+SELECT SUM(l_quantity) FROM lineitem
+WHERE l_shipdate < DATE '1995-01-01';
+\end{lstlisting}
+Its device pipeline is LOAD $\rightarrow$ Scan $\rightarrow$ Filter
+$\rightarrow$ Aggregate. Listing~\ref{lst:snia} shows the essential application
+flow. Function loading and lookup through
+\texttt{csCSFDownload}/\texttt{csGetCSFId} are omitted. The four named buffers are AFDM:
+raw pages, decoded columns, a selection vector, and aggregate state.
 
-This division preserves application control of the operator graph without
-requiring the application to interpret each operator's intermediate rows.
-The API library schedules logical dependencies; the backend handles device
-I/O continuation; the CSF owns its algorithmic state.
+\begin{lstlisting}[style=demo,language=C,caption={Minimal application composition. Capitalized constructors build application request descriptors; the cs-prefixed calls are the SNIA API.},label={lst:snia}]
+csOpenCSx(device_path, NULL, &dev);
+// Resolve the preloaded CSF IDs (omitted).
+for (i = 0; i < 4; ++i)
+  csAllocMem(dev, bytes[i], &flags[i],
+             &mem[i], NULL);
+// raw, columns, selected, sum_state = mem[0..3]
+CsBatchRequest r[4] = {
+  Load(dev, first_extent, raw),
+  Compute(scan_id, raw, columns, scan_desc),
+  Compute(filter_id, columns, selected, pred),
+  Compute(agg_id, columns, selected, sum_state)
+};
+csAllocBatchRequest(CS_BATCH_SERIAL, 4, &batch);
+for (i = 0; i < 4; ++i)
+  csConfigureBatchEntry(batch, CS_BATCH_ADD,
+                        &r[i], 0, 0, &node[i]);
+for_each_chunk(extents, chunk) {
+  r[0] = Load(dev, chunk, raw);
+  csConfigureBatchEntry(batch, CS_BATCH_RECONFIG,
+                        &r[0], node[0], 0, NULL);
+  csQueueBatchRequest(batch, NULL, NULL,
+                      NULL, NULL, NULL);
+}
+CsCopyMemRequest out = CopyFrom(sum_state, &state);
+csQueueCopyMemRequest(&out, NULL, NULL,
+                      NULL, NULL, NULL);
+return FinalizeSum(state);
+\end{lstlisting}
+
+\texttt{Load} fills a storage request with NVM extents and an AFDM destination;
+\texttt{Compute} fills a CSF identifier and AFDM arguments using
+\texttt{csHelperSetComputeArg}; \texttt{CopyFrom} fills a copy request.
+They are application shorthand, not additional SNIA functions.
+\texttt{scan\_desc} and \texttt{pred} denote prepared descriptor AFDMs.
+The initialized aggregate state contains a sum and non-NULL count so that
+finalization also handles an empty input correctly. Error handling, function
+setup, and cleanup are omitted to expose the data path.
+
+SERIAL mode supplies the dependency order in this example. Each submission
+reuses the same buffer handles and aggregate state, changing only the input
+extent. LOAD transfers no raw pages through PostgreSQL, Filter emits a
+selection vector over device columns, and Aggregate accumulates across
+chunks. Only the final state is copied back. Replacing the SERIAL batch
+with independent HYBRID branches changes application scheduling without
+changing the device invocation interface.
+
+\subsection{Reentrant Spill Requests: Sort without Host Fallback}
+\label{sec:reentrant}
+A blocking operator should not have to abandon device execution when its
+next allocation fails. Our protocol separates \emph{algorithm continuation}
+from \emph{internal storage I/O}. The CSF retains its input cursor, completed
+runs, and pending action. It returns NEED\_STORE as a tagged completion value,
+not as a failed SNIA status. The FEMU plugin allocates an NVM extent, stores
+the last AFDM I/O buffer, and reinvokes the same CSF with the new spill token.
+The CSF records that token, releases the now-safe resident buffer, and
+continues from its saved cursor.
+
+Listings~\ref{lst:sortcontinuation} and~\ref{lst:plugincontinuation} show a
+minimal Sort sink and its plugin loop. For clarity, one victim run fits one
+I/O buffer; a larger run repeats the same transition for each bounded block.
+\texttt{AppendNext} advances the input cursor only after a successful append.
+\texttt{SealRun} finalizes the existing resident run and records its byte size.
+Both helpers and the state structure belong to Sort.
+
+\begin{lstlisting}[style=demo,language=C,caption={Device Sort sink: keep the cursor and request a spill instead of returning intermediate rows.},label={lst:sortcontinuation}]
+int64_t sort_sink(femu_csd_args *a) {
+  SortState *s = State(a->cparam1);
+  void *io = a->mr_addr[a->numr - 1];
+  if (csIsReentry(a) && s->pending == STORE) {
+    s->runs.push(csReentryValue(a));
+    ReleaseResidentRun(s);  // STORE is complete
+    s->pending = NONE;
+  }
+  while (HasInput(s)) {
+    if (AppendNext(s)) continue;
+    SealRun(s);
+    memcpy(io, s->run, s->run_bytes);
+    s->pending = STORE;     // save continuation
+    return csNeedStore(s->run_bytes);
+  }
+  return DONE;             // sink call completed
+}
+\end{lstlisting}
+
+\begin{lstlisting}[style=demo,language=C,caption={FEMU plugin: perform the requested I/O, update invocation state, and reenter the same CSF.},label={lst:plugincontinuation}]
+value = InvokeCSF(task);
+while (IsNeedIO(value)) {
+  switch (Action(value)) {
+  case NEED_STORE:
+    token = SpillAlloc(Bytes(value));
+    InternalStore(LastAFDM(task), token);
+    break;
+  case NEED_LOAD:
+    token = Token(value);
+    InternalLoad(token, LastAFDM(task));
+    break;
+  case NEED_FREE:
+    token = Token(value);
+    SpillFree(token);
+    break;
+  }
+  task.reentry = token;   // mapped to cparam2
+  value = InvokeCSF(task);
+}
+CompleteBatchNode(task, value);
+\end{lstlisting}
+
+\texttt{InvokeCSF}, \texttt{SpillAlloc}, and the internal transfers abbreviate
+the FEMU adapter operations. The actual device helpers are
+\texttt{csNeedStore}, \texttt{csNeedLoad}, \texttt{csNeedFree},
+\texttt{csIsReentry}, and \texttt{csReentryValue}. The plugin updates the
+invocation's reentry field, mapped to \texttt{cparam2}; it does not rewrite
+Sort's private data structure or restart the operator. The first branch of
+Listing~\ref{lst:sortcontinuation} updates that private structure after the
+I/O completes. Thus ``resume state'' has two owners: transport completion in
+the plugin and algorithm progress in the CSF.
+
+During merge, a Sort source returns NEED\_LOAD for a missing run block and
+NEED\_FREE for a consumed token, using the same loop. Successors start only
+when a normal completion value is returned. This preserves a complete device
+fragment under memory pressure: temporary tuples move between AFDM and NVM,
+while the host handles only small requests and tokens. Query-level operator
+composition remains in the application. The NEED\_* encoding and reentry
+mapping are FEMU backend conventions carried through SNIA completion, not
+new standard SNIA status codes.
 
 \section{Composable SQL Operators on Device CPUs}
 \label{sec:operators}
@@ -335,12 +552,17 @@ spill I/O buffers. Hash tables, sort runs, cursors, and aggregate state use
 a shared work-memory allocator. Per-query root contexts and operator child
 contexts charge allocations to the same global pool.
 
-Let $M_A$ denote AFDM reservations and $M_W$ the shared algorithm budget.
 For $k$ concurrent operators, admission requires
 \begin{equation}
  M_A \leq M_{\mathrm{AFDM}},\qquad
  \sum_{i=1}^{k} M_{W,i} \leq M_W.
 \end{equation}
+Here $M_A$ is the sum of reserved AFDM bytes for the query,
+$M_{\mathrm{AFDM}}$ is the available AFDM capacity, $M_W$ is the shared
+private work-memory limit, $k$ is the number of simultaneously active
+operators, $i$ identifies one of those operators, and $M_{W,i}$ is that
+operator's charged private-state allocation. All memory quantities are in
+bytes and include the allocator overhead charged to their respective pools.
 The application chooses chunk size and concurrent slots using both budgets.
 A work-memory limit is a shared query constraint, not a fresh allocation for
 every CU. Spill space is accounted separately on NVM. This avoids turning
@@ -422,7 +644,7 @@ wait for completion to isolate the effect of a fully populated cache.
 \subsection{Overlap and Resource Control}
 \begin{figure*}[t]
 \centering
-\input{figures/timeline.tex}
+\input{figures/timeline_cpu.tex}
 \caption{Intended overlap for application-orchestrated CPU execution. Range
 notifications permit host reads while later device batches execute. Refill
 may continue after a query finishes; the next plan observes actual residency.}
@@ -469,6 +691,11 @@ storage movement:
  \ell_D(v)=C_{\mathrm{CPU}}(v)+C_{\mathrm{I/O}}(v)
                           +C_{\mathrm{spill}}(v).
 \end{equation}
+Here $v$ identifies an operator, $\ell_D(v)$ is its local device cost,
+$C_{\mathrm{CPU}}(v)$ is its CPU processing cost, $C_{\mathrm{I/O}}(v)$ is
+its base-data movement cost, and $C_{\mathrm{spill}}(v)$ is temporary-write
+and replay cost. Each term is a time estimate in seconds; dependencies and
+overlap are handled when combining physical alternatives.
 CPU cost is estimated from measured scan/decode, expression, hash, aggregate,
 and sort throughput at the chosen CU concurrency. Spill cost includes both
 writes and replay reads. A device-to-host boundary adds request setup and
@@ -480,11 +707,19 @@ result transfer, so the recurrence is
  C_{\mathrm{root}}&=\min\{H(v),X(v)\}.
 \label{eq:dp}
 \end{align}
-Here $X(v)$ materializes the device result for HOST and $\widehat{B}_v$ is
-expected serialized output size. Internal device edges reuse buffers and do
-not repeatedly pay result transfer. Actual planning retains alternative
-orders, algorithms, and physical properties rather than a single scalar
-per state.
+Here $D(v)$ is the cost of the device subtree rooted at $v$, $H(v)$ is
+its best host-executable cost, and $X(v)$ is its device execution followed
+by materialization for the host. The symbol $u$ ranges over the child
+operators in $\mathrm{child}(v)$, $\ell_H(v)$ is the local host cost,
+$C_{\mathrm{setup}}$ is command/setup time, $\widehat{B}_v$ is estimated
+serialized output bytes, and $W_{\mathrm{return}}$ is effective return
+bandwidth in bytes per second. $C_{\mathrm{root}}$ is the final query cost;
+at that line $v$ denotes the plan root. All costs are in seconds. Each $D$
+combination requires device-resident children; incompatible states are
+excluded. Internal device edges reuse buffers and do not pay return costs.
+The scalar recurrence expresses legal transitions; the planner retains
+candidate orders and algorithms, and a scheduled candidate accounts for
+parallel branches instead of interpreting their sum as an overlap guarantee.
 
 For a relation with $p_r$ pages and observed resident fraction $h_r$, the
 host scan I/O component is
@@ -492,6 +727,11 @@ host scan I/O component is
  C_{H,\mathrm{scan}}(r)=p_r[(1-h_r)c_{\mathrm{storage}}
                                   +h_r c_{\mathrm{cached}}].
 \end{equation}
+Here $r$ identifies a relation, $C_{H,\mathrm{scan}}(r)$ is its host scan
+I/O time, $p_r$ is its number of pages, $h_r\in[0,1]$ is the fraction
+resident in host cache, $c_{\mathrm{storage}}$ is time per uncached page,
+and $c_{\mathrm{cached}}$ is time per resident page. Both per-page costs
+are in seconds per page; CPU decoding is accounted for separately.
 Cache sampling uses the heap segments' actual residency. Refills from an
 earlier device query raise $h_r$ and can change the next query's placement.
 This connects cache production to the planning objective without awarding
@@ -513,205 +753,265 @@ intermediate may remain useful to an upper device reducer even when returning
 that intermediate to HOST would be expensive. Spill and return boundaries
 are therefore evaluated independently.
 
-\section{Evaluation}
+\section{Evaluation and Analytical Projections}
 \label{sec:evaluation}
-The evaluation follows the four contributions in order: API composition,
-complete operator execution, cache refill, and adaptive placement. We use
-TPC-H Q1--Q22 at SF=1 as the initial workload \cite{tpch}, supplemented with
-operator microbenchmarks and repeated query sequences.
+The evaluation follows the four contributions: API composition, complete
+operator execution, reentrant memory management, and cache-aware placement.
+We use TPC-H Q1--Q22 at SF=1 as the initial workload \cite{tpch}, together
+with operator microbenchmarks and repeated-query sequences.
 
-\paragraph{Status of the reference results.}
-The numerical figures below reuse the existing SF=1 companion-prototype
-measurements as preliminary reference data. They guide experiment selection
-and expected trends; final CPU/SNIA measurements will replace them. The five-way
-ablation is specified here with unmeasured cells left open, rather than
-inferred from those reference numbers.
+\paragraph{Measured anchors versus theoretical projections.}
+The five-way results in this section are \emph{analytical scenarios, not new
+measurements}. They are computed from archived SF=1 reference costs and
+explicit assumptions to guide the next implementation and experiment round.
+Every projected figure is labeled THEORETICAL ESTIMATE. Reference-clock seconds
+are a common plotting scale, not a prediction of physical CPU/SNIA latency.
+We keep measured cache/Sort evidence separate and never infer correctness
+from the model. Model parameters and calculated values are saved with the
+paper so later measurements can replace them directly.
 
-\subsection{Configurations and Comparison Questions}
-Table~\ref{tab:baselines} defines the five configurations. They share SQL,
-data layout, CPU/CU allocation, memory budgets, and device bandwidth settings.
-Offload-capable configurations use the same SNIA backend so the operator
-comparison is not confounded by a different transport.
+\subsection{Configurations and Experimental Protocol}
+Table~\ref{tab:baselines} defines the five configurations. The final experiment
+will hold SQL, data layout, CPU/CU resources, AFDM/work-memory budgets, and
+device settings constant across offload configurations.
 
 \begin{table*}[t]
-\caption{Five-way comparison. Each added mechanism answers a separate
-question; Filter-only is a restricted baseline, not a description of every
-prior system.}
+\caption{Five-way comparison used by the projections and planned measurements.}
 \label{tab:baselines}
 \small
 \begin{tabular}{@{}p{.14\textwidth}p{.24\textwidth}p{.06\textwidth}p{.09\textwidth}p{.35\textwidth}@{}}
 \toprule
 Configuration & Operator placement & Refill & Adaptive & Comparison purpose \\
 \midrule
-Host-only & All relational work on native PostgreSQL & No & No & Reference execution without offload \\
-Filter-only & Device scan/filter; host joins, aggregates, sort & No & No & Benefit and limit of predicate offload \\
-CSD-only & All supported relational work on device CPUs & No & No & Incremental value of complete operator chains \\
-CSD + Cache Refill & Same forced-device placement as CSD-only & Yes & No & Cost and reuse benefit of cache population \\
-Full system & Node-level HOST/CSD choices & Yes & Yes & Additional benefit of cache-aware placement \\
+Host-only & All relational work on PostgreSQL & No & No & Reference without offload \\
+Filter-only & Device scan/filter; host blocking operators & No & No & Predicate reduction alone \\
+CSD-only & Complete supported device fragments & No & No & Benefit of full operator chains \\
+CSD + Cache Refill & Same forced-device plan as CSD-only & Yes & No & Refill overhead and later reuse \\
+Full system & Node-level HOST/CSD choices & Yes & Yes & Value of using observed cache state \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
-Host-only versus Filter-only isolates early row reduction. Filter-only versus
-CSD-only measures whether joins and blocking operators avoid substantial
-intermediate transfer. CSD-only versus CSD + Cache Refill must be compared
-both for the first query and for later queries: refill can add traffic now
-while saving I/O later. CSD + Cache Refill versus the full system isolates
-placement, since their operator library and refill mechanism are identical.
+Cold tests restart PostgreSQL and clear host page cache before each sample.
+Warm tests specify initial resident fraction. Sequence tests clear caches
+only before the sequence, allowing each configuration to create its own cache
+state; Host-only also receives the warming benefit of its ordinary reads.
+The final tests will check exact results and report repeated latency samples,
+CPU work, I/O, memory, and refill completion. Concurrent request durations
+are not added together as end-to-end latency.
 
-\subsection{Setup and Measurement Protocol}
-The final setup records host and device CPU resources, CU count, AFDM,
-shared work memory, storage bandwidth, API request cost, and query memory
-settings. A CU sweep uses 1, 2, and 4 concurrent device requests. Memory
-experiments vary AFDM and work-memory limits separately; the example operator
-library provides a 64 MiB work-memory setting as an initial pressure point.
-The same total budget applies across CUs.
+\subsection{A Transparent Projection Model}
+The reference CSV provides a cold HOST cost $H_q^0$ and an AUTO cost $A_q^0$
+for each query $q$, totaling 825.114 and 183.020 s. These are archived timing
+anchors, not final CPU implementation measurements. The three-trial cache
+experiment gives a relative reduction
+$\lambda=1-10.818313/22.537964\simeq0.52$. We assume
+\begin{align}
+ \widetilde H_q(h)&=H_q^0(1-\lambda h),\\
+ \widetilde F_q(h)&=\widetilde H_q(h)
+                           [1-\alpha+\alpha\sigma_q]+\tau,\\
+ \widetilde R_q&=(1+\delta)\widetilde D_q.
+\label{eq:projection}
+\end{align}
+Here a tilde denotes an estimated scenario cost; $q$ is the query identifier;
+$h\in[0,1]$ is initial cache residency; $\widetilde H_q$ is Host-only cost;
+$\widetilde F_q$ is Filter-only cost; $\widetilde D_q$ is forced CSD-only cost;
+and $\widetilde R_q$ is forced CSD + Cache Refill cost. $H_q^0$ is the archived
+cold HOST anchor. The parameter $\lambda$ is the assumed fully warm latency
+reduction, $\alpha=0.55$ is the assumed fraction of HOST work avoidable by
+scan/filter offload, $\sigma_q$ is an assumed surviving-work fraction,
+$\tau=0.02$ s is request overhead, and $\delta=0.03$ is non-overlapped refill
+contention. Costs are in reference-scale seconds; all fractions are
+unitless. The assumed $\sigma_q$ values, from 0.02 to 0.98, are model inputs,
+not measured TPC-H selectivities.
 
-Cold-query experiments restart PostgreSQL and clear the host file cache
-before every configuration sample. Warm and sequential experiments instead
-retain cache across a specified query sequence, clearing only before the
-sequence. All outputs are checked against Host-only. Repeated measurements
-report median, dispersion, and total query-sequence completion time.
-End-to-end latency is the primary metric; CPU time, per-CSF time, bytes
-transferred, refill completion, memory peaks, and spill traffic explain it.
-Overlapping per-request times are not summed as query latency.
+For queries previously placed completely on the CSD, we set
+$\widetilde D_q=A_q^0$. To expose forced-placement risks, we assume
+$\widetilde D_q=1.20H_q^0$ for the two HOST-selected queries and
+$\widetilde D_q=1.25A_q^0$ for the two mixed queries. The multipliers 1.20
+and 1.25 are hypotheses about an unfavorable forced placement, not observations.
+The full-system projection takes the minimum among HOST, device-with-refill,
+and a retained mixed candidate. The mixed candidate has cost
+$A_q^0(1-\eta\lambda h)(1+\delta)$ with assumed host-sensitive fraction
+$\eta=0.30$; $A_q^0$ is the archived AUTO anchor. This candidate minimum is
+an optimistic surrogate for a correctly calibrated planner, not an execution
+or validation of our dynamic program.
 
-\begin{table*}[t]
-\caption{Main results template for the CPU/SNIA implementation. Dashes mark
-measurements to be filled; they do not denote zero. All configurations run
-the same queries and sequence definitions.}
-\label{tab:resultslots}
-\small
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{@{}lrrrrr@{}}
-\toprule
-Metric & Host-only & Filter-only & CSD-only & CSD + Cache Refill & Full system \\
-\midrule
-Cold Q1--Q22 total latency (s) & \pending & \pending & \pending & \pending & \pending \\
-Warm Q1--Q22 total latency (s) & \pending & \pending & \pending & \pending & \pending \\
-Repeated-query sequence latency (s) & \pending & \pending & \pending & \pending & \pending \\
-Mixed-query sequence latency (s) & \pending & \pending & \pending & \pending & \pending \\
-Host-interface data traffic (GiB) & \pending & \pending & \pending & \pending & \pending \\
-Device spill read + write (GiB) & \pending & \pending & \pending & \pending & \pending \\
-Peak query memory (MiB) & \pending & \pending & \pending & \pending & \pending \\
-Correct query outputs / 22 & \pending & \pending & \pending & \pending & \pending \\
-\bottomrule
-\end{tabular}}
-\end{table*}
+These assumptions deliberately separate known numbers from guessed cost
+components. In particular, the cache reduction measured for one count scan
+is applied uniformly only as a scenario. Its applicability to each real
+query, the forced-device penalties, and filter fractions must be measured
+later. The model predicts directions and counterexamples, not confidence
+intervals or guaranteed speedups.
 
-Table~\ref{tab:resultslots} is the main result matrix to fill. Per-query bars
-will show the five configurations normalized to Host-only. Separate sequence
-plots will show cumulative completion time and measured cache residency, so
-cache production and location changes are visible together.
-
-\subsection{API and Complete-Operator Evaluation}
-The interface microbenchmarks measure allocation, compute request latency,
-event completion, and SERIAL versus HYBRID batches. A composed
-LOAD--sort-sink / sort-source--aggregate workload tests that intermediate
-rows stay inside the device and that parallel branches share one memory
-budget. It also separates useful CPU work from request and continuation cost.
-
-For TPC-H, Filter-only and CSD-only should be compared by selectivity,
-intermediate bytes returned, and the number of host blocking operators.
-Q6 represents a simple scan/reduction chain; Q3 and Q5 exercise joins and
-aggregation; Q18 exercises grouping, joins, and ordering. The purpose is to
-identify when a complete fragment is better than returning filtered rows,
-not to assume that more offload always wins.
-
-Existing reference profiles illustrate the state-management questions.
-Streaming Q1 and Q6 aggregation consume 29 batches and record small operator
-state peaks of 2,528 and 134 bytes. A forced 1 MiB join replay returns count
-299,808 with a 750,240-byte recorded state peak. A grouped replay returns
-74,999 groups with 796,876 bytes of recorded state. These values motivate
-separate reporting of buffers, private state, and spill; the CPU/SNIA operator
-experiments will measure those categories directly.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figures/sf1_sort_io.pdf}
-\caption{Preliminary SF=1 reference: three separate external-sort I/O
-comparisons. Final output streaming, SQL Top-N, and wider merging motivate
-CPU operator ablations; each pair has its own baseline.}
-\Description{Paired bars compare spill traffic before and after final
-streaming, Top-N, and adaptive merging in the reference data.}
-\label{fig:sort}
-\end{figure}
-
-Figure~\ref{fig:sort} supplies reference points for the external-sort study.
-Final merge-to-consumer streaming reduces spill traffic from 14,646,232 to
-9,420,282 bytes. A LIMIT 100 query needs 69,190 bytes against the latter
-unbounded reference. In a separate 229-run test, wider merging reduces traffic
-from 3,680,832 to 1,183,632 bytes. The final CPU experiments will compare
-matched SQL and budgets, including output streaming, Top-N, fan-in, and
-work-memory sensitivity.
-
-\subsection{Cache Refill: Immediate Cost and Future Benefit}
-We use two complementary experiments. A controlled two-query experiment
-first offloads a scan and then executes a forced-host query over the same
-relation. Waiting for refill before the second query isolates achievable
-cache benefit. A sequence experiment removes that wait and includes all
-refill overhead in elapsed time, measuring whether asynchronous warming
-improves the workload as a whole.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figures/sf1_cache_benefit.pdf}
-\caption{Preliminary reference for subsequent-query cache benefit. After
-complete refill, the HOST count scan averages 10.82 s instead of 22.54 s;
-dots represent the three archived samples.}
-\Description{Bars and sample points compare a subsequent host scan with
-refill disabled and after complete refill.}
-\label{fig:cache}
-\end{figure}
-
-The reference two-query experiment returns 6,001,215 in both paths.
-Subsequent HOST scan time averages 22,537.964 ms without refill and
-10,818.313 ms after complete refill, a 2.0833 ratio
-(Figure~\ref{fig:cache}). The completed range is 1,276,665,856 bytes across
-two heap segments. A separate overlap experiment records 128 MiB completed
-inside a roughly 1.218 s outstanding command window. These observations
-motivate measuring completed refill bytes, first/last completion, and the
-fraction overlapping useful device work.
-
-For the final five-way comparison, CSD + Cache Refill and CSD-only use exactly
-the same forced-device plan. We report current-query overhead, next-query
-latency, total sequence latency, extra NVM/host traffic, and cache residency.
-A refill-rate sweep tests whether excessive warming competes with useful
-computation or result transfer. Repeated scans and mixed query sequences
-separate high reuse from cache pollution.
-
-\subsection{Full System: Cache-Aware Placement}
+\subsection{Five-Way Query and Suite Comparisons}
 \begin{figure*}[t]
 \centering
-\includegraphics[width=.94\textwidth]{figures/sf1_auto_speedup.pdf}
-\caption{Preliminary SF=1 placement reference. Colors identify complete CSD,
-mixed, and HOST choices. The final evaluation will replace this two-path
-reference with the five configurations in Table~\ref{tab:baselines}.}
-\Description{Per-query reference time ratios show different host, device,
-and mixed placements across the 22 TPC-H queries.}
-\label{fig:placement}
+\includegraphics[width=.96\textwidth]{figures/theory_query_comparison.pdf}
+\caption{Theoretical five-way per-query ratios for cold and fully resident
+inputs. Curves use Equation~\ref{eq:projection} and assumed placement
+penalties. These are reproducible scenarios, not measured CPU results.}
+\Description{Two logarithmic plots compare all five configurations across
+22 queries under cold and warm assumptions.}
+\label{fig:theoryqueries}
 \end{figure*}
 
-The reference placement run chooses 18 complete CSD plans, two mixed plans,
-and two HOST plans. Total reference times are 183,019.742 ms for AUTO and
-825,114.403 ms for HOST, an aggregate ratio of 4.5083; the geometric mean of
-per-query ratios is 6.9207 (Figure~\ref{fig:placement}). These values establish
-an initial scale for the study, while the final five-way experiment isolates
-the additional effect of the CPU/SNIA architecture and refill-aware choice.
+Figure~\ref{fig:theoryqueries} makes the Filter-only distinction visible.
+Avoiding only scan work leaves downstream joins and blocking operators on
+the host. Full fragments can reduce both computation and intermediate
+transfer, while forced placement can lose on queries assigned an unfavorable
+device cost. Increasing residency reduces HOST cost and narrows some offload
+advantages; it does not automatically eliminate the value of device compute.
 
-The placement experiment sweeps measured resident fraction from cold to hot
-and records the chosen location at each node. We compare the full system
-against forced CSD + Cache Refill, a cache-oblivious placement variant, and
-an offline best-of-configurations reference. The offline reference is an
-analysis bound, not a deployable optimizer.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=.96\textwidth]{figures/theory_suite_totals.pdf}
+\caption{Theoretical suite totals replace the empty main-result table.
+Cold totals are 825.1, 622.3, 207.6, 213.8, and 184.2 reference-scale seconds;
+warm totals are 396.1, 299.0, 207.6, 213.8, and 127.1 in configuration order.}
+\Description{Cold and warm grouped bar charts show estimated aggregate
+query time for Host-only, Filter-only, CSD-only, CSD with refill, and Full.}
+\label{fig:theorytotals}
+\end{figure*}
 
-A mixed-query sequence starts with a selective offloaded query, then submits
-queries over overlapping and disjoint relations. We track cumulative time,
-cache-resident bytes, device spill, and the locations selected at successive
-planning points. This directly tests the intended chain: complete device
-execution creates refill opportunities, refill changes host scan cost, and
-node-level planning uses the changed cost. Performance on unrelated queries
-checks whether the same refill also harms cache capacity.
+Figure~\ref{fig:theorytotals} summarizes the calculated values. Under cold
+inputs the full-system scenario has a HOST/full ratio of 4.48; under warm
+inputs that ratio is 3.12. These are consequences of the stated parameters.
+CSD + Cache Refill is deliberately 3\% slower than CSD-only when no subsequent
+reuse is credited. The plots therefore do not assign a free current-query
+speedup to asynchronous reads. They motivate measuring operator reduction,
+refill overhead, and placement as separate effects.
+
+\subsection{Multi-Query Reuse and Placement Changes}
+We next model two six-query sequences. The first repeats a Q6-like reduction;
+the second alternates reductions with host-friendly count-style probes.
+Reduction cost uses the archived Q6 HOST/CSD anchors. Probe HOST costs are
+22.538 s cold and 10.818 s warm from the cache experiment; its device cost
+is assumed to be 65\% of cold HOST cost, and Filter-only probe cost is
+assumed to be 80\% of the residency-adjusted HOST cost plus 0.02 s.
+Each successful full host scan warms
+the relevant input, Filter-only warms an assumed 20\%, CSD-only warms none,
+and refill completes the relevant working set before the next request.
+That last assumption requires sufficient compute time or inter-query slack;
+it is a reuse scenario rather than evidence that refill always finishes.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=.96\textwidth]{figures/theory_sequences.pdf}
+\caption{Theoretical cumulative query time, including the first query.
+Repeated reductions show refill overhead without a placement benefit.
+The mixed sequence allows full execution to use the warmed host path.}
+\Description{Two line charts show cumulative estimated time over six
+requests for a repeated reduction and a mixed reuse workload.}
+\label{fig:theorysequence}
+\end{figure*}
+
+For repeated reductions, CSD-only totals 11.79 s and both refill configurations
+12.15 s: device aggregation remains preferable and refill adds overhead.
+For the mixed sequence, totals are 69.35 s for Host-only, 80.14 for
+Filter-only, 62.53 for CSD-only, 64.41 for forced CSD with refill, and 47.32
+for the full system (Figure~\ref{fig:theorysequence}). Filter-only can lose
+because it warms only part of the input. Forced CSD with refill produces
+cache state that its fixed placement does not exploit; the full configuration
+uses that state for later probes. The forced-refill/full time ratio is
+1.36, a testable model prediction rather than a measured result.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/theory_cache_crossover.pdf}
+\caption{Theoretical placement crossover for the host-friendly probe.
+HOST becomes cheaper beyond resident fraction 0.636 under the stated costs.}
+\Description{HOST cost falls with residency, fixed device cost is horizontal,
+and their minimum changes from device to host near 64 percent residency.}
+\label{fig:crossover}
+\end{figure}
+
+The crossover in Figure~\ref{fig:crossover} explains the mixed-sequence
+behavior. With probe device fraction 0.65 and refill overhead 0.03, equality
+occurs at $h=[1-0.65(1+0.03)]/\lambda=0.636$. Here $h$ is resident fraction
+and $\lambda$ is the warm reduction factor defined above. This analytical
+threshold identifies a useful residency sweep for the real optimizer.
+
+\subsection{Traffic and the Price of Producing Cache}
+\begin{figure*}[t]
+\centering
+\includegraphics[width=.96\textwidth]{figures/theory_traffic.pdf}
+\caption{Theoretical traffic for a representative reduction followed by a
+forced-HOST probe, normalized to input bytes. Full refill restores a cache
+opportunity by spending transfer bandwidth; it does not preserve all of the
+result-only traffic saving.}
+\Description{Stacked bars show first-query useful traffic and refill bytes;
+a second chart shows uncached bytes needed by the next forced-host probe.}
+\label{fig:theorytraffic}
+\end{figure*}
+
+This normalized example assumes Filter-only returns 25\% of input, a complete
+fragment returns 0.1\%, and full refill transfers one input volume. Host-only
+therefore transfers 1.0 input units, Filter-only 0.25, CSD-only 0.001, and the
+two refill configurations 1.001 during the first query plus its refill tail.
+The next forced-HOST probe reads 0, 0.8, 1.0, 0, and 0 input units,
+respectively, under the preceding warming assumptions
+(Figure~\ref{fig:theorytraffic}). Returned-row fraction and cached-page
+fraction are distinct assumptions; neither is inferred from the other.
+The chart includes full refill traffic even when some completes after the
+query result. It demonstrates why both foreground latency and sequence
+completion must be measured.
+
+For a measured anchor, the three archived cache trials reduce a subsequent
+HOST count from 22,537.964 to 10,818.313 ms and complete 1,276,665,856 bytes.
+A separate run completes 128 MiB during a roughly 1.218 s command window.
+Those observations establish useful cache population and partial overlap;
+the theoretical sequence's complete-by-next-query assumption remains to be
+tested on the CPU/SNIA execution path.
+
+\subsection{Memory Pressure and Reentrant Spill}
+\begin{figure*}[t]
+\centering
+\includegraphics[width=.96\textwidth]{figures/theory_memory_spill.pdf}
+\caption{Theoretical 256 MiB Sort scenario with 16 MiB fixed AFDM buffers.
+The left chart is budgeted algorithm memory, not physical process RSS.
+The right is ideal one-pass spill traffic; extra merge passes add traffic.}
+\Description{Budgeted sort memory remains within fixed buffers plus work
+quota, while modeled spill traffic decreases as the private quota grows.}
+\label{fig:theorymemory}
+\end{figure*}
+
+To make the continuation mechanism's resource tradeoff visible, consider
+\begin{equation}
+ P(W)=A+\min(S,W),\qquad I(W)=2\max(0,S-W).
+\label{eq:sortprojection}
+\end{equation}
+Here $W$ is the private Sort work budget, $A=16$ MiB is fixed AFDM capacity,
+$S=256$ MiB is input/run payload size, $P(W)$ is modeled resident algorithm
+memory, and $I(W)$ is total internal spill-write plus replay-read traffic.
+All five quantities are in MiB. The factor 2 counts one write and one read
+of the payload beyond the resident budget. Metadata is ignored in this
+idealized payload model, and extra merge passes increase $I(W)$.
+
+At $W=32$ MiB resident payload plus fixed buffers is 48 MiB in this model and
+performs 448 MiB of internal spill I/O. At an assumed symmetric bandwidth
+of 1000 MiB/s, that adds 0.448 s of ideal serialized I/O. At $W=128$ MiB,
+these values become 144 MiB, 256 MiB, and 0.256 s
+(Figure~\ref{fig:theorymemory}). The key design property is continued device
+execution through STORE/LOAD reentry, rather than exporting the entire
+intermediate to a host operator. Allocator overhead, fragmentation, request
+latency, and additional passes belong in the final measurements.
+
+Existing SF=1 Sort profiles provide independent mechanism evidence: final
+merge-to-consumer streaming reduces spill bytes from 14,646,232 to 9,420,282;
+a separate 229-run test reduces 3,680,832 to 1,183,632 with wider merging.
+These measured byte counts are not substituted for the theoretical 256 MiB
+scenario. The final reentry microbenchmark will record run count, NEED\_*
+transitions, allocated token bytes, peak budget use, and exact sorted output.
+
+\subsection{Completing the Measurement Set}
+The six projected figures replace the large blank results matrix with
+specific targets: per-query time, cold/warm totals, query-sequence time,
+traffic, memory/spill sensitivity, and cache-driven placement transitions.
+Correctness remains an exact comparison for every configuration and is never
+a guessed model output. Interface tests will additionally measure request
+and batch overhead; repeated real runs will replace scenario curves rather
+than add artificial error bars to deterministic calculations.
 
 \section{Design Tradeoffs}
 The architecture deliberately exposes composition to the application. This
@@ -734,8 +1034,10 @@ operator/refill/placement comparison.
 
 \section{Related Work}
 \paragraph{Near-storage query execution.}
-Ibex demonstrates richer SQL offload than simple filtering, including GROUP
-BY \cite{ibex}. PushdownDB explores the capabilities and limits of cloud
+YourSQL and POLARDB motivate integrating scan offload into the database and
+storage stack \cite{yoursql,polardb}. Ibex demonstrates richer SQL offload,
+including GROUP BY \cite{ibex}; AQUOMAN extends offload to multi-way joins
+\cite{aquoman}. PushdownDB explores the capabilities and limits of cloud
 storage computation \cite{pushdowndb}. Trinity integrates database execution
 with near-data acceleration \cite{trinity}, while NASCENT specializes
 near-storage sorting \cite{nascent}. These systems motivate operator coverage

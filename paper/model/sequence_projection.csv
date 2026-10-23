@@ -1,0 +1,61 @@
+scenario,position,kind,configuration,cumulative_reference_s,location,status
+Repeated reduction,1,reduce,Host-only,17.621179,HOST,THEORETICAL
+Repeated reduction,2,reduce,Host-only,26.079415,HOST,THEORETICAL
+Repeated reduction,3,reduce,Host-only,34.537651,HOST,THEORETICAL
+Repeated reduction,4,reduce,Host-only,42.995888,HOST,THEORETICAL
+Repeated reduction,5,reduce,Host-only,51.454124,HOST,THEORETICAL
+Repeated reduction,6,reduce,Host-only,59.912360,HOST,THEORETICAL
+Repeated reduction,1,reduce,Filter-only,8.143364,FILTER,THEORETICAL
+Repeated reduction,2,reduce,Filter-only,15.441904,FILTER,THEORETICAL
+Repeated reduction,3,reduce,Filter-only,22.740444,FILTER,THEORETICAL
+Repeated reduction,4,reduce,Filter-only,30.038984,FILTER,THEORETICAL
+Repeated reduction,5,reduce,Filter-only,37.337524,FILTER,THEORETICAL
+Repeated reduction,6,reduce,Filter-only,44.636065,FILTER,THEORETICAL
+Repeated reduction,1,reduce,CSD-only,1.965277,CSD,THEORETICAL
+Repeated reduction,2,reduce,CSD-only,3.930554,CSD,THEORETICAL
+Repeated reduction,3,reduce,CSD-only,5.895831,CSD,THEORETICAL
+Repeated reduction,4,reduce,CSD-only,7.861108,CSD,THEORETICAL
+Repeated reduction,5,reduce,CSD-only,9.826385,CSD,THEORETICAL
+Repeated reduction,6,reduce,CSD-only,11.791662,CSD,THEORETICAL
+Repeated reduction,1,reduce,CSD + Cache Refill,2.024235,CSD,THEORETICAL
+Repeated reduction,2,reduce,CSD + Cache Refill,4.048471,CSD,THEORETICAL
+Repeated reduction,3,reduce,CSD + Cache Refill,6.072706,CSD,THEORETICAL
+Repeated reduction,4,reduce,CSD + Cache Refill,8.096941,CSD,THEORETICAL
+Repeated reduction,5,reduce,CSD + Cache Refill,10.121177,CSD,THEORETICAL
+Repeated reduction,6,reduce,CSD + Cache Refill,12.145412,CSD,THEORETICAL
+Repeated reduction,1,reduce,Full system,2.024235,CSD,THEORETICAL
+Repeated reduction,2,reduce,Full system,4.048471,CSD,THEORETICAL
+Repeated reduction,3,reduce,Full system,6.072706,CSD,THEORETICAL
+Repeated reduction,4,reduce,Full system,8.096941,CSD,THEORETICAL
+Repeated reduction,5,reduce,Full system,10.121177,CSD,THEORETICAL
+Repeated reduction,6,reduce,Full system,12.145412,CSD,THEORETICAL
+Reduction + host-friendly probes,1,reduce,Host-only,17.621179,HOST,THEORETICAL
+Reduction + host-friendly probes,2,probe,Host-only,28.439492,HOST,THEORETICAL
+Reduction + host-friendly probes,3,probe,Host-only,39.257804,HOST,THEORETICAL
+Reduction + host-friendly probes,4,reduce,Host-only,47.716041,HOST,THEORETICAL
+Reduction + host-friendly probes,5,probe,Host-only,58.534353,HOST,THEORETICAL
+Reduction + host-friendly probes,6,probe,Host-only,69.352666,HOST,THEORETICAL
+Reduction + host-friendly probes,1,reduce,Filter-only,8.143364,FILTER,THEORETICAL
+Reduction + host-friendly probes,2,probe,Filter-only,24.318591,FILTER,THEORETICAL
+Reduction + host-friendly probes,3,probe,Filter-only,40.493817,FILTER,THEORETICAL
+Reduction + host-friendly probes,4,reduce,Filter-only,47.792358,FILTER,THEORETICAL
+Reduction + host-friendly probes,5,probe,Filter-only,63.967585,FILTER,THEORETICAL
+Reduction + host-friendly probes,6,probe,Filter-only,80.142812,FILTER,THEORETICAL
+Reduction + host-friendly probes,1,reduce,CSD-only,1.965277,CSD,THEORETICAL
+Reduction + host-friendly probes,2,probe,CSD-only,16.614954,CSD,THEORETICAL
+Reduction + host-friendly probes,3,probe,CSD-only,31.264630,CSD,THEORETICAL
+Reduction + host-friendly probes,4,reduce,CSD-only,33.229907,CSD,THEORETICAL
+Reduction + host-friendly probes,5,probe,CSD-only,47.879584,CSD,THEORETICAL
+Reduction + host-friendly probes,6,probe,CSD-only,62.529260,CSD,THEORETICAL
+Reduction + host-friendly probes,1,reduce,CSD + Cache Refill,2.024235,CSD,THEORETICAL
+Reduction + host-friendly probes,2,probe,CSD + Cache Refill,17.113402,CSD,THEORETICAL
+Reduction + host-friendly probes,3,probe,CSD + Cache Refill,32.202569,CSD,THEORETICAL
+Reduction + host-friendly probes,4,reduce,CSD + Cache Refill,34.226804,CSD,THEORETICAL
+Reduction + host-friendly probes,5,probe,CSD + Cache Refill,49.315971,CSD,THEORETICAL
+Reduction + host-friendly probes,6,probe,CSD + Cache Refill,64.405138,CSD,THEORETICAL
+Reduction + host-friendly probes,1,reduce,Full system,2.024235,CSD,THEORETICAL
+Reduction + host-friendly probes,2,probe,Full system,12.842548,HOST,THEORETICAL
+Reduction + host-friendly probes,3,probe,Full system,23.660861,HOST,THEORETICAL
+Reduction + host-friendly probes,4,reduce,Full system,25.685096,CSD,THEORETICAL
+Reduction + host-friendly probes,5,probe,Full system,36.503409,HOST,THEORETICAL
+Reduction + host-friendly probes,6,probe,Full system,47.321721,HOST,THEORETICAL

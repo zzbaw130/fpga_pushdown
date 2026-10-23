@@ -1,0 +1,34 @@
+{
+  "status": "THEORETICAL",
+  "cold_total_s": {
+    "Host-only": 825.1144029999998,
+    "Filter-only": 622.3374198220001,
+    "CSD-only": 207.61303335,
+    "CSD + Cache Refill": 213.8414243505,
+    "Full system": 184.19601209
+  },
+  "warm_total_s": {
+    "Host-only": 396.0582063856348,
+    "Filter-only": 298.9532434423829,
+    "CSD-only": 207.61303335,
+    "CSD + Cache Refill": 213.8414243505,
+    "Full system": 127.10862752660363
+  },
+  "sequence_final_s": {
+    "repeat": {
+      "Host-only": 59.91236022144946,
+      "Filter-only": 44.63606450361763,
+      "CSD-only": 11.791662,
+      "CSD + Cache Refill": 12.14541186,
+      "Full system": 12.14541186
+    },
+    "mixed": {
+      "Host-only": 69.35266591095657,
+      "Filter-only": 80.14281166259019,
+      "CSD-only": 62.5292604,
+      "CSD + Cache Refill": 64.405138212,
+      "Full system": 47.32172128666668
+    }
+  },
+  "illustrative_cache_crossover_fraction": 0.6355818010399286
+}

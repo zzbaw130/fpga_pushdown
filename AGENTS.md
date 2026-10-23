@@ -15,6 +15,13 @@ reference，不能自动视为新版 CPU/SNIA 系统的实测结果。原始数�
 `paper/plot_results.py` 再生成。仅核查源码与已有数值，未运行新实验、未编译论文。
 本段仅描述论文方向，下面各节仍记录当前 FPGA Pushdown 代码的已验证事实。
 
+同日第三轮论文修订：阅读 YourSQL、Ibex、POLARDB、AQUOMAN 原文，重写背景动机，
+增加 SNIA LOAD→Scan→Filter→Aggregate 与 Sort NEED_STORE/插件重入 demo，并解释公式
+全部符号。用户明确要求理论估算，故 `paper/project_results.py` 在独立 `paper/model/`
+目录保存假设/CSV/汇总，生成六组带 THEORETICAL ESTIMATE 标识的图；它们不是实测结果，
+不写入 results/，不作为当前代码性能或正确性结论。原有用户修改的四幅图源/文件保留，
+正文使用单独 CPU 图源。未编译论文、未执行新的数据库实验。
+
 ## 1. 研究目标与三项贡献
 
 项目目标是在 CEMU 模拟的 Computational Storage Device（CSD）内执行
