@@ -26,6 +26,10 @@ reference，不能自动视为新版 CPU/SNIA 系统的实测结果。原始数�
 保留 Evaluation Model 和配套参数来源；CSV/JSON 使用 MODEL_DERIVED 字段。数值不变，
 未新增测量，未编译论文。
 
+同日正文整理：按用户要求将实验估算模型、参数和推导移入 `paper/DRAFT_NOTES.md`，
+正文保留实验配置、图表和结果分析；系统设计的内存/代价公式与符号说明不变。
+图表数值不变，未新增实验或编译。
+
 ## 1. 研究目标与三项贡献
 
 项目目标是在 CEMU 模拟的 Computational Storage Device（CSD）内执行

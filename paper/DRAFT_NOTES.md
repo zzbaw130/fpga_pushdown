@@ -151,6 +151,122 @@ payload 下限，不能冒充进程 RSS 或严格 allocator 证明。反例也�
 
 ## 图文呈现修订
 
-按用户要求取消图面横幅，标题/图注采用正常实验主题；正文集中保留 Evaluation Model、
-参数来源和计算方式，不反复插入警示段落。数值没有变化，未新增测量。
+按用户要求取消图面横幅，标题/图注采用正常实验主题；模型、参数来源和计算方式保存在说明中，不反复插入正文。数值没有变化，未新增测量。
 JSON/CSV 中用 MODEL_DERIVED 标识计算输出，原始 results/ 数据不改。
+
+
+## 正文整理：计算说明移出论文
+
+按用户要求，将 Evaluation Model、sequence/traffic 假设、cache crossover 推导及 Sort
+情景计算从 main.tex 移至本说明。正文保留配置、图表和分析，不增加新的实测声称；
+系统设计章节的内存/代价公式及符号释义保留。图表和数值不变，未运行新实验或编译。
+以下保留移出内容，便于后续替换参数和补充测量。
+
+### 移出片段 1
+
+```latex
+\subsection{Evaluation Model}
+The reference CSV provides a cold HOST cost $H_q^0$ and an AUTO cost $A_q^0$
+for each query $q$, totaling 825.114 and 183.020 s. These archived timings
+set the baseline for the evaluation model. The three-trial cache
+experiment gives a relative reduction
+$\lambda=1-10.818313/22.537964\simeq0.52$. We assume
+\begin{align}
+ \widetilde H_q(h)&=H_q^0(1-\lambda h),\\
+ \widetilde F_q(h)&=\widetilde H_q(h)
+                           [1-\alpha+\alpha\sigma_q]+\tau,\\
+ \widetilde R_q&=(1+\delta)\widetilde D_q.
+\label{eq:projection}
+\end{align}
+Here a tilde denotes a cost estimate; $q$ is the query identifier;
+$h\in[0,1]$ is initial cache residency; $\widetilde H_q$ is Host-only cost;
+$\widetilde F_q$ is Filter-only cost; $\widetilde D_q$ is forced CSD-only cost;
+and $\widetilde R_q$ is forced CSD + Cache Refill cost. $H_q^0$ is the archived
+cold HOST anchor. The parameter $\lambda$ is the assumed fully warm latency
+reduction, $\alpha=0.55$ is the assumed fraction of HOST work avoidable by
+scan/filter offload, $\sigma_q$ is an assumed surviving-work fraction,
+$\tau=0.02$ s is request overhead, and $\delta=0.03$ is non-overlapped refill
+contention. Costs are in seconds; all fractions are
+unitless. The $\sigma_q$ values range from 0.02 to 0.98 in the model.
+
+For queries previously placed completely on the CSD, we set
+$\widetilde D_q=A_q^0$. To expose forced-placement risks, we assume
+$\widetilde D_q=1.20H_q^0$ for the two HOST-selected queries and
+$\widetilde D_q=1.25A_q^0$ for the two mixed queries. The multipliers 1.20
+and 1.25 represent forced-placement penalties. The full-system model takes the minimum among HOST, device-with-refill,
+and a retained mixed candidate. The mixed candidate has cost
+$A_q^0(1-\eta\lambda h)(1+\delta)$ with assumed host-sensitive fraction
+$\eta=0.30$; $A_q^0$ is the archived AUTO anchor. This candidate minimum represents the lowest cost among the available
+placements.
+
+The cache reduction factor, operator fractions, and placement penalties
+provide a consistent parameterization of the five configurations. The same
+parameters are used throughout the per-query and suite comparisons.
+```
+
+### 移出片段 2
+
+```latex
+We next model two six-query sequences. The first repeats a Q6-like reduction;
+the second alternates reductions with host-friendly count-style probes.
+Reduction cost uses the archived Q6 HOST/CSD anchors. Probe HOST costs are
+22.538 s cold and 10.818 s warm from the cache experiment; its device cost
+is assumed to be 65\% of cold HOST cost, and Filter-only probe cost is
+assumed to be 80\% of the residency-adjusted HOST cost plus 0.02 s.
+Each successful full host scan warms
+the relevant input, Filter-only warms an assumed 20\%, CSD-only warms none,
+and refill completes the relevant working set before the next request.
+This reuse pattern allows sufficient compute time or inter-query slack for
+refill to complete.
+```
+
+### 移出片段 3
+
+```latex
+The crossover in Figure~\ref{fig:crossover} explains the mixed-sequence
+behavior. With probe device fraction 0.65 and refill overhead 0.03, equality
+occurs at $h=[1-0.65(1+0.03)]/\lambda=0.636$. Here $h$ is resident fraction
+and $\lambda$ is the warm reduction factor defined above. The crossover identifies the point at which the planner can exploit
+refill by selecting the host path.
+```
+
+### 移出片段 4
+
+```latex
+This normalized example assumes Filter-only returns 25\% of input, a complete
+fragment returns 0.1\%, and full refill transfers one input volume. Host-only
+therefore transfers 1.0 input units, Filter-only 0.25, CSD-only 0.001, and the
+two refill configurations 1.001 during the first query plus its refill tail.
+The next forced-HOST probe reads 0, 0.8, 1.0, 0, and 0 input units,
+respectively, under the preceding warming assumptions
+(Figure~\ref{fig:theorytraffic}). Returned-row fraction and cached-page
+fraction are distinct assumptions; neither is inferred from the other.
+The chart includes full refill traffic even when some completes after the
+query result. It demonstrates why both foreground latency and sequence
+completion must be measured.
+```
+
+### 移出片段 5
+
+```latex
+To make the continuation mechanism's resource tradeoff visible, consider
+\begin{equation}
+ P(W)=A+\min(S,W),\qquad I(W)=2\max(0,S-W).
+\label{eq:sortprojection}
+\end{equation}
+Here $W$ is the private Sort work budget, $A=16$ MiB is fixed AFDM capacity,
+$S=256$ MiB is input/run payload size, $P(W)$ is modeled resident algorithm
+memory, and $I(W)$ is total internal spill-write plus replay-read traffic.
+All five quantities are in MiB. The factor 2 counts one write and one read
+of the payload beyond the resident budget. Metadata is ignored in this
+idealized payload model, and extra merge passes increase $I(W)$.
+
+At $W=32$ MiB resident payload plus fixed buffers is 48 MiB, and Sort
+performs 448 MiB of internal spill I/O. At an assumed symmetric bandwidth
+of 1000 MiB/s, that adds 0.448 s of ideal serialized I/O. At $W=128$ MiB,
+these values become 144 MiB, 256 MiB, and 0.256 s
+(Figure~\ref{fig:theorymemory}). The key design property is continued device
+execution through STORE/LOAD reentry, rather than exporting the entire
+intermediate to a host operator. Allocator overhead, fragmentation, request
+latency, and additional passes belong in the final measurements.
+```

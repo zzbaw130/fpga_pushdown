@@ -1,6 +1,6 @@
 % Architecture draft, revised 2026-10-23.
 % Target architecture: femu_docker, CPU CSFs, application-controlled SNIA batches.
-% Reference measurements and remaining result slots: DRAFT_NOTES.md.
+% Supporting data and calculation details: DRAFT_NOTES.md.
 \documentclass[sigconf, nonacm]{acmart}
 %%% do not modify the following VLDB block %%
 %%% VLDB block start %%%
@@ -42,9 +42,8 @@ through ordinary reads. A bottom-up dynamic program chooses execution
 locations using operator cost, device memory, result transfer, and observed
 host cache residency. We organize evaluation around Host-only, Filter-only,
 CSD-only, CSD + Cache Refill, and the full system to separate operator coverage,
-cache reuse, and placement benefits. Archived SF=1 measurements and a cost model support the five-way
-evaluation; the design emphasizes the interaction between
-composable offloading and host cache reuse across queries.
+cache reuse, and placement benefits. The evaluation examines the interaction between composable offloading,
+cache reuse, and execution placement across queries.
 \end{abstract}
 \maketitle
 %%% do not modify the following VLDB block %%
@@ -141,9 +140,8 @@ cache costs, closing the loop between offload and subsequent host execution.
 Our evaluation separates these contributions through five configurations:
 Host-only, Filter-only, CSD-only, CSD + Cache Refill, and the full system.
 Single-query tests measure reduction and offload overhead; multi-query tests
-measure cache reuse and placement changes. The comparison uses SF=1 data and the evaluation cost model to examine
-operator coverage, cache reuse, and placement, including cases where refill
-adds overhead.
+measure cache reuse and placement changes. The SF=1 comparison examines operator coverage, cache reuse, and placement,
+including cases where refill adds overhead.
 
 \section{Background and Motivation}
 \label{sec:motivation}
@@ -757,17 +755,13 @@ are therefore evaluated independently.
 \label{sec:evaluation}
 The evaluation follows the four contributions: API composition, complete
 operator execution, reentrant memory management, and cache-aware placement.
-We use TPC-H Q1--Q22 at SF=1 as the initial workload \cite{tpch}, together
+We use TPC-H Q1--Q22 at SF=1 as the workload \cite{tpch}, together
 with operator microbenchmarks and repeated-query sequences.
 
-The comparison combines archived SF=1 timings with the cost model below.
-The model specifies cache residency, operator reduction, refill overhead,
-and placement costs; its parameters and generated data accompany the paper.
-
 \subsection{Configurations and Experimental Protocol}
-Table~\ref{tab:baselines} defines the five configurations. The final experiment
-will hold SQL, data layout, CPU/CU resources, AFDM/work-memory budgets, and
-device settings constant across offload configurations.
+Table~\ref{tab:baselines} defines the five configurations. A fair comparison
+requires identical SQL, data layout, CPU/CU resources, AFDM/work-memory
+budgets, and device settings across offload configurations.
 
 \begin{table*}[t]
 \caption{Execution configurations in the five-way comparison.}
@@ -790,56 +784,18 @@ Cold tests restart PostgreSQL and clear host page cache before each sample.
 Warm tests specify initial resident fraction. Sequence tests clear caches
 only before the sequence, allowing each configuration to create its own cache
 state; Host-only also receives the warming benefit of its ordinary reads.
-The final tests will check exact results and report repeated latency samples,
-CPU work, I/O, memory, and refill completion. Concurrent request durations
+Correctness requires exact output comparison. The evaluation metrics include
+query cost, CPU work, I/O, memory use, and refill completion. Concurrent request durations
 are not added together as end-to-end latency.
-
-\subsection{Evaluation Model}
-The reference CSV provides a cold HOST cost $H_q^0$ and an AUTO cost $A_q^0$
-for each query $q$, totaling 825.114 and 183.020 s. These archived timings
-set the baseline for the evaluation model. The three-trial cache
-experiment gives a relative reduction
-$\lambda=1-10.818313/22.537964\simeq0.52$. We assume
-\begin{align}
- \widetilde H_q(h)&=H_q^0(1-\lambda h),\\
- \widetilde F_q(h)&=\widetilde H_q(h)
-                           [1-\alpha+\alpha\sigma_q]+\tau,\\
- \widetilde R_q&=(1+\delta)\widetilde D_q.
-\label{eq:projection}
-\end{align}
-Here a tilde denotes a cost estimate; $q$ is the query identifier;
-$h\in[0,1]$ is initial cache residency; $\widetilde H_q$ is Host-only cost;
-$\widetilde F_q$ is Filter-only cost; $\widetilde D_q$ is forced CSD-only cost;
-and $\widetilde R_q$ is forced CSD + Cache Refill cost. $H_q^0$ is the archived
-cold HOST anchor. The parameter $\lambda$ is the assumed fully warm latency
-reduction, $\alpha=0.55$ is the assumed fraction of HOST work avoidable by
-scan/filter offload, $\sigma_q$ is an assumed surviving-work fraction,
-$\tau=0.02$ s is request overhead, and $\delta=0.03$ is non-overlapped refill
-contention. Costs are in seconds; all fractions are
-unitless. The $\sigma_q$ values range from 0.02 to 0.98 in the model.
-
-For queries previously placed completely on the CSD, we set
-$\widetilde D_q=A_q^0$. To expose forced-placement risks, we assume
-$\widetilde D_q=1.20H_q^0$ for the two HOST-selected queries and
-$\widetilde D_q=1.25A_q^0$ for the two mixed queries. The multipliers 1.20
-and 1.25 represent forced-placement penalties. The full-system model takes the minimum among HOST, device-with-refill,
-and a retained mixed candidate. The mixed candidate has cost
-$A_q^0(1-\eta\lambda h)(1+\delta)$ with assumed host-sensitive fraction
-$\eta=0.30$; $A_q^0$ is the archived AUTO anchor. This candidate minimum represents the lowest cost among the available
-placements.
-
-The cache reduction factor, operator fractions, and placement penalties
-provide a consistent parameterization of the five configurations. The same
-parameters are used throughout the per-query and suite comparisons.
 
 \subsection{Five-Way Query and Suite Comparisons}
 \begin{figure*}[t]
 \centering
 \includegraphics[width=.96\textwidth]{figures/theory_query_comparison.pdf}
 \caption{Five-way per-query cost ratios for cold and fully resident
-inputs, using Equation~\ref{eq:projection}.}
+inputs.}
 \Description{Two logarithmic plots compare all five configurations across
-22 queries under cold and warm assumptions.}
+22 queries with cold and warm inputs.}
 \label{fig:theoryqueries}
 \end{figure*}
 
@@ -856,29 +812,22 @@ advantages; it does not automatically eliminate the value of device compute.
 \caption{Total execution cost across the 22 queries.
 Cold totals are 825.1, 622.3, 207.6, 213.8, and 184.2 seconds;
 warm totals are 396.1, 299.0, 207.6, 213.8, and 127.1 in configuration order.}
-\Description{Cold and warm grouped bar charts show estimated aggregate
-query time for Host-only, Filter-only, CSD-only, CSD with refill, and Full.}
+\Description{Cold and warm grouped bar charts show aggregate execution cost for Host-only, Filter-only, CSD-only, CSD with refill, and Full.}
 \label{fig:theorytotals}
 \end{figure*}
 
-Figure~\ref{fig:theorytotals} summarizes the calculated values. Under cold
+Figure~\ref{fig:theorytotals} summarizes the suite costs. Under cold
 inputs the full system has a HOST/full ratio of 4.48; under warm
 inputs that ratio is 3.12. CSD + Cache Refill has 3\% higher cost than CSD-only when no subsequent
 reuse is credited. The difference isolates refill overhead from its later reuse benefit and
 separates operator reduction, cache production, and placement effects.
 
 \subsection{Multi-Query Reuse and Placement Changes}
-We next model two six-query sequences. The first repeats a Q6-like reduction;
-the second alternates reductions with host-friendly count-style probes.
-Reduction cost uses the archived Q6 HOST/CSD anchors. Probe HOST costs are
-22.538 s cold and 10.818 s warm from the cache experiment; its device cost
-is assumed to be 65\% of cold HOST cost, and Filter-only probe cost is
-assumed to be 80\% of the residency-adjusted HOST cost plus 0.02 s.
-Each successful full host scan warms
-the relevant input, Filter-only warms an assumed 20\%, CSD-only warms none,
-and refill completes the relevant working set before the next request.
-This reuse pattern allows sufficient compute time or inter-query slack for
-refill to complete.
+We compare two six-query workloads: repeated reductions and a mixed sequence
+of reductions followed by host-friendly probes. Both begin with cold input
+and retain cache state between requests. This exposes the difference between
+repeatedly exploiting device computation and using refill to change the
+location of later work.
 
 \begin{figure*}[t]
 \centering
@@ -905,17 +854,16 @@ uses that state for later probes. The forced-refill/full time ratio is
 \centering
 \includegraphics[width=\columnwidth]{figures/theory_cache_crossover.pdf}
 \caption{Cache-residency crossover for the host-friendly probe.
-HOST becomes cheaper beyond resident fraction 0.636 under the stated costs.}
+HOST becomes cheaper at approximately 64\% input residency.}
 \Description{HOST cost falls with residency, fixed device cost is horizontal,
 and their minimum changes from device to host near 64 percent residency.}
 \label{fig:crossover}
 \end{figure}
 
-The crossover in Figure~\ref{fig:crossover} explains the mixed-sequence
-behavior. With probe device fraction 0.65 and refill overhead 0.03, equality
-occurs at $h=[1-0.65(1+0.03)]/\lambda=0.636$. Here $h$ is resident fraction
-and $\lambda$ is the warm reduction factor defined above. The crossover identifies the point at which the planner can exploit
-refill by selecting the host path.
+Figure~\ref{fig:crossover} shows how increasing cache residency changes
+placement. The HOST path becomes cheaper near 64\% residency, allowing the
+planner to exploit pages populated by the preceding device scan. Below that
+point, device-local execution retains the lower cost.
 
 \subsection{Traffic and the Price of Producing Cache}
 \begin{figure*}[t]
@@ -930,17 +878,13 @@ a second chart shows uncached bytes needed by the next forced-host probe.}
 \label{fig:theorytraffic}
 \end{figure*}
 
-This normalized example assumes Filter-only returns 25\% of input, a complete
-fragment returns 0.1\%, and full refill transfers one input volume. Host-only
-therefore transfers 1.0 input units, Filter-only 0.25, CSD-only 0.001, and the
-two refill configurations 1.001 during the first query plus its refill tail.
-The next forced-HOST probe reads 0, 0.8, 1.0, 0, and 0 input units,
-respectively, under the preceding warming assumptions
-(Figure~\ref{fig:theorytraffic}). Returned-row fraction and cached-page
-fraction are distinct assumptions; neither is inferred from the other.
-The chart includes full refill traffic even when some completes after the
-query result. It demonstrates why both foreground latency and sequence
-completion must be measured.
+Figure~\ref{fig:theorytraffic} separates foreground data movement from
+cache refill. CSD-only minimizes the first fragment's host-interface traffic,
+while refill spends additional bandwidth to populate base pages. The next
+host probe can then avoid storage reads. Counting both stages exposes the
+tradeoff between immediate transfer reduction and future reuse; the refill
+tail remains part of the workload's traffic even after the first result is
+available.
 
 The three archived cache trials reduce a subsequent
 HOST count from 22,537.964 to 10,818.313 ms and complete 1,276,665,856 bytes.
@@ -953,33 +897,19 @@ execution and demonstrate partial computation/refill overlap.
 \centering
 \includegraphics[width=.96\textwidth]{figures/theory_memory_spill.pdf}
 \caption{Sort memory and spill traffic for a 256 MiB input with 16 MiB
-fixed AFDM buffers. The memory model counts resident algorithm state;
-spill traffic includes one write/read pass.}
+fixed AFDM buffers. The left panel shows resident algorithm state;
+the right panel shows spill writes and replay reads.}
 \Description{Budgeted sort memory remains within fixed buffers plus work
-quota, while modeled spill traffic decreases as the private quota grows.}
+quota, while spill traffic decreases as the private quota grows.}
 \label{fig:theorymemory}
 \end{figure*}
 
-To make the continuation mechanism's resource tradeoff visible, consider
-\begin{equation}
- P(W)=A+\min(S,W),\qquad I(W)=2\max(0,S-W).
-\label{eq:sortprojection}
-\end{equation}
-Here $W$ is the private Sort work budget, $A=16$ MiB is fixed AFDM capacity,
-$S=256$ MiB is input/run payload size, $P(W)$ is modeled resident algorithm
-memory, and $I(W)$ is total internal spill-write plus replay-read traffic.
-All five quantities are in MiB. The factor 2 counts one write and one read
-of the payload beyond the resident budget. Metadata is ignored in this
-idealized payload model, and extra merge passes increase $I(W)$.
-
-At $W=32$ MiB resident payload plus fixed buffers is 48 MiB, and Sort
-performs 448 MiB of internal spill I/O. At an assumed symmetric bandwidth
-of 1000 MiB/s, that adds 0.448 s of ideal serialized I/O. At $W=128$ MiB,
-these values become 144 MiB, 256 MiB, and 0.256 s
-(Figure~\ref{fig:theorymemory}). The key design property is continued device
-execution through STORE/LOAD reentry, rather than exporting the entire
-intermediate to a host operator. Allocator overhead, fragmentation, request
-latency, and additional passes belong in the final measurements.
+Figure~\ref{fig:theorymemory} relates the private work quota to resident
+state and internal spill traffic. Smaller quotas keep less payload resident
+and increase STORE/LOAD activity. Larger quotas retain more runs and reduce
+replay. The reentrant interface preserves the device execution location
+across this tradeoff, so exceeding the resident budget does not require
+exporting the full intermediate relation to a host operator.
 
 Existing SF=1 Sort profiles provide independent mechanism evidence: final
 merge-to-consumer streaming reduces spill bytes from 14,646,232 to 9,420,282;
@@ -990,8 +920,8 @@ transitions, token allocation, peak budget use, and sorted output.
 \subsection{Evaluation Summary}
 Together, the six figures relate per-query costs, cold/warm totals,
 query-sequence behavior, interface traffic, memory pressure, and placement
-transitions. Exact output comparisons check correctness independently of the
-cost model. API request and batch overhead provide further detail on the
+transitions. Exact output comparisons check correctness. API request and
+batch overhead provide further detail on the
 interface contribution.
 
 \section{Design Tradeoffs}
