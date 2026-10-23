@@ -1,26 +1,26 @@
-% Original diagram reconstructed from this repository's control/data paths.
+% CPU architecture: application owns the graph; library schedules dependencies.
 \begin{tikzpicture}[font=\small, >=Latex,
  box/.style={draw, rounded corners=2pt, align=center, minimum height=10mm},
  host/.style={box, fill=blue!6}, device/.style={box, fill=orange!9},
  flow/.style={->, thick}, hint/.style={->, dashed, thick, teal!70!black}]
-\node[host, text width=34mm] (pg) at (0,2.0) {PostgreSQL 12\\HOST paths + CSD frontier};
-\node[host, text width=34mm] (exec) at (0,0.4) {CustomScan executor\\ABI-v8 plan + FIEMAP};
-\node[host, text width=34mm] (cache) at (0,-1.4) {Linux heap inode cache\\AER worker + readahead};
-\node[device, text width=43mm] (runtime) at (5,2.0) {CEMU program runtime\\DAG / pipeline scheduler};
-\node[device, text width=43mm] (ops) at (5,0.4) {Scan / Filter / Project\\Join / Aggregate / Sort};
-\node[device, text width=43mm] (fdm) at (5,-1.4) {4 GiB modeled FDM\\windows, FIFOs, arena, staging};
-\node[device, text width=34mm] (flash) at (10,0.4) {NVM namespace\\heap + query-local spill};
-\node[device, text width=34mm] (log) at (10,-1.4) {Vendor log 0xC0\\64-entry range ring};
-\draw[flow] (pg) -- (exec);
-\draw[flow] (exec.east) -- node[above, sloped, font=\scriptsize]{NVMe Program Execute} (runtime.west);
-\draw[flow] (runtime) -- (ops);
-\draw[flow, <->] (ops) -- (fdm);
-\draw[flow, <->] (ops) -- node[above, font=\scriptsize]{base / spill I/O} (flash);
-\draw[flow] (ops.west) -- node[below, font=\scriptsize]{result + status} (exec.east);
-\draw[hint] (ops.south east) -- (log.north west);
-\draw[hint] (log.south) -- ++(0,-.55) -| node[pos=.26, below, font=\scriptsize]{AER notice; driver fetches range metadata} (cache.south);
-\draw[flow] (cache.west) -- ++(-.65,0) |- node[pos=.7, left, font=\scriptsize]{residency} (pg.west);
-\draw[hint] (cache.north east) -- node[below, sloped, font=\scriptsize]{ordinary reads populate inode cache} (flash.south west);
-\node[draw, dashed, fit=(pg)(exec)(cache), inner sep=5mm, label=above:{Database host (CEMU guest)}] {};
-\node[draw, dashed, fit=(runtime)(ops)(fdm)(flash)(log), inner sep=5mm, label=above:{Emulated computational storage device}] {};
+\node[host,text width=38mm] (planner) at (0,3.0) {PostgreSQL planner\\node-level HOST/CSD choices};
+\node[host,text width=38mm] (app) at (0,1.4) {Application orchestrator\\operators, buffers, dependencies};
+\node[host,text width=38mm] (snia) at (0,-.2) {SNIA library + FEMU plugin\\handles, batches, NVMe mapping};
+\node[host,text width=38mm] (cache) at (0,-2.0) {Linux heap inode cache\\range worker + ordinary reads};
+\node[device,text width=42mm] (cu) at (6,2.3) {Device CPU compute units\\Scan / Filter / Join / Agg / Sort};
+\node[device,text width=42mm] (memory) at (6,.4) {AFDM: input / output batches\\shared private work memory};
+\node[device,text width=42mm] (nvm) at (6,-1.5) {NVM namespace\\heap / index / spill extents};
+\node[device,text width=28mm] (log) at (10,-1.5) {AER + range log\\completed scan hints};
+\draw[flow] (planner) -- (app);
+\draw[flow] (app) -- (snia);
+\draw[flow] (snia.east) -- node[above,sloped,font=\scriptsize]{individual I/O / compute requests} (cu.west);
+\draw[flow, <->] (cu) -- (memory);
+\draw[flow, <->] (memory) -- node[right,font=\scriptsize]{internal LOAD / STORE} (nvm);
+\draw[flow] (cu.north) -- ++(0,.8) -| node[pos=.3,above,font=\scriptsize]{completion events / final result batches} (app.north east);
+\draw[hint] (cu.east) -| (log.north);
+\draw[hint] (log.south) -- ++(0,-1.2) -| node[pos=.28,below,font=\scriptsize]{notice then fetch range metadata} (cache.south);
+\draw[hint] (cache.east) -- node[below,sloped,font=\scriptsize]{refill through ordinary inode reads} (nvm.west);
+\draw[hint] (cache.west) -- ++(-.9,0) |- node[pos=.7,left,font=\scriptsize]{observed residency} (planner.west);
+\node[draw,dashed,fit=(planner)(app)(snia)(cache),inner sep=5mm,label=above:{Host application and operating system}] {};
+\node[draw,dashed,fit=(cu)(memory)(nvm)(log),inner sep=5mm,label=above:{CPU-based computational storage device}] {};
 \end{tikzpicture}

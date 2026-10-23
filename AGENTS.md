@@ -5,13 +5,15 @@
 工程接续，也为论文的系统设计、实现和实验章节保留可追溯事实。不要把尚未验证的
 设计写成已实现结论。
 
-2026-10-23 论文初稿：`paper/main.tex` 按设备 SQL 执行、AER 回填、缓存感知节点级
-位置选择组织英文初稿；`paper/DRAFT_NOTES.md` 保存代码/实验来源、版本边界和待补实验。
-架构/时序采用 `paper/figures/*.tex` 的原创 TikZ 图，实验图由
-`paper/plot_results.py` 从既有 SF=1 CSV 和验证报告再生成。仅核查源码与已有数值，
-未运行新的数据库实验，未编译论文。AUTO 的 4.5083 比值属于历史 TCG guest + 参数化
-设备模型，不是原生 CPU/真实 FPGA 加速比；后续 spill/streaming 定向结果不可与该轮
-合并为同一版本性能。尚无完整 SNIA API 符合性证据，正文不宣称标准全面通过。
+2026-10-23 论文架构初稿及修订：用户明确指定最终源码以同级 `femu_docker` 为基础，
+计算单元改为 CPU，应用通过 SNIA API 编排；`paper/main.tex` 已按标准接口、完整 CPU
+算子链、AER 回填、缓存感知节点级规划四项贡献重写，用于指导后续实现。架构/时序图
+不再描述本仓库 FPGA 风格 runtime。实验定义 Host-only、Filter-only、CSD-only、
+CSD + Cache Refill、Full system 五组，未测单元留空。现有 SF=1 数字只作为 preliminary
+reference，不能自动视为新版 CPU/SNIA 系统的实测结果。原始数据不修改。
+`paper/DRAFT_NOTES.md` 保存跨项目源码入口、数据来源和待填实验；实验图由
+`paper/plot_results.py` 再生成。仅核查源码与已有数值，未运行新实验、未编译论文。
+本段仅描述论文方向，下面各节仍记录当前 FPGA Pushdown 代码的已验证事实。
 
 ## 1. 研究目标与三项贡献
 

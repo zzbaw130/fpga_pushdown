@@ -1,4 +1,4 @@
-"""Regenerate draft figures from archived SF=1 evidence; no experiments run."""
+"""Generate preliminary reference figures, not final CPU/SNIA measurements."""
 from pathlib import Path
 import csv
 import math
@@ -29,7 +29,7 @@ for placement in colors:
     ax.bar([i + 1 for i in subset], [speedups[i] for i in subset],
            color=colors[placement], label=placement, width=.72)
 ax.axhline(1, color="black", lw=.8, ls="--")
-ax.set(yscale="log", ylabel="TCG guest HOST / AUTO time", xlabel="TPC-H query (SF=1)",
+ax.set(yscale="log", ylabel="Reference HOST / AUTO time", xlabel="TPC-H query (SF=1)",
        xticks=list(range(1, 23)), ylim=(.65, 65))
 ax.set_yticks([1, 2, 5, 10, 20, 50], labels=["1", "2", "5", "10", "20", "50"])
 ax.legend(ncol=3, frameon=False, loc="upper right")
