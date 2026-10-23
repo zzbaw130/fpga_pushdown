@@ -1,0 +1,830 @@
+% First draft, 2026-10-23. Evidence and revision notes: DRAFT_NOTES.md.
+% Historical experiments use different versioned kernels; do not pool them.
+\documentclass[sigconf, nonacm]{acmart}
+
+%%% do not modify the following VLDB block %%
+%%% VLDB block start %%%
+\usepackage{pvldb}
+%%% VLDB block end %%%
+
+\usepackage{amsmath}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,calc}
+\renewcommand\vldbdoi{XX.XX/XXX.XX}
+\renewcommand\vldbpages{XXX-XXX}
+\renewcommand\vldbavailabilityurl{}
+\newcommand{\sys}{\textsc{FPGA Pushdown}}
+\newcommand{\host}{\mathsf{H}}
+\newcommand{\csd}{\mathsf{D}}
+
+\begin{document}
+\title{Cache-Aware SQL Plan Offloading to Computational Storage}
+% Replace with actual authors and affiliations before submission.
+\author{Anonymous Author(s)}
+\renewcommand{\shortauthors}{Anonymous Author(s)}
+
+\begin{abstract}
+Computational storage can reduce host--storage data movement by executing
+relational operators near persistent data. Two obstacles complicate its
+integration with a database: intermediate state can exceed device memory,
+and a device scan bypasses the host cache that would otherwise benefit later
+queries. We present \sys{}, a PostgreSQL 12 extension and CEMU-based prototype
+that couples SQL plan execution, asynchronous cache population, and execution
+placement. A versioned plan interface lowers the operators and expressions
+needed by all 22 TPC-H queries into device-side pipelines, with Flash replay
+for oversized joins, aggregates, and sorts. Vendor-specific NVMe asynchronous
+events identify scanned ranges; ordinary host reads populate the corresponding
+heap-file page cache. A bottom-up, node-granularity placement search compares
+HOST and CSD alternatives using measured cache residency, separate latency and
+capacity estimates, and a one-way CSD-to-HOST transition rule. At SF=1, all
+22 queries match PostgreSQL results. An archived cold-cache run yields an
+aggregate HOST/AUTO time ratio of 4.508 under TCG and the parameterized device
+model. Separate experiments show a 2.083-fold improvement for a subsequent
+HOST scan after complete cache population and 128 MiB populated during a
+1.218-second modeled command window. These are prototype and model results;
+we distinguish them from physical FPGA performance and identify the remaining
+memory and consistency limitations.
+\end{abstract}
+
+\maketitle
+%%% do not modify the following VLDB block %%
+%%% VLDB block start %%%
+\vldbtopmatter
+%%% VLDB block end %%%
+
+\section{Introduction}
+Database query execution repeatedly moves data from storage to host memory
+before applying selection, joins, aggregation, and ordering. Computational
+storage devices (CSDs) offer another placement: execute a relational fragment
+beside its input and return its output. This can avoid transferring discarded
+rows and large intermediate relations across the host interface. The benefit,
+however, depends on more than the acceleration of an isolated operator.
+
+First, SQL plans mix streaming and blocking computation. A filter can consume
+one batch at a time, while a join build, grouped aggregate, or sort can require
+state larger than device memory. Supporting a complete analytical query
+therefore requires a common execution interface, explicit memory admission,
+and an out-of-core path. Second, device-local scans do not automatically
+populate the host's file cache. A query that saves transfer now may leave the
+next host query reading the same relation from storage again. Third, after
+both execution paths exist, placement depends on cached input, intermediate
+cardinality, output capacity, and the point where results return to the host.
+A query-wide offload switch cannot express all these choices.
+
+We address these issues through one system design. \sys{} integrates a
+PostgreSQL planner/executor extension with a device-side SQL runtime in CEMU,
+a full-system computational-storage emulator built on FEMU/QEMU
+\cite{cemu,femu}. PostgreSQL sends a self-contained binary plan through NVMe
+Program Execute. The runtime schedules a plan DAG, decodes raw heap pages,
+and executes relational operators using FPGA-style dataflow models. Reusable
+scan windows, alternating tuple FIFOs, operator-state leases, and query-local
+Flash spill separate input movement from blocking state management.
+
+The system also exposes scanned ranges as cache opportunities. A vendor
+NVMe asynchronous event request (AER) completion prompts the host driver to
+fetch a range log and issue ordinary reads against registered heap inodes.
+The notification carries no table payload. This allows the host to populate
+its file cache while a modeled device command remains outstanding. At the
+next planning decision, actual file-cache residency reduces HOST scan cost.
+The feedback is therefore explicit: device scan, range notification, host
+cache population, residency observation, and placement choice.
+
+Our contributions are three cooperating mechanisms:
+\begin{enumerate}
+\item A device SQL execution layer covering the operator and expression
+families required by TPC-H Q1--Q22, with a versioned plan ABI, pipeline
+scheduling, and memory-accounted Flash replay paths.
+\item An AER-based cache-population protocol that maps device scan ranges
+back to PostgreSQL heap inodes, tracks actual read completion, and permits
+population during the modeled command window.
+\item A cache-aware, bottom-up placement search with node-level choices,
+a private Pareto frontier of device candidates, and separate cardinalities
+for expected cost and resource admission.
+\end{enumerate}
+
+The computational-storage interface is an enabling foundation for these
+mechanisms. We describe the implemented program-loading, memory-range-set,
+and execution operations, while leaving full SNIA API conformance to a
+separate validation task. Likewise, coverage of the 22 query templates does
+not imply support for arbitrary SQL, UDFs, or transactional MVCC execution.
+
+We evaluate existing SF=1 evidence at three levels: exact query results,
+end-to-end placement under a parameterized device model, and directed
+cache/spill experiments. The cold-cache AUTO run selects 18 complete CSD
+plans, two mixed plans, and two HOST plans, with 22/22 exact answers. We report
+an aggregate guest-time ratio of 4.508 relative to the TCG HOST path, rather
+than presenting it as measured FPGA acceleration. Separate cache experiments
+and low-memory operator profiles isolate the mechanisms behind the design.
+
+\section{Background and Design Requirements}
+\label{sec:background}
+\subsection{Computational Storage Interface}
+SNIA's Computational Storage API specifies an application-facing abstraction
+whose implementation maps calls to a device-specific interface \cite{snia}.
+Our execution path uses CEMU's compute and memory namespaces: a shared-library
+program is loaded, FDM ranges are assembled into a memory range set (MRS),
+and NVMe Program Execute invokes the SQL entry point. The PostgreSQL
+extension supplies a custom, versioned SQL plan above this transport.
+These operations establish the interface used in this paper; a complete
+mapping and test suite for every mandatory SNIA API operation are outside
+the evidence available for this draft.
+
+FDMFS represents finite device memory, not unlimited secondary storage.
+A separate NVM namespace contains PostgreSQL heap files and query-local
+spill extents. Although CEMU implements its NVM backend in host DRAM, the
+SQL runtime accesses this namespace through its device services and charges
+Flash traffic to the device-time model. This distinction separates emulation
+implementation from the modeled storage hierarchy.
+
+\subsection{SQL Semantics and Scope}
+PostgreSQL heap pages contain line pointers, tuple headers, NULL bitmaps,
+alignment, and variable-length attributes \cite{pgstorage}. Direct device
+execution must interpret these structures consistently with the host and
+retain decimal scale, NULL semantics, grouping keys, and output schemas.
+A plan interface cannot safely transmit PostgreSQL process pointers or assume
+that every physically stored tuple is visible to a query.
+
+The prototype targets static analytical relations under a proven
+frozen/all-visible scan contract. It rejects unsupported page/value formats,
+external or compressed TOAST values, unsupported collations and functions,
+and numeric values outside its supported representation. It does not perform
+general transaction visibility checks. Subqueries are rewritten into joins
+and aggregate branches where semantic conditions permit; otherwise the
+planner must retain a supported host alternative or reject forced offload.
+
+\subsection{Placement and Cache Interaction}
+A cold input scan may favor execution near storage. A cached input can favor
+HOST execution because storage reads have already been avoided. In addition,
+a large device output can make partial offload unattractive even when the
+device operators themselves are inexpensive. Placement must account for
+these effects at the point where a device fragment materializes for HOST.
+
+Our design imposes one transition direction along each dataflow path:
+CSD may feed HOST, but HOST intermediates are never uploaded to CSD.
+This admits an individual device node when its dependencies are already
+device-resident, a connected device subtree, or an entire device plan.
+It does not allow an arbitrary upper node to offload above a HOST child.
+Different branches may each have a device-to-host boundary.
+
+\section{System Overview}
+\label{sec:overview}
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{\input{figures/architecture.tex}}
+\caption{Implemented architecture. Solid arrows denote plan, result, or I/O
+paths; dashed arrows denote cache hints and the reads they trigger. Ordinary
+reads, rather than AER payloads, populate the heap inode cache. Device execution
+and cache population form a feedback loop through observed host residency.}
+\Description{PostgreSQL sends a binary plan to CEMU, whose operators access
+finite device memory and NVM. A range log triggers host readahead, and observed
+cache residency feeds the PostgreSQL planner.}
+\label{fig:architecture}
+\end{figure*}
+
+Figure~\ref{fig:architecture} separates the PostgreSQL host, Linux cache
+worker, and emulated device. The extension installs hooks for base, join,
+and upper relations. PostgreSQL maintains ordinary HOST paths; the extension
+also maintains device-resident alternatives. The selected device fragment
+becomes a CustomScan backed by recursive operator metadata.
+
+Before execution, the extension obtains main-fork physical extents using
+FIEMAP, allocates FDM reservations, prepares the result/status ranges, and
+creates a query-local spill file when enabled. It registers heap segment
+file descriptors for cache population. The plan blob is staged in an MRS
+range; Program Execute carries its exact byte count and range index in two
+command parameters. This avoids the metadata-field overlap in the underlying
+passthrough command layout.
+
+The device entry point, \texttt{csd\_sql}, validates the ABI and dependencies,
+executes the plan DAG, and writes typed result cells and execution status.
+PostgreSQL checks status before decoding results. Scalar InitPlans may use
+separate commands; a PostgreSQL top-level Limit can remain as orchestration.
+Thus complete relational offload need not imply exactly one command per SQL
+script or the absence of all host control nodes.
+
+The implementation spans four components: the PostgreSQL extension, the C++
+SQL runtime, CEMU controller/runtime changes, and Linux NVMe/FDMFS changes.
+It uses CEMU's TCG plus VM-Freeze mechanism. Guest-built PostgreSQL runs on
+a cluster staged once onto the emulated NVMe namespace. The shared source
+filesystem is used for development and initial staging, outside the query's
+data path.
+
+\section{Device SQL Execution with Limited Memory}
+\label{sec:execution}
+\subsection{Plan ABI and Expression Execution}
+ABI v8 contains a header, fixed-size node table, expression and operator
+descriptors, and physical NVM extents. Nodes identify dependencies, schemas,
+work budgets, and blocking/spill behavior. Serialized offsets and range
+indices replace process addresses. Lengths, version, operator counts, and
+access ranges are checked before use.
+
+Filter, projection, join residuals, HAVING, and post-aggregate arithmetic use
+a shared bounded postfix expression VM. Instructions cover comparisons,
+fixed-point arithmetic, SQL three-valued Boolean logic, NULL tests, LIKE,
+CASE selection, substring, and year extraction. BETWEEN and constant-array
+IN expand into comparisons; PostgreSQL folds constant date arithmetic.
+The VM has no arbitrary calls, jumps, or indirect access. Decimal cells carry
+an \texttt{int64} coefficient and scale, and overflow or division by zero
+produces an explicit failure. Multiplication removes only lossless decimal
+trailing zeros before its final representability check.
+
+Table~\ref{tab:coverage} summarizes execution coverage. Index access and merge
+join canonicalization preserve semantics but do not preserve their original
+access algorithms. A general nested loop remains a counted software fallback,
+not a claimed fixed-throughput FPGA primitive.
+
+\begin{table}[t]
+\caption{Operator families and device implementation.}
+\label{tab:coverage}
+\small
+\begin{tabular}{@{}p{.31\columnwidth}p{.63\columnwidth}@{}}
+\toprule
+Plan family & Implemented behavior \\
+\midrule
+Scan / index / bitmap & Raw heap decode; index forms canonicalize to scan + predicate \\
+Filter / Project & Bounded vector expression VM and valid-lane compaction \\
+Join & Multi-key hash INNER/LEFT/SEMI/ANTI with residuals; equality merge joins canonicalize \\
+Aggregate & SUM/COUNT/MIN/MAX/AVG; multi-key groups and grouped DISTINCT \\
+Sort / Limit & Stable external merge; exact SQL LIMIT + OFFSET Top-N bound \\
+Subplan / Materialize & DAG dependencies and explicit materialization barriers \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Lowering also preserves the physical result schema. Sort retains its input
+layout, so an order-preserving Project after Sort trims and reorders internal
+join columns into the exact PostgreSQL target layout. Without this boundary,
+a correctly sorted result can still be decoded using the wrong type.
+
+Two subquery rewrites illustrate the semantic discipline. A correlated scalar
+MIN becomes a grouped aggregate plus keyed join. NOT IN becomes an anti-join
+only when both compared columns are proven NOT NULL; otherwise SQL UNKNOWN
+would be lost. Independent scalar InitPlan values use explicit relocations,
+which must be patched before execution. An unpatched value is an error rather
+than an implicit NULL.
+
+\subsection{Pipelines, Parallelism, and Reservations}
+Compatible Scan--Filter--Project chains form streaming pipelines; joins,
+aggregates, sorts, and materialization create state or dependency boundaries.
+A scan reads physical extents through a reusable 32 MiB window. Decoded
+rows cross two alternating capacity-limited tuple FIFOs, splitting a window
+into multiple batches when necessary. Eligible consumers process each batch
+without retaining a complete Scan result.
+
+The functional model expresses three forms of parallelism: page decode tasks,
+tuple lanes derived from a 1024-bit binding word and attribute count, and
+independent ready DAG branches. A shared query budget caps replicated workers
+at 32 and prevents nested worker pools from multiplying resources. These
+threads describe functional parallel work. They are not synthesized lanes,
+and the current timing model does not establish a calibrated 32-lane speedup.
+
+Let $M_{\mathrm{FDM}}$ be configured device memory. The actual operator arena
+is the page-aligned remainder after all other reservations:
+\begin{equation}
+M_{\mathrm{op}} = M_{\mathrm{FDM}} -
+ (M_{\mathrm{scan}}+2M_{\mathrm{FIFO}}+M_{\mathrm{out}}+
+  M_{\mathrm{stage}}+M_{\mathrm{plan/status}}).
+\label{eq:memory}
+\end{equation}
+Here $M_{\mathrm{scan}}$ includes the scan windows reserved by the plan.
+Blocking state acquires query-scoped leases; a configurable cap can reduce
+$M_{\mathrm{op}}$ for experiments. Flash spill capacity is a separate budget.
+The reusable spill staging window is charged to FDM, while the spill file
+itself is charged to NVM. A consumed Flash extent returns to a coalescing free
+list for reuse. Concurrent replay waits for an otherwise sufficient lease
+held by another branch instead of reporting a false capacity failure.
+
+\subsection{Sort: Runs, Merge, and Top-N}
+A sole-consumer Scan--Filter/Project--Sort pipeline charges incoming rows to
+its current run. If the lease cannot grow, it sorts and writes the run to
+Flash, then releases the run's state. Resident run descriptors retain handles
+and maximum serialized row widths rather than full sorted relations.
+
+Merge cursors decode row-complete chunks. For fan-in $k$, each cursor receives
+a nominal chunk of $M_{\mathrm{stage}}/(8k)$; a conservative fourfold reserve
+across cursors occupies at most half the stage, leaving the other half for
+an intermediate writer. The implementation chooses a feasible fan-in from
+3 to 128, retaining a two-way fallback for wide rows. Equal keys use original
+run order as a stable tie-break. Intermediate merges write their next run
+incrementally, while the last merge emits directly into the separately
+admitted result boundary.
+
+For a finite SQL LIMIT $L$ and OFFSET $O$, every run and merge retains at most
+$L+O$ rows, and the downstream Limit skips $O$. OFFSET-only sorting remains
+unbounded. The planner may not substitute a cardinality estimate for an
+unresolved SQL limit. This preserves query semantics while avoiding Flash
+traffic for discarded tails.
+
+\subsection{Join: Partitioning and Bounded Replay}
+A resident build is leased once and reused across FIFO probe batches. If the
+build exceeds the arena, power-of-two radix partitioning uses the complete
+canonical join key, and corresponding build/probe partitions are written to
+Flash. Eligible oversized Scan build inputs also partition directly from
+batches. Other subtree shapes can still require input materialization.
+Actual partition bytes govern further repartitioning when the initial
+fan-out is insufficient.
+
+A two-pass selection writer serializes descriptors and payload directly
+from source ordinals. Streamed partition records link through 40-byte Flash
+nodes; each partition retains a 16-byte tail/count payload. Replay restores
+one build partition under a lease and consumes its probe records in
+staging-bounded chunks. NULL keys, residual predicates, and unmatched rows
+follow the selected INNER, LEFT, SEMI, or ANTI semantics. An unsplittable
+oversized group of join keys fails explicitly.
+
+A hidden global probe ordinal supports deterministic output reconstruction.
+Probe matches emit one row at a time into a bounded buffer, which forms
+ordered Flash runs. Binary-carry merging retains at most one run per merge
+level, reducing resident handle payload to $O(\log R)$ for $R$ leaf runs.
+Partition metadata is $O(P)$ for $P$ partitions. Large probes can replay in
+waves before the entire probe fills the spill area, retaining build
+partitions and global ordinals across waves.
+
+When a partitioned Join's sole downstream chain ends in a non-DISTINCT
+Aggregate, final ordered chunks update that aggregate directly. Other
+supported chains can feed another Join without restoring a complete visible
+Join result. These paths remove specific large intermediates; they do not
+make every possible plan shape streaming.
+
+\subsection{Aggregate: Admission and Recursive Replay}
+A non-DISTINCT global aggregate has fixed-size state and consumes scan
+batches directly. A grouped aggregate uses the resident streaming path only
+when its conservative capacity estimate, including additional hash-state
+allowance, fits the arena. Eligible oversized grouped inputs instead write
+full-group-key radix chains and replay partitions individually. Every group
+stays within one partition, preserving AVG sum/count and grouped DISTINCT
+semantics without combining inconsistent partial groups.
+
+New groups and DISTINCT entries are charged before insertion. On overflow,
+partial state is released and the intact input is repartitioned using higher
+hash bits. A Join-fed aggregate can reread the final Flash run and partition
+its bounded chunks directly, avoiding restoration of the entire Join output.
+Single-group state larger than the arena is rejected. Global large DISTINCT
+and several uncertain input shapes retain compatibility paths.
+
+\paragraph{Physical-memory boundary.}
+Arena leases and measured batch peaks are accounting mechanisms. Cursor
+chunks, hash tables, and other state still use ordinary STL allocations,
+and some final outputs or compatibility paths retain complete batches.
+Consequently, the prototype does not prove a strict end-to-end physical
+controller-memory bound. The supported low-memory paths and their individual
+budgets are the claims evaluated here.
+
+\section{AER-Based Host Cache Population}
+\label{sec:cache}
+\subsection{Range Notification and Inode Reads}
+After reading a scan chunk, the runtime calls a notification callback.
+CEMU records namespace, physical offset, relation OID, logical offset, length,
+sequence number, and plan generation in vendor log page \texttt{0xC0}.
+A 64-entry ring coalesces adjacent logical ranges for the same relation and
+generation; on overflow it overwrites the oldest hint and counts the loss.
+A pending vendor AER completes when a notification is available. The Linux
+NVMe driver then reads the log and dispatches its cache worker.
+
+Before Program Execute, PostgreSQL begins a generation and registers each
+main-fork segment's file descriptor, relation OID, logical base, and length.
+The driver holds references to the files. This mapping matters: reading the
+same physical LBA through a block-device inode would not populate the heap
+inode's file cache. The worker resolves each logical range to the registered
+heap segment and issues file readahead.
+
+Linux limits each WILLNEED request by the backing device's readahead window.
+The worker submits these smaller requests in 32 MiB pipeline groups and
+checks that the corresponding folios become Uptodate. It avoids copying every
+byte through a temporary kernel buffer; a missed page under memory pressure
+can use a page-read fallback. Completed bytes, rather than requested bytes,
+are counted as cache population.
+
+A final event closes a plan generation after preceding range entries have
+been processed. Normal queries use asynchronous population with zero wait.
+An optional completion barrier makes cache experiments reproducible. Errors
+or dropped hints reduce cache opportunities and do not invalidate a correct
+SQL result. Generation checks filter stale plan events; concurrent truncate,
+rewrite, and drop require stronger lifecycle protection than this prototype
+provides.
+
+\subsection{What Overlap Means in CEMU}
+\begin{figure*}[t]
+\centering
+\input{figures/timeline.tex}
+\caption{Two timing domains in the prototype. Functional C++ execution runs
+while the guest clock is frozen. After guest resumption, the command remains
+outstanding for the modeled device delay; the Linux cache worker can complete
+ordinary reads during that interval. Remaining cache population can outlive
+the query unless an explicit experimental barrier waits for it.}
+\Description{A timeline distinguishes frozen functional execution, modeled
+outstanding command delay, overlapping cache reads, and cache reads after
+command completion.}
+\label{fig:timeline}
+\end{figure*}
+
+The functional kernel runs while the guest is frozen. Guest Linux cannot
+execute cache work during that period. Once the kernel returns, CEMU resumes
+the guest but delays Program Execute completion using modeled FPGA cycles
+and Flash bytes (Figure~\ref{fig:timeline}). The worker may run in this
+outstanding interval. A control setting instead defers the same worker until
+command completion, providing an overlap-disabled baseline.
+
+Thus the experiment demonstrates completed host reads concurrent with a
+modeled command window. It does not demonstrate simultaneous physical FPGA
+execution and PCIe traffic. It also does not transfer scanned bytes directly
+into host cache: population performs additional ordinary reads, consuming
+storage and interface resources. Reusing spare bandwidth is the opportunity;
+contention, eviction, and priority control remain important for deployment.
+
+\section{Cache-Aware Execution Placement}
+\label{sec:placement}
+\subsection{Legal States and Cost Recurrence}
+For an operator $v$, let $D(v)$ represent device-resident candidates and
+$H(v)$ represent host-executable candidates. Device parents accept only device
+children; host parents accept host children or a materialized device result.
+The legal transitions are $\csd\!\rightarrow\!\csd$,
+$\csd\!\rightarrow\!\host$, and $\host\!\rightarrow\!\host$.
+For a fixed physical alternative, the recurrence can be written as
+\begin{align}
+D(v) &= \ell_D(v)+\sum_{u\in\mathrm{child}(v)}D(u),\\
+X(v) &= D(v)+s+\beta\widehat{B}_{v},\\
+H(v) &= \ell_H(v)+\sum_{u\in\mathrm{child}(v)}
+                     \min\{H(u),X(u)\},\\
+C_{\mathrm{root}} &= \min\{H(v),X(v)\}.
+\label{eq:dp}
+\end{align}
+Here $X$ is a device-to-host boundary, $s$ is setup cost, $\widehat{B}$ is
+expected serialized result size, and $\beta$ is return-byte cost. The actual
+planner enumerates alternatives and preserves ordering and semantic
+properties; the scalar notation only expresses legal transitions.
+An invalid or oversized boundary receives a prohibitive cost.
+
+Internal device edges do not pay setup and result return repeatedly. Device
+scan cost combines pages and decoded tuples; join and aggregate cost combine
+child costs, processed tuples, and estimated spill; sort adds a comparison
+term proportional to $n\log_2 n$ and spill. These are PostgreSQL optimizer
+cost units, distinct from the nanosecond device model used by CEMU.
+
+For relation $r$, the default cache estimator uses \texttt{mincore} on every
+heap segment to obtain resident fraction $h_r$. A deterministic override in
+$[0,1]$ supports experiments. The HOST sequential-page component becomes
+\begin{equation}
+C_{\mathrm{scan,IO}}(r)=p_r\big[(1-h_r)c_{\mathrm{disk}}
+                                    +h_r c_{\mathrm{cache}}\big].
+\end{equation}
+The implementation adjusts ordinary sequential and partial sequential paths
+and retains their CPU/startup components. Cache savings are charged once to
+HOST, without an additional cache penalty on CSD. File-cache residency is an
+observation at planning time, not a promise that pages remain resident.
+
+\subsection{Frontiers and Capacity Admission}
+PostgreSQL's ordinary local path pruning may discard a device fragment that
+would become attractive after a later aggregate reduces its output. The
+extension therefore retains a private CSD frontier per relation. Join
+planning enumerates pairs from the child frontiers; upper operators examine
+all surviving inputs. Comparable candidates must agree on pathkeys,
+unresolved-subplan state, selectivity risk, scan count, and expected rows.
+Within this equivalence class, a candidate dominates another only when device
+cost, resource-bound rows, and resource-bound bytes are all no larger.
+This avoids pruning solely by local device cost, while reducing duplicate
+candidate growth. It does not establish global optimality over all possible
+SQL transformations or unconstrained placements.
+
+Expected PostgreSQL/ANALYZE cardinalities drive latency costs. A separate
+resource estimate drives admission: physical heap-page tuple bounds for
+scans, structural bounds for joins, inherited bounds for Sort, and exact
+LIMIT truncation. Group/DISTINCT uses the smaller of its input bound and
+eight times its estimated cardinality. Result estimates include the ABI
+header, cells, and bounded variable payload. The grouped estimate is
+statistical, so runtime capacity checks remain authoritative.
+
+A device state whose output exceeds the result reservation may still feed
+a device reducer. It is its HOST boundary that is discouraged. Unresolved
+SubPlans cannot cross a boundary before whole-DAG rewriting. SEMI/ANTI
+cardinality risk propagates until a reducing operation establishes a safer
+boundary. Current code additionally carries eligible unparameterized
+subquery device alternatives outward when no unpushed restriction or lateral
+dependency remains, preventing local subquery pruning from hiding complete
+device plans.
+
+\subsection{The Cache Feedback Objective}
+AER-produced pages reduce the observed HOST cost at subsequent planning
+points. This is the implemented connection between cache population and
+placement. The optimizer does not assign a speculative reward for warming
+an unknown future query, nor does it solve a workload-wide cache allocation
+problem. It also chooses before execution rather than migrating an active
+operator on the basis of runtime observations. These distinctions keep the
+optimization objective aligned with the implemented mechanism.
+
+\section{Evaluation}
+\label{sec:evaluation}
+We use archived project experiments to answer four questions: does complete
+query lowering preserve results; what placements does AUTO select; can cache
+population help later HOST execution and overlap a command window; and do
+low-memory paths reduce state and spill traffic? The workload comprises the
+repository's 22 TPC-H query templates at SF=1 \cite{tpch}. These are research
+query experiments, not an audited TPC-H result or a QphH measurement.
+
+\subsection{Setup, Timing Domains, and Provenance}
+The SF=1 runs use guest-built PostgreSQL 12.22, Linux 6.8 with CEMU changes,
+TCG/VM-Freeze, and a cluster resident on the emulated NVMe namespace.
+Table~\ref{tab:setup} lists the relevant configured defaults; directed
+experiments override arena and staging budgets. The current configuration
+uses a 48 GiB NVM namespace for larger datasets, but this draft does not infer
+that capacity for every historical SF=1 run. Host CPU model, original guest
+RAM allocation, and all historical PostgreSQL resource settings require
+per-run metadata confirmation before hardware comparisons.
+
+\begin{table}[t]
+\caption{Model and runtime parameters used to interpret SF=1 evidence.}
+\label{tab:setup}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Parameter & Value / interpretation \\
+\midrule
+Modeled FDM capacity & 4 GiB \\
+Scan window; each of two FIFOs & 32 MiB; 32 MiB \\
+Default result; spill staging & 64 MiB; 32 MiB \\
+Default Flash spill capacity & 4 GiB, separate from FDM \\
+Functional workers & 32 maximum; shared query budget \\
+FPGA clock; default II & 250 MHz; 1 \\
+Per-node launch accounting & 64 cycles \\
+Flash read / write bandwidth & 1000 / 1000 MiB/s \\
+Program runtime override & 0, automatic model \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The runtime accumulates cycles using a per-node launch plus processed-row
+charge, $64+n_i\mathrm{II}_i$. It returns cycles, total Flash reads, total
+Flash writes, and replay reads. The spill-aware scheduler uses
+\begin{align}
+B_{\mathrm{base}} &= B_{\mathrm{read}}-B_{\mathrm{replay}},\\
+T_{\mathrm{device}} &=
+ \max\left(\frac{C_{\mathrm{model}}}{f},
+           \frac{B_{\mathrm{base}}}{W_r}\right)
+ +\frac{B_{\mathrm{replay}}}{W_r}+\frac{B_{\mathrm{write}}}{W_w}.
+\label{eq:timing}
+\end{align}
+The maximum permits base scanning to overlap modeled streaming compute;
+spill writes and replay reads add conservatively. This is not a calibrated
+per-operator hardware pipeline model: lane scaling, comparator trees, memory
+bank conflicts, and all transfer contention are not fully modeled.
+
+The principal AUTO dataset predates later spill and streaming optimizations
+and uses \texttt{csd\_sql\_overlap\_v2.so}. It is preserved as a historical
+placement/model measurement, not attributed to the latest kernel. Later
+low-memory results are reported with their own experiment versions. Since
+these are separate runs, their improvements cannot be multiplied to predict
+a new full-suite speedup.
+
+The benchmark restarts PostgreSQL and drops guest page cache before each
+AUTO and each HOST sample. \texttt{guest\_ms} excludes functional C++ work
+inside VM-Freeze but includes modeled outstanding delay and ordinary guest
+PostgreSQL execution. \texttt{wall\_ms} includes TCG and functional-model
+implementation overhead. The HOST comparator also executes under TCG, so
+the guest ratio is specific to this prototype and cannot establish speedup
+over native PostgreSQL on a physical CPU. The 22-query timing dataset has
+one pair per query, and supplies no confidence intervals. Q15 time sums the
+create-view, query, and drop-view script's reported times.
+
+\subsection{Correctness and Coverage}
+Forced-CSD planner regressions cover all 22 query templates and require no
+host scan/join/aggregate/sort inside the selected relational work; host
+control wrappers remain permissible. Lowered plans have zero pending
+non-scalar expressions. Exact execution comparison checks normalized outputs
+byte for byte, with order normalization where SQL does not specify order.
+The forced-CSD suites and the frontier-based AUTO suite both report 22/22
+EXACT. Separate unit and sanitizer results cover join kinds, residuals,
+NULLs, decimal scales, DISTINCT, Top-N, and bounded replay.
+
+This establishes tested query-template coverage under the scan contract.
+It does not generalize to every legal parameter distribution, collation,
+concurrent update pattern, SQL function, or arbitrary precision number.
+
+\subsection{AUTO Placements and End-to-End Time}
+\begin{figure*}[t]
+\centering
+\includegraphics[width=.94\textwidth]{figures/sf1_auto_speedup.pdf}
+\caption{Archived SF=1 cold-cache guest-time ratios. Both HOST and AUTO run
+under TCG; AUTO includes parameterized device delay. The dashed line denotes
+equal time, and colors identify selected placements. This is not a native
+CPU versus physical FPGA comparison.}
+\Description{A logarithmic bar chart shows HOST divided by AUTO guest time
+for all 22 queries, with different colors for CSD, mixed, and HOST plans.}
+\label{fig:auto}
+\end{figure*}
+
+The frontier planner selects complete CSD execution for 18 queries, mixed
+CSD/HOST execution for Q17 and Q20, and pure HOST execution for Q2 and Q16.
+No query-number rule encodes these choices. Total AUTO guest time is
+183,019.742 ms versus 825,114.403 ms for HOST. We define the aggregate elapsed
+time ratio as $\sum_q T_H(q)/\sum_q T_A(q)$, yielding 4.5083; the geometric
+mean of the 22 ratios is 6.9207. Twenty query samples favor AUTO
+(Figure~\ref{fig:auto}). These quantities summarize serial query samples,
+not measured concurrent throughput.
+
+Q1's ratio is 43.961, whereas mixed Q20 is nearly tied at 1.024. Q2 and Q16
+select HOST in both modes and have ratios 0.905 and 0.943 in the single
+paired samples. A separate cold Q2 check measured 19,176.669 versus
+19,218.811 ms, consistent with a near tie; the full distribution remains
+unmeasured. These data do not establish that AUTO always matches an oracle.
+Directed planner tests separately check cold=CSD, hot=HOST, a legal mixed
+cut, oversized-output rejection, and safe subplan/selectivity boundaries.
+
+For transparency, the same full-suite run records total wall times of
+411,124 ms for AUTO and 867,529 ms for HOST, a ratio of about 2.110.
+The difference from the guest ratio quantifies the importance of the timing
+domain. Neither ratio is a hardware FPGA latency measurement.
+
+\subsection{Cache Benefit and Completed Overlap}
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/sf1_cache_benefit.pdf}
+\caption{Subsequent HOST count scan after a forced-CSD scan, with cache
+population disabled or fully completed. Dots show the three archived trials;
+bars show means. The completion barrier is experimental, not the default.}
+\Description{Two bars show mean subsequent HOST scan time falling from
+22.54 seconds to 10.82 seconds, with all three individual samples visible.}
+\label{fig:cache}
+\end{figure}
+
+The cache experiment runs forced-CSD \texttt{count(lineitem)} from a cold
+cluster, then immediately runs the same query on HOST. Each arm restarts
+PostgreSQL and drops guest cache. The cache-enabled arm waits for all
+registered ranges to complete before the HOST measurement. Both paths return
+6,001,215. Across three trials, subsequent HOST execution averages
+22,537.964 ms without population and 10,818.313 ms after full population:
+a 2.0833 ratio and 52.00\% latency reduction (Figure~\ref{fig:cache}).
+Each cache-enabled trial completes 1,276,665,856 bytes across two heap
+segments, with zero unmapped bytes, dropped entries, or errors in that trial.
+
+Those three trials use the earlier worker. A separate one-trial check of
+the final pipelined worker measures 23,492.340 versus 10,474.203 ms, a 2.2429
+ratio. It corroborates the mechanism but is not pooled into the three-trial
+mean. The results concern a fully warmed subsequent HOST query; they do not
+include population cost in a workload-wide speedup.
+
+A separate overlap A/B test holds automatic Program Execute delay at about
+1.218 s. Deferring the worker until command completion produces 0 completed
+bytes during that interval. Allowing immediate processing completes
+134,217,728 bytes (128 MiB), with the first completion at 343 ms after
+execute start. Full population still spans 10.553 s between first and last
+completion, about 115.37 MiB/s on this TCG/Linux path. The 128 MiB represents
+about 10.51\% of the completed relation bytes. This establishes partial overlap
+but cannot establish significant same-query latency reduction. The observed
+11.970 versus 13.198 s single-run query wall times include an explicit
+population barrier and are not used as an overlap speedup claim.
+
+Finally, zero loss in the isolated count trials does not imply a lossless
+protocol. The continuous 22-query AER correctness regression ends with 30
+controller-wide dropped log entries, while retaining 22/22 exact SQL results.
+The ring is a best-effort hint channel whose loss affects cache benefit.
+
+\subsection{Low-Memory Execution and Spill Traffic}
+\begin{table}[t]
+\caption{Directed SF=1 operator evidence. Bytes are measured profile fields;
+operator leases exclude other FDM reservations and ordinary STL overhead.}
+\label{tab:memory}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Case & Arena peak (B) & Output / batches \\
+\midrule
+Streaming Q1 aggregate & 2,528 & 29 batches \\
+Streaming Q6 aggregate & 134 & 29 batches \\
+1 MiB Join replay & 750,240 & 299,808 count \\
+1 MiB grouped replay & 796,876 & 74,999 groups \\
+Q3 probe-to-Flash & 29,494,560 & 30 probe batches \\
+Q3 build-to-Flash & 8,832,780 & 7 build + 30 probe \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Streaming Scan-to-Aggregate profiles consume 5,884,033 qualifying input rows
+for Q1 and 119,810 for Q6 across 29 FIFO batches each. Their query operator
+lease peaks are 2,528 and 134 bytes, with zero spill. These are aggregate
+state peaks, not total query memory: scan windows, FIFOs, results, staging,
+and other allocations remain live. The profiles demonstrate removal of the
+complete Scan intermediate for these admitted shapes.
+
+A forced 1 MiB Join replay case writes and rereads 241,548,724 bytes per
+direction, returns count 299,808 exactly, and peaks at a 750,240-byte operator
+lease. A 1 MiB grouped aggregate case writes and rereads 5,996,736 bytes per
+direction and returns 74,999 exact groups with peak 796,876 bytes. Q3 with
+a 32 MiB arena reduces its recorded peak from 29,494,560 to 8,832,780 bytes
+when its build also streams to Flash, a 70.06\% reduction
+(Table~\ref{tab:memory}). Later Q3 handle-chain and ordinal-merge experiments
+measure 1,024-byte partition descriptor payload and 150-byte merge-handle
+payload, respectively; these exclude allocator overhead and are not total
+join memory.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/sf1_sort_io.pdf}
+\caption{Three separate Sort comparisons at 1 MiB arena/staging. Each pair
+uses its own archived before/after kernels. The Top-N pair changes the SQL
+output bound; the other pairs preserve their respective query results.}
+\Description{Paired bars show measured spill reads plus writes reduced by
+35.68 percent for final streaming, 99.27 percent for Top-N, and 67.84 percent
+for adaptive merging.}
+\label{fig:sort}
+\end{figure}
+
+External Sort experiments isolate three mechanisms
+(Figure~\ref{fig:sort}). For 30,209 variable-length rows, final merge-and-stream
+reduces spill reads plus writes from 14,646,232 to 9,420,282 bytes (35.68\%).
+Adding SQL LIMIT 100 reduces the latter baseline to 69,190 bytes (99.27\%);
+LIMIT/OFFSET variants match HOST exactly. Because Top-N changes output
+requirements, its reduction is not an unbounded-sort algorithm comparison.
+For a separate full-lineitem LIMIT 100 query, 229 initial runs under the same
+1 MiB budgets use adaptive fan-in up to 128 and reduce total spill I/O from
+3,680,832 to 1,183,632 bytes (67.84\%) relative to binary merge. Its peak
+conservative staging reservation is exactly 1 MiB. Each figure pair has its
+own baseline; the percentages are not cumulative.
+
+\subsection{Device-Delay Accounting Check}
+The forced Join replay adds 241,548,724 bytes in each spill direction.
+At 1000 MiB/s reads and writes, Equation~\ref{eq:timing} predicts a
+460.718 ms increment. Two paired guest executor measurements produce
+457.322 and 451.430 ms, averaging 454.376 ms: a 1.38\% difference from the
+byte-derived increment. This checks that the scheduler exposes spill write
+and replay delay rather than hiding it behind the scan maximum. Since the
+scheduler itself uses this byte model, the agreement is an implementation
+consistency check, not independent calibration against a physical SSD.
+
+\section{Discussion and Limitations}
+\label{sec:discussion}
+\paragraph{Hardware validation.}
+The implementation is a functional C++ dataflow model with parameterized
+device delay. It provides no synthesis results, FPGA utilization, achieved
+frequency, hardware power, or physical PCIe measurements. Its 250 MHz and
+bandwidth parameters are assumptions. TCG HOST execution is not a native
+CPU baseline. A physical implementation or independently calibrated simulator
+is required for hardware performance conclusions.
+
+\paragraph{Memory guarantees and scale.}
+Spilling and FIFO consumers constrain the modeled live state of selected
+paths. Ordinary containers, protection copies, DISTINCT compatibility paths,
+and retained final batches preclude a whole-system physical bound. SF=1
+pressure tests exercise replay but do not alone demonstrate behavior for
+all larger-than-device workloads. Larger-scale exact validation exists in
+the repository, but this draft's quantitative evaluation deliberately uses
+SF=1 and does not import larger-scale speedups.
+
+\paragraph{Cache policy and consistency.}
+The worker populates Linux file cache, not PostgreSQL shared buffers, and
+performs extra reads. The current planner observes existing cache state; it
+does not jointly optimize future cache benefit, eviction, transfer contention,
+or a multi-query workload. AER ring overflow loses opportunities. Plan
+generation filtering is insufficient for production relation rewrite and
+transaction consistency. These are necessary extensions beyond static
+analytical experiments.
+
+\paragraph{Optimizer accuracy.}
+The Pareto search improves candidate retention within implemented choices.
+Statistics safety factors do not constitute formal bounds, and memory/return
+cost estimates can still misrank plans. Q20's near tie motivates repeated
+measurements and calibration. The current evidence lacks repeated full-suite
+runs, a cold-to-hot residency sweep, and a matched all-HOST/forced-CSD/AUTO
+comparison on one final kernel. They should precede stronger claims of
+robust placement quality.
+
+\section{Related Work}
+FEMU provides an extensible QEMU-based Flash emulation foundation
+\cite{femu}; CEMU extends full-system experimentation to computational storage
+\cite{cemu}. We build on that infrastructure rather than attributing its
+namespaces or emulation mechanisms to our SQL layer. SNIA defines the
+application API abstraction \cite{snia}; our work concentrates on SQL
+execution and cache/placement integration above the implemented transport.
+
+Trinity integrates PostgreSQL with near-data FPGA analytics and demonstrates
+direct page decode and tuple binding \cite{trinity}. It motivates our
+page/tuple/task decomposition. Vitis Database Library documents resident-build
+join and partition-then-join/aggregate designs \cite{vitis}, which guide the
+blocking-operator organization. NASCENT accelerates database sorting near
+storage on SmartSSD \cite{nascent}. Our sort is a C++ functional model of
+bounded external runs and Flash replay, rather than a reproduction of its
+hardware sorter.
+
+These projects establish relevant accelerator and system techniques. Our
+focus is their integration into a tested relational plan interface together
+with host inode-cache population and cache-aware one-way placement. We do
+not claim that hash partitioning, external merge, or heterogeneous query
+placement is individually new. A broader comparison with prior adaptive
+offload and cache-coherence systems remains necessary to establish the final
+novelty boundary before submission.
+
+\section{Conclusion}
+\sys{} connects device-side SQL execution, asynchronous host cache population,
+and cache-aware placement in a PostgreSQL/CEMU prototype. Versioned plans
+and Flash replay support the operator families required by all 22 tested
+TPC-H queries. AER range hints populate the correct host file cache through
+ordinary reads, and measured residency affects the next placement decision.
+SF=1 evidence establishes exact results, useful subsequent-query caching,
+partial command-window overlap, and reduced state or Flash traffic on
+selected low-memory paths. The end-to-end timing results remain specific
+to TCG and the configured device model. Strict physical memory bounds,
+production consistency, repeated workload measurements, and hardware
+validation remain the next steps.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+\end{document}

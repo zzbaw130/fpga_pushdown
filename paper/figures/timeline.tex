@@ -1,0 +1,20 @@
+\begin{tikzpicture}[font=\scriptsize, >=Latex, x=.85cm, y=.66cm]
+\node[anchor=east] at (0,2) {Functional kernel};
+\node[anchor=east] at (0,1) {Program Execute};
+\node[anchor=east] at (0,0) {Host cache worker};
+\fill[gray!25] (0,1.7) rectangle (3,2.3);
+\node at (1.5,2) {TCG VM-Freeze};
+\draw[thick] (0,1) -- (3,1);
+\fill[blue!18] (3,.7) rectangle (7,1.3);
+\node at (5,1) {modeled outstanding delay};
+\draw[->] (7,1) -- (8,1) node[right] {completion};
+\fill[teal!25] (4,-.3) rectangle (7,.3);
+\fill[orange!20] (7,-.3) rectangle (10,.3);
+\node at (5.5,0) {overlap};
+\node at (8.5,0) {remaining fill};
+\draw[dashed] (3,-.6) -- (3,2.6) node[above] {guest resumes};
+\draw[dashed] (7,-.6) -- (7,1.5);
+\draw[->] (0,-1) -- (10.5,-1) node[right] {wall time};
+\node[align=center] at (1.5,-1.65) {guest clock paused\\not FPGA latency};
+\node[align=center] at (6.8,-1.65) {guest clock advances; ordinary reads run\\schematic durations, not to scale};
+\end{tikzpicture}

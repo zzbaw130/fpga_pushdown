@@ -1,0 +1,26 @@
+% Original diagram reconstructed from this repository's control/data paths.
+\begin{tikzpicture}[font=\small, >=Latex,
+ box/.style={draw, rounded corners=2pt, align=center, minimum height=10mm},
+ host/.style={box, fill=blue!6}, device/.style={box, fill=orange!9},
+ flow/.style={->, thick}, hint/.style={->, dashed, thick, teal!70!black}]
+\node[host, text width=34mm] (pg) at (0,2.0) {PostgreSQL 12\\HOST paths + CSD frontier};
+\node[host, text width=34mm] (exec) at (0,0.4) {CustomScan executor\\ABI-v8 plan + FIEMAP};
+\node[host, text width=34mm] (cache) at (0,-1.4) {Linux heap inode cache\\AER worker + readahead};
+\node[device, text width=43mm] (runtime) at (5,2.0) {CEMU program runtime\\DAG / pipeline scheduler};
+\node[device, text width=43mm] (ops) at (5,0.4) {Scan / Filter / Project\\Join / Aggregate / Sort};
+\node[device, text width=43mm] (fdm) at (5,-1.4) {4 GiB modeled FDM\\windows, FIFOs, arena, staging};
+\node[device, text width=34mm] (flash) at (10,0.4) {NVM namespace\\heap + query-local spill};
+\node[device, text width=34mm] (log) at (10,-1.4) {Vendor log 0xC0\\64-entry range ring};
+\draw[flow] (pg) -- (exec);
+\draw[flow] (exec.east) -- node[above, sloped, font=\scriptsize]{NVMe Program Execute} (runtime.west);
+\draw[flow] (runtime) -- (ops);
+\draw[flow, <->] (ops) -- (fdm);
+\draw[flow, <->] (ops) -- node[above, font=\scriptsize]{base / spill I/O} (flash);
+\draw[flow] (ops.west) -- node[below, font=\scriptsize]{result + status} (exec.east);
+\draw[hint] (ops.south east) -- (log.north west);
+\draw[hint] (log.south) -- ++(0,-.55) -| node[pos=.26, below, font=\scriptsize]{AER notice; driver fetches range metadata} (cache.south);
+\draw[flow] (cache.west) -- ++(-.65,0) |- node[pos=.7, left, font=\scriptsize]{residency} (pg.west);
+\draw[hint] (cache.north east) -- node[below, sloped, font=\scriptsize]{ordinary reads populate inode cache} (flash.south west);
+\node[draw, dashed, fit=(pg)(exec)(cache), inner sep=5mm, label=above:{Database host (CEMU guest)}] {};
+\node[draw, dashed, fit=(runtime)(ops)(fdm)(flash)(log), inner sep=5mm, label=above:{Emulated computational storage device}] {};
+\end{tikzpicture}
