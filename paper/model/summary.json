@@ -1,5 +1,5 @@
 {
-  "status": "THEORETICAL",
+  "status": "MODEL_DERIVED",
   "cold_total_s": {
     "Host-only": 825.1144029999998,
     "Filter-only": 622.3374198220001,

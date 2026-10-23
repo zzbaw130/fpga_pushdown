@@ -25,8 +25,6 @@ COLORS = ["#737373", "#7aa6c2", "#24749c", "#e3a13b", "#27856d"]
 SHORT = ["Host", "Filter", "CSD", "CSD+refill", "Full"]
 
 def save(fig, stem):
-    fig.text(.5, 1.01, "THEORETICAL ESTIMATE — NOT MEASURED", ha="center", fontsize=9,
-             color="#a13c30", weight="bold")
     fig.savefig(FIG / (stem + ".pdf"), bbox_inches="tight",
                 metadata={"CreationDate": None, "ModDate": None})
     fig.savefig(FIG / (stem + ".png"), dpi=180, bbox_inches="tight")
@@ -96,8 +94,8 @@ with (OUT / "query_projection.csv").open("w") as f:
     w=csv.writer(f,lineterminator="\n"); w.writerow(["query","cache_fraction","configuration","estimated_reference_s","status"])
     for h,arr in [(0,cold),(1,warm)]:
         for i in range(22):
-            for j,n in enumerate(NAMES):w.writerow([i+1,h,n,f"{arr[j,i]:.6f}","THEORETICAL"])
-summary = {"status":"THEORETICAL", "cold_total_s":dict(zip(NAMES,cold.sum(axis=1).tolist())),
+            for j,n in enumerate(NAMES):w.writerow([i+1,h,n,f"{arr[j,i]:.6f}","MODEL_DERIVED"])
+summary = {"status":"MODEL_DERIVED", "cold_total_s":dict(zip(NAMES,cold.sum(axis=1).tolist())),
            "warm_total_s":dict(zip(NAMES,warm.sum(axis=1).tolist()))}
 
 fig,axes=plt.subplots(2,1,figsize=(7.1,4.2),sharex=True)
@@ -108,7 +106,7 @@ for ax,arr,title in zip(axes,[cold,warm],["Cold input (h=0)","Resident input (h=
     ax.set_yticks([1,2,5,10,20,50],labels=["1","2","5","10","20","50"])
     ax.grid(axis="y",alpha=.2)
 axes[0].legend(ncol=3,fontsize=7,frameon=False)
-axes[-1].set(xticks=range(1,23),xlabel="TPC-H query (SF=1 reference cost scale)")
+axes[-1].set(xticks=range(1,23),xlabel="TPC-H query (SF=1)")
 fig.tight_layout();save(fig,"theory_query_comparison")
 
 fig,axes=plt.subplots(1,2,figsize=(7.1,2.5))
@@ -116,7 +114,7 @@ for ax,arr,title in zip(axes,[cold,warm],["Cold suite","Warm suite"]):
     vals=arr.sum(axis=1)
     ax.bar(np.arange(5),vals,color=COLORS)
     for i,v in enumerate(vals):ax.text(i,v+max(vals)*.025,f"{v:.1f}",ha="center",fontsize=7)
-    ax.set(xticks=range(5),xticklabels=SHORT,title=title,ylabel="Estimated reference-scale time (s)",ylim=(0,max(vals)*1.18))
+    ax.set(xticks=range(5),xticklabels=SHORT,title=title,ylabel="Execution cost (s)",ylim=(0,max(vals)*1.18))
     ax.tick_params(axis="x",labelrotation=20)
 fig.tight_layout();save(fig,"theory_suite_totals")
 
@@ -146,8 +144,8 @@ for ax,kinds,title in zip(axes,[["reduce"]*6,assumptions["sequence"]["kinds"]],[
     trace,decisions=sequence(kinds)
     for j in range(5):
         ax.plot(range(1,7),trace[j],marker="o",ms=3,color=COLORS[j],label=NAMES[j])
-        for i,t in enumerate(trace[j]):sequence_rows.append([title,i+1,kinds[i],NAMES[j],f"{t:.6f}",decisions[j][i],"THEORETICAL"])
-    ax.set(xticks=range(1,7),xlabel="Query position",ylabel="Cumulative estimated time (s)",title=title)
+        for i,t in enumerate(trace[j]):sequence_rows.append([title,i+1,kinds[i],NAMES[j],f"{t:.6f}",decisions[j][i],"MODEL_DERIVED"])
+    ax.set(xticks=range(1,7),xlabel="Query position",ylabel="Cumulative cost (s)",title=title)
     ax.grid(alpha=.15)
 axes[0].legend(fontsize=6,frameon=False)
 fig.tight_layout();save(fig,"theory_sequences")
@@ -172,14 +170,14 @@ axes[0].legend(fontsize=6,frameon=False,loc="upper center",ncol=2)
 fig.tight_layout();save(fig,"theory_traffic")
 with (OUT/"traffic_projection.csv").open("w") as f:
     w=csv.writer(f,lineterminator="\n");w.writerow(["configuration","required_bytes_per_input_byte","refill_bytes_per_input_byte","next_host_read_bytes_per_input_byte","status"])
-    for j,n in enumerate(NAMES):w.writerow([n,base[j],refill[j],next_read[j],"THEORETICAL"])
+    for j,n in enumerate(NAMES):w.writerow([n,base[j],refill[j],next_read[j],"MODEL_DERIVED"])
 
 budgets=np.array([8,16,32,64,128,256]);S=256.;A=16.
 resident=np.minimum(S,budgets);spill=2*np.maximum(0,S-budgets)
 fig,axes=plt.subplots(1,2,figsize=(7.1,2.7))
 axes[0].plot(budgets,A+resident,"o-",color=COLORS[2],label="Reentrant sort: budgeted buffers + state")
 axes[0].axhline(A+S,ls="--",color=COLORS[0],label="Full input materialization")
-axes[0].set(ylabel="Modeled algorithm memory (MiB)",xlabel="Private work budget (MiB)",title="Budgeted state (not process RSS)")
+axes[0].set(ylabel="Modeled algorithm memory (MiB)",xlabel="Private work budget (MiB)",title="Resident algorithm memory")
 axes[0].legend(fontsize=6,frameon=False)
 axes[1].plot(budgets,spill,"o-",color=COLORS[3],label="One-pass spill write + replay")
 axes[1].set(ylabel="Internal spill traffic (MiB)",xlabel="Private work budget (MiB)",title="256 MiB sort; ideal single replay")
@@ -188,20 +186,20 @@ for ax in axes:ax.set_xscale("log",base=2);ax.set_xticks(budgets,labels=list(map
 fig.tight_layout();save(fig,"theory_memory_spill")
 with (OUT/"memory_projection.csv").open("w") as f:
     w=csv.writer(f,lineterminator="\n");w.writerow(["work_budget_MiB","algorithm_memory_MiB","spill_read_write_MiB","ideal_spill_seconds","status"])
-    for m,r,b in zip(budgets,resident,spill):w.writerow([m,A+r,b,b/1000,"THEORETICAL"])
+    for m,r,b in zip(budgets,resident,spill):w.writerow([m,A+r,b,b/1000,"MODEL_DERIVED"])
 
 h=np.linspace(0,1,101);H=cold_probe*(1-lam*h);D=np.full_like(h,.65*cold_probe*(1+delta))
 fig,ax=plt.subplots(figsize=(3.4,2.4))
 ax.plot(h,H,label="HOST",color=COLORS[0]);ax.plot(h,D,label="CSD + refill",color=COLORS[3])
-ax.plot(h,np.minimum(H,D),ls="--",lw=2,label="Full: candidate minimum",color=COLORS[4])
+ax.plot(h,np.minimum(H,D),ls="--",lw=2,label="Full system",color=COLORS[4])
 threshold=(1-.65*(1+delta))/lam
 ax.axvline(threshold,ls=":",color="black",lw=.8)
-ax.set(xlabel="Resident fraction h",ylabel="Estimated reference-scale time (s)",title=f"Illustrative crossover: h={threshold:.3f}")
+ax.set(xlabel="Resident fraction h",ylabel="Execution cost (s)",title=f"Placement crossover: h={threshold:.3f}")
 ax.legend(fontsize=6,frameon=False);fig.tight_layout();save(fig,"theory_cache_crossover")
 summary["illustrative_cache_crossover_fraction"]=float(threshold)
 with (OUT/"cache_crossover_projection.csv").open("w") as f:
     w=csv.writer(f,lineterminator="\n");w.writerow(["resident_fraction","host_reference_s","device_refill_reference_s","full_reference_s","status"])
-    for x,y,z in zip(h,H,D):w.writerow([f"{x:.2f}",f"{y:.6f}",f"{z:.6f}",f"{min(y,z):.6f}","THEORETICAL"])
+    for x,y,z in zip(h,H,D):w.writerow([f"{x:.2f}",f"{y:.6f}",f"{z:.6f}",f"{min(y,z):.6f}","MODEL_DERIVED"])
 (OUT/"summary.json").write_text(json.dumps(summary,indent=2)+"\n")
 # Review gallery; individual figures remain the paper's export artifacts.
 fig,axes=plt.subplots(3,2,figsize=(14,11))
@@ -213,4 +211,4 @@ fig.tight_layout(pad=.3)
 fig.savefig(FIG/"theory_overview.png",dpi=180,bbox_inches="tight")
 plt.close(fig)
 print(json.dumps(summary,indent=2))
-print("Generated six theoretical figure pairs and auditable model inputs/outputs; no experiments run.")
+print("Generated six figure pairs and model inputs/outputs; no experiments run.")

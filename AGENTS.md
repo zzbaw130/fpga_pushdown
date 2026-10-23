@@ -18,9 +18,13 @@ reference，不能自动视为新版 CPU/SNIA 系统的实测结果。原始数�
 同日第三轮论文修订：阅读 YourSQL、Ibex、POLARDB、AQUOMAN 原文，重写背景动机，
 增加 SNIA LOAD→Scan→Filter→Aggregate 与 Sort NEED_STORE/插件重入 demo，并解释公式
 全部符号。用户明确要求理论估算，故 `paper/project_results.py` 在独立 `paper/model/`
-目录保存假设/CSV/汇总，生成六组带 THEORETICAL ESTIMATE 标识的图；它们不是实测结果，
+目录保存假设/CSV/汇总，生成六组模型图；它们不是实测结果，
 不写入 results/，不作为当前代码性能或正确性结论。原有用户修改的四幅图源/文件保留，
 正文使用单独 CPU 图源。未编译论文、未执行新的数据库实验。
+
+同日图文呈现修订：按用户要求去除模型图横幅与正文重复提示，使用正常标题/图注，
+保留 Evaluation Model 和配套参数来源；CSV/JSON 使用 MODEL_DERIVED 字段。数值不变，
+未新增测量，未编译论文。
 
 ## 1. 研究目标与三项贡献
 

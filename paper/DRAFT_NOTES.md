@@ -21,8 +21,8 @@ Ibex 已支持聚合，FPDB 已联合缓存与下推；Filter-only 是本稿的�
 按用户要求删除旧稿的逐项实现审计、SNIA 未实现说明、FPGA 周期/II 模型、VM-Freeze
 计时章节以及大量旧项目边界讨论。正文是目标架构，非当前两套代码的功能验收报告。
 实验明确区分两类内容：已有 measured anchors 与 analytical projections。用户授权估算后，
-用显式假设计算五组消融的理论情景，移除空白主结果表；所有新图及 CSV 均标注
-THEORETICAL，不把情景当作新版 CPU/SNIA 实测或新正确性证据。
+用显式假设计算五组消融的理论情景，移除空白主结果表；图面采用正常标题，CSV 中保留
+MODEL_DERIVED 来源字段，不把情景当作新版 CPU/SNIA 实测或新正确性证据。
 
 ## femu_docker 中实际参考的文件
 
@@ -139,7 +139,7 @@ Full system 用候选最小值，是偏乐观的离线规划代理，而非执�
 从 cold 开始，让 Host-only 也获得自身扫描的缓存收益，不给回填组免费预热。
 
 `model/assumptions.json` 保存全部假设，`summary.json` 保存汇总；query、sequence、traffic、
-memory、crossover CSV 均有 THEORETICAL 字段。cold 总时间依次为
+memory、crossover CSV 均有 MODEL_DERIVED 字段。cold 总时间依次为
 825.114 / 622.337 / 207.613 / 213.841 / 184.196 reference-scale s；warm 为
 396.058 / 298.953 / 207.613 / 213.841 / 127.109。它们不是物理 CPU 时间预测。
 
@@ -147,3 +147,10 @@ Sort 情景用 P=A+min(S,W)、I=2max(0,S-W)，忽略元数据和额外归并轮�
 payload 下限，不能冒充进程 RSS 或严格 allocator 证明。反例也保留：只重复 reduction
 时 CSD+refill 比 CSD-only 慢 3%；mixed 情景 Filter-only 可因只缓存部分页而慢于 Host-only。
 原 results/ 目录完全不写入理论数据。
+
+
+## 图文呈现修订
+
+按用户要求取消图面横幅，标题/图注采用正常实验主题；正文集中保留 Evaluation Model、
+参数来源和计算方式，不反复插入警示段落。数值没有变化，未新增测量。
+JSON/CSV 中用 MODEL_DERIVED 标识计算输出，原始 results/ 数据不改。

@@ -1,6 +1,6 @@
 configuration,required_bytes_per_input_byte,refill_bytes_per_input_byte,next_host_read_bytes_per_input_byte,status
-Host-only,1.0,0.0,0.0,THEORETICAL
-Filter-only,0.25,0.0,0.8,THEORETICAL
-CSD-only,0.001,0.0,1.0,THEORETICAL
-CSD + Cache Refill,0.001,1.0,0.0,THEORETICAL
-Full system,0.001,1.0,0.0,THEORETICAL
+Host-only,1.0,0.0,0.0,MODEL_DERIVED
+Filter-only,0.25,0.0,0.8,MODEL_DERIVED
+CSD-only,0.001,0.0,1.0,MODEL_DERIVED
+CSD + Cache Refill,0.001,1.0,0.0,MODEL_DERIVED
+Full system,0.001,1.0,0.0,MODEL_DERIVED
